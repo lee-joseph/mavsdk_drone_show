@@ -23,23 +23,23 @@ Description:
     coordinate transforms, and an LED controller for real-time status indication.
 
 Key Features:
-  • Dual Setpoint Modes  
-    – Local NED: `PositionNedYaw` for body-relative control.  
+  • Dual Setpoint Modes
+    – Local NED: `PositionNedYaw` for body-relative control.
     – Global LLH: `PositionGlobalYaw` using GPS-derived LLA when `Params.USE_GLOBAL_SETPOINTS` is True.
 
-  • Initial Climb Safety  
+  • Initial Climb Safety
     – Vertical climb phase with configurable thresholds (altitude, duration, and mode) to avoid abrupt maneuvers.
 
-  • Drift Compensation  
+  • Drift Compensation
     – Time-drift catch-up allowing waypoint skipping and feed-forward velocity/acceleration in NED mode.
 
-  • Auto / Manual Launch Position  
+  • Auto / Manual Launch Position
     – Auto-extract first waypoint origin or shift by preconfigured NED offsets.
 
-  • Controlled vs. Native Landing  
+  • Controlled vs. Native Landing
     – Selects between PX4 native landing or a custom descent based on final altitude and mission progress.
 
-  • Comprehensive Logging & LEDs  
+  • Comprehensive Logging & LEDs
     – Verbose debug/info logs and LED color changes reflecting initialization, pre-flight, in-flight, and error states.
 
 Usage:
@@ -56,22 +56,22 @@ Command Line Arguments:
   --debug                   Turn on detailed (DEBUG) logging
 
 Dependencies:
-  • Python 3.7+  
-  • MAVSDK (`pip install mavsdk`)  
-  • psutil (`pip install psutil`)  
-  • tenacity (`pip install tenacity`)  
-  • navpy (`pip install navpy`)  
+  • Python 3.7+
+  • MAVSDK (`pip install mavsdk`)
+  • psutil (`pip install psutil`)
+  • tenacity (`pip install tenacity`)
+  • navpy (`pip install navpy`)
   • requests, asyncio, argparse, logging, csv, socket
 
 LED Status Indicators:
-  • Blue      — Initialization  
-  • Yellow    — Pre-flight checks  
-  • White     — Offboard armed & ready  
-  • Green     — Mission complete / standby  
-  • Red       — Error or disarmed  
+  • Blue      — Initialization
+  • Yellow    — Pre-flight checks
+  • White     — Offboard armed & ready
+  • Green     — Mission complete / standby
+  • Red       — Error or disarmed
 
 Notes:
-  • Ensure `mavsdk_server` is executable and located at `~/mavsdk_drone_show/mavsdk_server`.  
+  • Ensure `mavsdk_server` is executable and located at `~/mavsdk_drone_show/mavsdk_server`.
   • Toggle `Params.USE_GLOBAL_SETPOINTS` to switch between local and global control modes.
 """
 
@@ -723,11 +723,11 @@ async def perform_trajectory(
                 if Params.USE_GLOBAL_SETPOINTS:
                     # Send GLOBAL setpoint (lat, lon, alt, yaw)
                     gp = PositionGlobalYaw(
-                    lla_lat,
-                    lla_lon,
-                    lla_alt,
-                    raw_yaw,
-                    PositionGlobalYaw.AltitudeType.AMSL
+                        lla_lat,
+                        lla_lon,
+                        lla_alt,
+                        raw_yaw,
+                        PositionGlobalYaw.AltitudeType.AMSL
                     )
                     #Other Options: RELATIVE , AMSL , TAKEOFF
                     logger.debug(
@@ -954,7 +954,7 @@ async def pre_flight_checks(drone: System):
     - Checking the health of the global and home position via MAVSDK
     - Fetching the GPS global origin using MAVSDK when health is valid
     - Implementing a fallback mechanism using current position if origin request fails
-    
+
     Args:
         drone (System): MAVSDK drone system instance
 
@@ -992,7 +992,7 @@ async def pre_flight_checks(drone: System):
                     logger.warning("Waiting for global position estimate...")
                 if not health.is_home_position_ok:
                     logger.warning("Waiting for home position initialization...")
-                
+
                 await asyncio.sleep(1)
 
             if not health_checks_passed:
@@ -1052,7 +1052,7 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
         None
     """
     logger = logging.getLogger(__name__)
-    
+
     try:
         # Initialize LED controller
         led_controller = LEDController.get_instance()
@@ -1109,7 +1109,7 @@ async def compute_position_drift():
     """
     Compute initial position drift using LOCAL_POSITION_NED from the drone's API.
     The NED origin is automatically set when the drone arms (matches GPS_GLOBAL_ORIGIN).
-    
+
     Returns:
         PositionNedYaw: Drift in NED coordinates or None if unavailable
     """
@@ -1125,7 +1125,7 @@ async def compute_position_drift():
 
         if response.status_code == 200:
             ned_data = response.json()
-            
+
             # Create PositionNedYaw from API response (x=north, y=east, z=down)
             drift = PositionNedYaw(
                 north_m=ned_data['x'],
@@ -1133,7 +1133,7 @@ async def compute_position_drift():
                 down_m=ned_data['z'],
                 yaw_deg=0.0  # Adding yaw parameter, set to 0 if not needed
             )
-            
+
             logger.info(f"Initial NED drift from origin: {drift}")
             return drift
         else:

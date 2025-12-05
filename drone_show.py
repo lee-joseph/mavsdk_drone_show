@@ -78,13 +78,13 @@ LED Status Indicators:
   • Blue      — Initialization
   • Yellow    — Pre-flight checks
   • Green     — Arming in progress
-  • White     — Offboard armed & ready  
+  • White     — Offboard armed & ready
   • CSV RGB   — Synchronized show LEDs during trajectory (ledr, ledg, ledb from waypoints)
   • Green     — Mission complete / standby
-  • Red       — Error or disarmed  
+  • Red       — Error or disarmed
 
 Notes:
-  • Ensure `mavsdk_server` is executable and located at `~/mavsdk_drone_show/mavsdk_server`.  
+  • Ensure `mavsdk_server` is executable and located at `~/mavsdk_drone_show/mavsdk_server`.
   • Toggle `Params.USE_GLOBAL_SETPOINTS` to switch between local and global control modes.
 """
 
@@ -1368,7 +1368,7 @@ async def pre_flight_checks(drone: System):
     - Checking the health of the global and home position via MAVSDK
     - Fetching the GPS global origin using MAVSDK when health is valid
     - Implementing a fallback mechanism using current position if origin request fails
-    
+
     Args:
         drone (System): MAVSDK drone system instance
 
@@ -1406,7 +1406,7 @@ async def pre_flight_checks(drone: System):
                     logger.warning("Waiting for global position estimate...")
                 if not health.is_home_position_ok:
                     logger.warning("Waiting for home position initialization...")
-                
+
                 await asyncio.sleep(1)
 
             if not health_checks_passed:
@@ -1467,7 +1467,7 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
         None
     """
     logger = logging.getLogger(__name__)
-    
+
     try:
         # Initialize LED controller
         led_controller = LEDController.get_instance()
@@ -1503,7 +1503,7 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
         # Indicate readiness with LED color
         led_controller.set_color(255, 255, 255)  # White: Ready to fly
         logger.info("LED set to white: Drone is ready to fly.")
-        
+
         # From this point on, LED control will be managed by CSV waypoints during trajectory execution
         logger.info("Offboard mode started. LED control transferred to trajectory CSV colors.")
 
@@ -1527,7 +1527,7 @@ async def compute_position_drift():
     """
     Compute initial position drift using LOCAL_POSITION_NED from the drone's API.
     The NED origin is automatically set when the drone arms (matches GPS_GLOBAL_ORIGIN).
-    
+
     Returns:
         PositionNedYaw: Drift in NED coordinates or None if unavailable
     """
@@ -1543,7 +1543,7 @@ async def compute_position_drift():
 
         if response.status_code == 200:
             ned_data = response.json()
-            
+
             # Create PositionNedYaw from API response (x=north, y=east, z=down)
             drift = PositionNedYaw(
                 north_m=ned_data['x'],
@@ -1551,7 +1551,7 @@ async def compute_position_drift():
                 down_m=ned_data['z'],
                 yaw_deg=0.0  # Adding yaw parameter, set to 0 if not needed
             )
-            
+
             logger.info(f"Initial NED drift from origin: {drift}")
             return drift
         else:
@@ -1734,7 +1734,6 @@ def check_mavsdk_server_running(port):
     Returns:
         tuple: (is_running (bool), pid (int or None))
     """
-    logger = logging.getLogger(__name__)
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             for conn in proc.net_connections(kind="inet"):
