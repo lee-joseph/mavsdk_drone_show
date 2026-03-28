@@ -47,6 +47,7 @@ pip-delete-this-directory.txt
 
 # Unit test / coverage reports
 htmlcov/
+coverage_html/
 .tox/
 .nox/
 .coverage
@@ -127,10 +128,15 @@ venv.bak/
 *_bak.py
 *_old.py
 
-# Logs
+# Logs — session files and symlinks (never committed)
 logs/
+logs/sessions/
+logs/current
 *.log
+*.jsonl
 gcs-server/logs/
+# Re-include source component directories named logs
+!app/dashboard/drone-dashboard/src/components/logs/
 
 # Test and optimization files
 test_logging_optimizations.py
@@ -141,7 +147,11 @@ cached_files.txt
 # Local configuration files
 /local_config.yml
 /local_config.xml
-/online_config.csv
+/online_config.json
+/data/origin.json
+/.mds_sitl_image_build.env
+/.mds_px4_source_provenance.env
+/.mds_px4_submodules.txt
 
 # Specific binary and hardware ID files that should not be committed
 /mavsdk_server
@@ -195,5 +205,12 @@ yarn-debug.log*
 yarn-error.log*
 
 app/dashboard/drone-dashboard/.env
+app/dashboard/drone-dashboard/.env.bak
 *.ZoneIdentifier
 .claude/settings.local.json
+QUICKSCOUT_IMPLEMENTATION_PROMPT.md
+
+# Build artifacts & temp
+multiple_sitl/**/build/
+.benchmarks/
+temp/

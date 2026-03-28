@@ -12,7 +12,7 @@ import traceback
 import requests
 import threading
 import time
-from datetime import datetime
+import logging
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
@@ -21,16 +21,98 @@ from enums import Mission, State
 from config import load_config
 from heartbeat import last_heartbeats, last_heartbeats_lock
 
-# Import the new logging system
-from logging_config import (
-    get_logger, log_drone_telemetry, log_system_error, log_system_warning
-)
+# Unified logging system
+from mds_logging.server import get_logger
+
+logger = get_logger("telemetry")
 
 # Thread-safe data structures
 telemetry_data_all_drones = {}
 last_telemetry_time = {}
 telemetry_stats = {}  # Track success/failure rates per drone
 data_lock = threading.Lock()
+
+
+def _normalize_heartbeat_first_seen(value):
+    """Normalize legacy heartbeat first_seen values into Unix milliseconds."""
+    if value in (None, ""):
+        return None
+
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if numeric_value <= 0:
+        return None
+
+    if numeric_value < 1_000_000_000_000:
+        numeric_value *= 1000.0
+
+    return int(numeric_value)
+
+
+def _log_system_event(message: str, level: str = "INFO", component: str = "telemetry") -> None:
+    """Log a telemetry system event with the standard logger interface."""
+    target_logger = get_logger(component)
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    target_logger.log(log_level, message)
+
+
+def _format_log_value(value):
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    if isinstance(value, (tuple, list)):
+        return "[" + ", ".join(_format_log_value(item) for item in value) + "]"
+    return str(value)
+
+
+def _build_telemetry_message(details):
+    if not isinstance(details, dict):
+        return str(details)
+
+    preferred_order = (
+        "message",
+        "error",
+        "position",
+        "battery",
+        "mission",
+        "status",
+        "http_status",
+        "consecutive_errors",
+        "target_uri",
+        "details",
+    )
+
+    parts = []
+    for key in preferred_order:
+        value = details.get(key)
+        if value not in (None, "", [], {}):
+            parts.append(f"{key}={_format_log_value(value)}")
+
+    for key, value in details.items():
+        if key in preferred_order or value in (None, "", [], {}):
+            continue
+        parts.append(f"{key}={_format_log_value(value)}")
+
+    return "; ".join(parts) if parts else "telemetry event"
+
+
+def _log_drone_telemetry_event(drone_id: str, success: bool, details) -> None:
+    """Log per-drone telemetry events without relying on deprecated logger methods."""
+    if success:
+        level = logging.INFO if isinstance(details, dict) and details.get("message") else logging.DEBUG
+        state = "ok"
+    else:
+        error_text = str(details.get("error", "")) if isinstance(details, dict) else str(details)
+        level = logging.ERROR if error_text.startswith("Unexpected error") else logging.WARNING
+        state = "issue"
+
+    logger.log(
+        level,
+        f"Telemetry {state}: {_build_telemetry_message(details)}",
+        extra={"mds_drone_id": str(drone_id)},
+    )
 
 def get_enum_name(enum_class, value):
     """
@@ -47,8 +129,6 @@ def get_enum_name(enum_class, value):
 
 def initialize_telemetry_tracking(drones):
     """Initialize telemetry tracking structures"""
-    logger = get_logger()
-    
     with data_lock:
         for drone in drones:
             hw_id = drone['hw_id']
@@ -60,8 +140,8 @@ def initialize_telemetry_tracking(drones):
                 'last_success': 0,
                 'consecutive_failures': 0
             }
-    
-    logger.log_system_event(
+
+    _log_system_event(
         f"Initialized telemetry tracking for {len(drones)} drones", 
         "INFO", "telemetry"
     )
@@ -157,15 +237,13 @@ def poll_telemetry(drone):
     """
     drone_id = drone['hw_id']
     drone_ip = drone['ip']
-    
-    logger = get_logger()
+
     consecutive_errors = 0
-    last_logged_error = None
     
     while True:
         try:
             # Construct the full URI
-            full_uri = f"http://{drone_ip}:{Params.drones_flask_port}/{Params.get_drone_state_URI}"
+            full_uri = f"http://{drone_ip}:{Params.drone_api_port}/{Params.get_drone_state_URI}"
             
             # Make the HTTP request
             response = requests.get(full_uri, timeout=Params.HTTP_REQUEST_TIMEOUT)
@@ -183,36 +261,46 @@ def poll_telemetry(drone):
                 # Update telemetry data with thread-safe access
                 with data_lock:
                     telemetry_data_all_drones[drone_id] = {
-                        'Pos_ID': telemetry_data.get('pos_id', 'UNKNOWN'),
-                        'Detected_Pos_ID': telemetry_data.get('detected_pos_id', 'UNKNOWN'),
-                        'State': telemetry_data.get('state', 999),  # Send numeric value, not enum name
-                        'Mission': get_enum_name(Mission, telemetry_data.get('mission', 'UNKNOWN')),
-                        'lastMission': get_enum_name(Mission, telemetry_data.get('last_mission', 'UNKNOWN')),
-                        'Position_Lat': telemetry_data.get('position_lat', 0.0),
-                        'Position_Long': telemetry_data.get('position_long', 0.0),
-                        'Position_Alt': telemetry_data.get('position_alt', 0.0),
-                        'Velocity_North': telemetry_data.get('velocity_north', 0.0),
-                        'Velocity_East': telemetry_data.get('velocity_east', 0.0),
-                        'Velocity_Down': telemetry_data.get('velocity_down', 0.0),
-                        'Yaw': telemetry_data.get('yaw', 0.0),
-                        'Battery_Voltage': telemetry_data.get('battery_voltage', 0.0),
-                        'Follow_Mode': telemetry_data.get('follow_mode', 'UNKNOWN'),
-                        'Update_Time': telemetry_data.get('update_time', 'UNKNOWN'),
-                        'Timestamp': telemetry_data.get('timestamp', time.time()),
-                        'Flight_Mode': telemetry_data.get('flight_mode', 'UNKNOWN'),  # PX4 custom_mode
-                        'Base_Mode': telemetry_data.get('base_mode', 'UNKNOWN'),      # MAVLink base_mode flags
-                        'System_Status': telemetry_data.get('system_status', 'UNKNOWN'),
-                        'Is_Armed': _get_enhanced_armed_status(telemetry_data), # Enhanced armed status
-                        'Is_Ready_To_Arm': telemetry_data.get('is_ready_to_arm', False),  # Pre-arm checks
-                        'Hdop': telemetry_data.get('hdop', 99.99),
-                        'Vdop': telemetry_data.get('vdop', 99.99),
-                        'Gps_Fix_Type': telemetry_data.get('gps_fix_type', 0),  # GPS fix status
-                        'Satellites_Visible': telemetry_data.get('satellites_visible', 0),  # Number of satellites
-                        'IP': telemetry_data.get('ip', 'N/A'),  # Drone IP address from config
-                        # Heartbeat data
-                        'Heartbeat_Last_Seen': heartbeat_data.get('timestamp', 0),  # Last heartbeat timestamp
-                        'Heartbeat_Network_Info': heartbeat_data.get('network_info', {}),  # Network connectivity info
-                        'Heartbeat_First_Seen': heartbeat_data.get('first_seen', 0),  # First heartbeat time
+                        'hw_id': drone_id,
+                        'pos_id': telemetry_data.get('pos_id', 'UNKNOWN'),
+                        'detected_pos_id': telemetry_data.get('detected_pos_id', 'UNKNOWN'),
+                        'state': telemetry_data.get('state', 999),  # Send numeric value, not enum name
+                        'mission': telemetry_data.get('mission', 0),  # Send numeric value for frontend integer mapping
+                        'last_mission': telemetry_data.get('last_mission', 0),  # Send numeric value for frontend integer mapping
+                        'position_lat': telemetry_data.get('position_lat', 0.0),
+                        'position_long': telemetry_data.get('position_long', 0.0),
+                        'position_alt': telemetry_data.get('position_alt', 0.0),
+                        'velocity_north': telemetry_data.get('velocity_north', 0.0),
+                        'velocity_east': telemetry_data.get('velocity_east', 0.0),
+                        'velocity_down': telemetry_data.get('velocity_down', 0.0),
+                        'yaw': telemetry_data.get('yaw', 0.0),
+                        'battery_voltage': telemetry_data.get('battery_voltage', 0.0),
+                        'follow_mode': telemetry_data.get('follow_mode', 0),
+                        'update_time': telemetry_data.get('update_time', 'UNKNOWN'),
+                        'timestamp': telemetry_data.get('timestamp', time.time()),
+                        'trigger_time': telemetry_data.get('trigger_time', 0),
+                        'flight_mode': telemetry_data.get('flight_mode', 'UNKNOWN'),  # PX4 custom_mode
+                        'base_mode': telemetry_data.get('base_mode', 'UNKNOWN'),  # MAVLink base_mode flags
+                        'system_status': telemetry_data.get('system_status', 'UNKNOWN'),
+                        'is_armed': _get_enhanced_armed_status(telemetry_data),  # Enhanced armed status
+                        'is_ready_to_arm': telemetry_data.get('is_ready_to_arm', False),  # Pre-arm checks
+                        'home_position_set': telemetry_data.get('home_position_set', False),
+                        'readiness_status': telemetry_data.get('readiness_status', 'unknown'),
+                        'readiness_summary': telemetry_data.get('readiness_summary', 'Readiness unavailable'),
+                        'readiness_checks': telemetry_data.get('readiness_checks', []),
+                        'preflight_blockers': telemetry_data.get('preflight_blockers', []),
+                        'preflight_warnings': telemetry_data.get('preflight_warnings', []),
+                        'status_messages': telemetry_data.get('status_messages', []),
+                        'preflight_last_update': telemetry_data.get('preflight_last_update', 0),
+                        'hdop': telemetry_data.get('hdop', 99.99),
+                        'vdop': telemetry_data.get('vdop', 99.99),
+                        'gps_fix_type': telemetry_data.get('gps_fix_type', 0),  # GPS fix status
+                        'satellites_visible': telemetry_data.get('satellites_visible', 0),  # Number of satellites
+                        'ip': telemetry_data.get('ip', 'N/A'),  # Drone IP address from config
+                        # Heartbeat data (kept with prefix for clarity)
+                        'heartbeat_last_seen': heartbeat_data.get('timestamp', 0),  # Last heartbeat timestamp
+                        'heartbeat_network_info': heartbeat_data.get('network_info', {}),  # Network connectivity info
+                        'heartbeat_first_seen': _normalize_heartbeat_first_seen(heartbeat_data.get('first_seen')),  # First heartbeat time
                     }
                     last_telemetry_time[drone_id] = time.time()
 
@@ -224,7 +312,7 @@ def poll_telemetry(drone):
                     consecutive_errors = 0
                     # Ultra-quiet: Only log recovery if it's significant
                     if should_log_telemetry_event(drone_id, True):
-                        log_drone_telemetry(
+                        _log_drone_telemetry_event(
                             drone_id, True,
                             {
                                 'message': 'Telemetry restored after connectivity issues',
@@ -241,7 +329,7 @@ def poll_telemetry(drone):
 
                 # Log telemetry only if it's significant (much quieter now)
                 elif should_log_telemetry_event(drone_id, True):
-                    log_drone_telemetry(
+                    _log_drone_telemetry_event(
                         drone_id, True,
                         {
                             'position': (
@@ -263,7 +351,7 @@ def poll_telemetry(drone):
 
                 # Smart error logging: first error + every Nth occurrence
                 if should_log_telemetry_event(drone_id, False):
-                    log_drone_telemetry(
+                    _log_drone_telemetry_event(
                         drone_id, False,
                         {
                             'error': error_msg,
@@ -271,7 +359,6 @@ def poll_telemetry(drone):
                             'http_status': response.status_code
                         }
                     )
-                    last_logged_error = error_msg
 
         except requests.Timeout:
             consecutive_errors += 1
@@ -279,7 +366,7 @@ def poll_telemetry(drone):
 
             # Log timeout errors with intelligent throttling
             if should_log_telemetry_event(drone_id, False):
-                log_drone_telemetry(
+                _log_drone_telemetry_event(
                     drone_id, False,
                     {
                         'error': f'Connection timeout after {Params.HTTP_REQUEST_TIMEOUT}s',
@@ -294,7 +381,7 @@ def poll_telemetry(drone):
 
             # Log connection errors with smart throttling
             if should_log_telemetry_event(drone_id, False):
-                log_drone_telemetry(
+                _log_drone_telemetry_event(
                     drone_id, False,
                     {
                         'error': f'Connection failed to {drone_ip}',
@@ -309,7 +396,7 @@ def poll_telemetry(drone):
 
             # Log request errors with professional throttling
             if should_log_telemetry_event(drone_id, False):
-                log_drone_telemetry(
+                _log_drone_telemetry_event(
                     drone_id, False,
                     {
                         'error': 'Request exception',
@@ -323,7 +410,7 @@ def poll_telemetry(drone):
             update_telemetry_stats(drone_id, False)
             
             # Log unexpected errors immediately
-            log_drone_telemetry(
+            _log_drone_telemetry_event(
                 drone_id, False,
                 {
                     'error': f'Unexpected error: {type(e).__name__}',
@@ -338,7 +425,7 @@ def poll_telemetry(drone):
         with data_lock:
             if current_time - last_telemetry_time.get(drone_id, 0) > Params.HTTP_REQUEST_TIMEOUT * 3:
                 if drone_id in telemetry_data_all_drones and telemetry_data_all_drones[drone_id]:
-                    get_logger().log_system_event(
+                    _log_system_event(
                         f"Purging stale telemetry data for drone {drone_id} (no data for {Params.HTTP_REQUEST_TIMEOUT * 3}s)",
                         "WARNING", "telemetry"
                     )
@@ -350,13 +437,12 @@ def poll_telemetry(drone):
 def start_telemetry_polling(drones):
     """Start telemetry polling threads for all drones with professional reporting"""
     if not drones:
-        log_system_error("Cannot start telemetry polling: no drones provided", "telemetry")
+        _log_system_event("Cannot start telemetry polling: no drones provided", "ERROR", "telemetry")
         return
 
     # Initialize tracking
     initialize_telemetry_tracking(drones)
 
-    logger = get_logger()
     started_threads = 0
 
     # Start polling threads
@@ -372,15 +458,16 @@ def start_telemetry_polling(drones):
             started_threads += 1
 
         except Exception as e:
-            log_system_error(
+            _log_system_event(
                 f"Failed to start telemetry thread for drone {drone['hw_id']}: {e}",
-                "telemetry"
+                "ERROR",
+                "telemetry",
             )
 
     # Start periodic status reporter
     _start_telemetry_reporter()
 
-    logger.log_system_event(
+    _log_system_event(
         f"Started {started_threads}/{len(drones)} telemetry polling threads with professional reporting",
         "INFO" if started_threads == len(drones) else "WARNING",
         "telemetry"
@@ -390,7 +477,6 @@ def _start_telemetry_reporter():
     """Start background thread for periodic telemetry status reports"""
     def telemetry_reporter():
         from params import Params
-        logger = get_logger()
 
         while True:
             try:
@@ -415,7 +501,7 @@ def _start_telemetry_reporter():
 
                 # Only report if there are drones configured
                 if total > 0:
-                    logger.log_system_event(status, level, "telemetry-report")
+                    _log_system_event(status, level, "telemetry-report")
 
                 # Additional details for failed drones
                 if failed > 0:
@@ -429,13 +515,13 @@ def _start_telemetry_reporter():
                                 failed_drones.append(f"D{drone_id} ({age}s ago)")
 
                         if failed_drones:
-                            logger.log_system_event(
+                            _log_system_event(
                                 f"Failed drones: {', '.join(failed_drones[:5])}{'...' if len(failed_drones) > 5 else ''}",
                                 "WARNING", "telemetry-report"
                             )
 
             except Exception as e:
-                logger.log_system_event(f"Telemetry reporter error: {e}", "ERROR", "telemetry")
+                _log_system_event(f"Telemetry reporter error: {e}", "ERROR", "telemetry")
                 time.sleep(60)  # Wait a minute before retrying
 
     reporter_thread = threading.Thread(target=telemetry_reporter, daemon=True, name="telemetry-reporter")
@@ -468,20 +554,16 @@ def get_telemetry_summary():
 # Standalone test mode
 if __name__ == "__main__":
     import argparse
-    from logging_config import initialize_logging, LogLevel, DisplayMode
-    
+    from mds_logging.server import init_server_logging
+    from mds_logging.cli import add_log_arguments, apply_log_args
+
     parser = argparse.ArgumentParser(description='Test telemetry polling system')
-    parser.add_argument('--log-level', choices=['QUIET', 'NORMAL', 'VERBOSE', 'DEBUG'], 
-                       default='VERBOSE', help='Log level')
-    parser.add_argument('--display-mode', choices=['DASHBOARD', 'STREAM', 'HYBRID'],
-                       default='HYBRID', help='Display mode')
+    add_log_arguments(parser)
     args = parser.parse_args()
-    
+
     # Initialize logging
-    initialize_logging(
-        LogLevel[args.log_level],
-        DisplayMode[args.display_mode]
-    )
+    apply_log_args(args)
+    init_server_logging()
     
     # Load drones and start polling
     drones = load_config()

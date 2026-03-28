@@ -1,147 +1,252 @@
-// DroneCard.js
-
-import React, { useState, useEffect } from 'react';
+import React, { forwardRef } from 'react';
+import {
+  FaChevronDown,
+  FaChevronRight,
+  FaExclamationTriangle,
+  FaExchangeAlt,
+  FaLink,
+  FaSatelliteDish,
+} from 'react-icons/fa';
 import '../styles/DroneCard.css';
+import { formatDroneLabel, formatShowSlotLabel } from '../utilities/missionIdentityUtils';
 
-const categorizeDroneRole = (drone, followerCounts, topLeaderIdsSet) => {
-    if (drone.follow === '0') return 'Top Leader';
-    if (!topLeaderIdsSet.has(drone.hw_id) && followerCounts[drone.hw_id]) return 'Intermediate Leader';
-    return 'Follower';
-};
+const DroneCard = forwardRef(function DroneCard(
+  {
+    drone,
+    draftAssignment,
+    followOptions,
+    onSelect,
+    onToggleExpand,
+    onAssignmentChange,
+    isSelected,
+    isExpanded,
+    isDirty,
+  },
+  ref
+) {
+  const draft = draftAssignment || drone;
+  const followValue = String(draft.follow ?? drone.follow ?? '0');
+  const frameValue = String(draft.frame ?? drone.frame ?? 'ned');
+  const isIndependentLeader = followValue === '0';
 
-const dronesFollowing = (droneId, allDrones) => {
-    return allDrones.filter(d => d.follow === droneId).map(d => d.hw_id);
-};
+  const handleCardSelect = () => {
+    onSelect(drone.hw_id);
+  };
 
-const DroneCard = ({ drone, allDrones, onSaveChanges, isSelected }) => {
-    const [isExpanded, setIsExpanded] = useState(false);
-    const [selectedFollow, setSelectedFollow] = useState(drone.follow);
-    const [offsets, setOffsets] = useState({
-        n: drone.offset_n,
-        e: drone.offset_e,
-        alt: drone.offset_alt
+  const handleToggleExpand = (event) => {
+    event.stopPropagation();
+    onSelect(drone.hw_id);
+    onToggleExpand(drone.hw_id);
+  };
+
+  const handleFollowChange = (event) => {
+    const nextFollow = event.target.value;
+
+    onAssignmentChange(drone.hw_id, {
+      follow: nextFollow,
+      offset_x: nextFollow === '0' ? '0' : draft.offset_x,
+      offset_y: nextFollow === '0' ? '0' : draft.offset_y,
+      offset_z: nextFollow === '0' ? '0' : draft.offset_z,
     });
-    const [isBodyCoord, setIsBodyCoord] = useState(drone.body_coord === '1');
+  };
 
-    // Count followers for each drone
-    const followerCounts = {};
-    allDrones.forEach(d => {
-        if (!followerCounts[d.follow]) {
-            followerCounts[d.follow] = 0;
-        }
-        followerCounts[d.follow]++;
+  const handleFrameChange = (event) => {
+    onAssignmentChange(drone.hw_id, {
+      frame: event.target.value,
     });
+  };
 
-    const topLeaderIdsSet = new Set(allDrones.filter(d => d.follow === '0').map(leader => leader.hw_id));
-    const role = categorizeDroneRole(drone, followerCounts, topLeaderIdsSet);
+  const handleOffsetChange = (axisKey) => (event) => {
+    onAssignmentChange(drone.hw_id, {
+      [axisKey]: event.target.value,
+    });
+  };
 
-    useEffect(() => {
-        if (selectedFollow === '0') {
-            setOffsets({ n: 0, e: 0, alt: 0 });
-        }
-    }, [selectedFollow]);
+  const followTargetText = drone.follow === '0'
+    ? 'Independent leader'
+    : drone.followTargetExists
+      ? `${formatDroneLabel(drone.follow)} · ${formatShowSlotLabel(drone.followTargetPosId)}`
+      : `${formatDroneLabel(drone.follow)} unavailable`;
 
-    // Dynamic labels based on coordinate system
-    const offsetNLabel = isBodyCoord ? 'Offset Forward (m)' : 'Offset North (m)';
-    const offsetELabel = isBodyCoord ? 'Offset Right (m)' : 'Offset East (m)';
+  const followerSummary = drone.directFollowers.length > 0
+    ? drone.directFollowers.map((followerId) => formatDroneLabel(followerId)).join(', ')
+    : 'None';
 
-    const handleSave = () => {
-        onSaveChanges(drone.hw_id, {
-            ...drone,
-            follow: selectedFollow,
-            offset_n: offsets.n,
-            offset_e: offsets.e,
-            offset_alt: offsets.alt,
-            body_coord: isBodyCoord ? '1' : '0'
-        });
-        setIsExpanded(false);
-    };
-
-    const dronesThatFollowThis = dronesFollowing(drone.hw_id, allDrones);
-
-    return (
-        <div className={`drone-card ${isExpanded ? 'selected-drone' : ''} ${isSelected ? 'selected' : ''}`}  >
-            <h3 onClick={() => setIsExpanded(!isExpanded)}>Drone {drone.hw_id}</h3>
-
-            <p>
-                {role === 'Top Leader' ?
-                    <span className="role leader">Top Leader</span> :
-                    role === 'Intermediate Leader' ?
-                        <span className="role intermediate">Intermediate Leader (Follows Drone {selectedFollow})</span> :
-                        <span className="role follower">Follows Drone {selectedFollow}</span>
-                }
-            </p>
-
-            {dronesThatFollowThis.length > 0 && (
-                <p className="followed-by-text">
-                    Followed By: {dronesThatFollowThis.join(', ')}
-                </p>
+  return (
+    <article
+      ref={ref}
+      tabIndex={-1}
+      className={[
+        'swarm-drone-card',
+        isSelected ? 'is-selected' : '',
+        isExpanded ? 'is-expanded' : '',
+        isDirty ? 'is-dirty' : '',
+        drone.hasWarnings ? 'has-warnings' : '',
+      ].filter(Boolean).join(' ')}
+      onClick={handleCardSelect}
+    >
+      <button
+        type="button"
+        className="swarm-drone-card__header"
+        onClick={handleToggleExpand}
+        aria-expanded={isExpanded}
+      >
+        <div className="swarm-drone-card__header-main">
+          <div className="swarm-drone-card__eyebrow">Smart Swarm Assignment</div>
+          <div className="swarm-drone-card__title-row">
+            <h3>{drone.title}</h3>
+            <span className="swarm-drone-card__slot-pill">{drone.subtitle}</span>
+            {drone.alias && (
+              <span className="swarm-drone-card__alias-pill">{drone.alias}</span>
             )}
-
-            <p className="collapsible-details">
-                Position Offset (m): {offsetNLabel.split(' ')[1]}: {drone.offset_n}, {offsetELabel.split(' ')[1]}: {drone.offset_e}, Altitude: {drone.offset_alt}
-            </p>
-
-            {isExpanded && (
-                <div>
-                    <div className="form-group">
-                        <label>Role: </label>
-                        <select value={selectedFollow} onChange={e => setSelectedFollow(e.target.value)}>
-                            <option value="0">Top Leader</option>
-                            {allDrones.map(d => {
-                                if (d.hw_id !== drone.hw_id) {
-                                    return <option key={d.hw_id} value={d.hw_id}> Follow Drone {d.hw_id}</option>;
-                                } else {
-                                    return null;
-                                }
-                            })}
-                        </select>
-                    </div>
-
-                    <div className="form-group">
-                        <label>{offsetNLabel}: </label>
-                        <input
-                            type="number"
-                            value={offsets.n}
-                            onChange={e => setOffsets(prev => ({ ...prev, n: e.target.value }))}
-                            disabled={selectedFollow === '0'}
-                        />
-                    </div>
-
-                    <div className="form-group">
-                        <label>{offsetELabel}: </label>
-                        <input
-                            type="number"
-                            value={offsets.e}
-                            onChange={e => setOffsets(prev => ({ ...prev, e: e.target.value }))}
-                            disabled={selectedFollow === '0'}
-                        />
-                    </div>
-
-                    <div className="form-group">
-                        <label>Offset Altitude (m): </label>
-                        <input
-                            type="number"
-                            value={offsets.alt}
-                            onChange={e => setOffsets(prev => ({ ...prev, alt: e.target.value }))}
-                            disabled={selectedFollow === '0'}
-                        />
-                    </div>
-
-                    {/* Coordinate System Selection */}
-                    <div className="form-group">
-                        <label>Coordinate Type:</label>
-                        <select value={isBodyCoord ? '1' : '0'} onChange={e => setIsBodyCoord(e.target.value === '1')}>
-                            <option value="0">North-East-Altitude (NEA)</option>
-                            <option value="1">Body Coordinates (Forward-Right-Altitude)</option>
-                        </select>
-                    </div>
-
-                    <button onClick={handleSave}>Save Changes</button>
-                </div>
-            )}
+          </div>
+          <p className="swarm-drone-card__summary">{drone.roleSummary}</p>
         </div>
-    );
-};
+
+        <div className="swarm-drone-card__header-status">
+          <span className={`swarm-role-badge ${drone.role}`}>
+            {drone.roleLabel}
+          </span>
+          {drone.isRoleSwap && (
+            <span className="swarm-status-pill role-swap">
+              <FaExchangeAlt />
+              Slot Swap
+            </span>
+          )}
+          {isDirty && (
+            <span className="swarm-status-pill staged">
+              Staged
+            </span>
+          )}
+          {drone.hasWarnings && (
+            <span className="swarm-status-pill attention">
+              <FaExclamationTriangle />
+              {drone.warnings.length} issue{drone.warnings.length === 1 ? '' : 's'}
+            </span>
+          )}
+          <span className="swarm-drone-card__expand-indicator" aria-hidden="true">
+            {isExpanded ? <FaChevronDown /> : <FaChevronRight />}
+          </span>
+        </div>
+      </button>
+
+      {!isExpanded && (
+        <div className="swarm-drone-card__meta-grid">
+          <div className="swarm-drone-card__meta-item">
+            <span className="swarm-drone-card__meta-label">Follow target</span>
+            <span className="swarm-drone-card__meta-value">{followTargetText}</span>
+          </div>
+
+          <div className="swarm-drone-card__meta-item">
+            <span className="swarm-drone-card__meta-label">Offset frame</span>
+            <span className="swarm-drone-card__meta-value">{drone.frameLabel}</span>
+          </div>
+
+          <div className="swarm-drone-card__meta-item">
+            <span className="swarm-drone-card__meta-label">Direct followers</span>
+            <span className="swarm-drone-card__meta-value">{followerSummary}</span>
+          </div>
+
+          <div className="swarm-drone-card__meta-item span-two">
+            <span className="swarm-drone-card__meta-label">Relative offset</span>
+            <span className="swarm-drone-card__meta-value">{drone.offsetSummary}</span>
+          </div>
+        </div>
+      )}
+
+      {drone.warnings.length > 0 && (
+        <div className="swarm-drone-card__warning-list" role="status">
+          {drone.warnings.map((warning) => (
+            <div
+              key={`${drone.hw_id}-${warning.code}`}
+              className={`swarm-drone-card__warning ${warning.severity}`}
+            >
+              <FaExclamationTriangle />
+              <span>{warning.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {isExpanded && (
+        <div
+          className="swarm-drone-card__editor"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <div className="swarm-drone-card__editor-grid">
+            <label className="swarm-drone-card__field">
+              <span className="swarm-drone-card__field-label">
+                <FaLink />
+                Leader link
+              </span>
+              <select value={followValue} onChange={handleFollowChange}>
+                <option value="0">Independent leader</option>
+                {followOptions
+                  .filter((option) => option.value !== drone.hw_id)
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+              </select>
+              <small>Follow chains always reference drone hardware IDs, not show slots.</small>
+            </label>
+
+            <label className="swarm-drone-card__field">
+              <span className="swarm-drone-card__field-label">
+                <FaSatelliteDish />
+                Offset frame
+              </span>
+              <select
+                value={frameValue}
+                onChange={handleFrameChange}
+                disabled={isIndependentLeader}
+              >
+                <option value="ned">Geographic (North / East / Up)</option>
+                <option value="body">Leader body (Forward / Right / Up)</option>
+              </select>
+              <small>{drone.frameDescription}</small>
+            </label>
+          </div>
+
+          <div className="swarm-drone-card__offset-grid">
+            <label className="swarm-drone-card__field">
+              <span className="swarm-drone-card__field-label">{drone.axisLabels.x}</span>
+              <input
+                type="number"
+                step="0.1"
+                value={draft.offset_x ?? drone.offset_x}
+                onChange={handleOffsetChange('offset_x')}
+                disabled={isIndependentLeader}
+              />
+            </label>
+
+            <label className="swarm-drone-card__field">
+              <span className="swarm-drone-card__field-label">{drone.axisLabels.y}</span>
+              <input
+                type="number"
+                step="0.1"
+                value={draft.offset_y ?? drone.offset_y}
+                onChange={handleOffsetChange('offset_y')}
+                disabled={isIndependentLeader}
+              />
+            </label>
+
+            <label className="swarm-drone-card__field">
+              <span className="swarm-drone-card__field-label">{drone.axisLabels.z}</span>
+              <input
+                type="number"
+                step="0.1"
+                value={draft.offset_z ?? drone.offset_z}
+                onChange={handleOffsetChange('offset_z')}
+                disabled={isIndependentLeader}
+              />
+            </label>
+          </div>
+        </div>
+      )}
+    </article>
+  );
+});
 
 export default DroneCard;

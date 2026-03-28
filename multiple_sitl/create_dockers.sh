@@ -17,10 +17,11 @@ cat << "EOF"
 EOF
 
 echo "Project: mavsdk_drone_show (alireza787b/mavsdk_drone_show)"
-echo "Version: 1.4 (November 2024)"
+echo "Launcher: Docker SITL bootstrap"
 echo
 echo "This script creates and configures multiple Docker container instances for the drone show simulation."
 echo "Each container represents a drone instance running the SITL (Software In The Loop) environment."
+echo "The active simulator path is headless PX4 Gazebo Harmonic via startup_sitl.sh."
 echo
 echo "Usage: bash create_dockers.sh <number_of_instances> [--verbose] [--subnet SUBNET] [--start-id START_ID] [--start-ip START_IP]"
 echo
@@ -44,9 +45,11 @@ echo "For ADVANCED USERS - Custom Repository Configuration:"
 echo "  Set environment variables before running this script:"
 echo "    export MDS_REPO_URL=\"git@github.com:yourorg/yourrepo.git\""
 echo "    export MDS_BRANCH=\"your-branch\""
+echo "    export MDS_GIT_AUTH_TOKEN_FILE=\"/secure/path/github_read_token\""
 echo "    export MDS_DOCKER_IMAGE=\"your-image:tag\""
 echo "  Then run: bash create_dockers.sh <number>"
-echo "  See: docs/advanced_sitl.md for complete guide"
+echo "  All MDS_* environment variables are forwarded into the container runtime."
+echo "  See: docs/guides/advanced-sitl.md for complete guide"
 echo
 echo "==============================================================="
 echo
@@ -58,39 +61,58 @@ echo
 # via environment variables while maintaining full backward compatibility.
 #
 # FOR NORMAL USERS (99%):
-#   - No action required - uses default drone-template:latest image
+#   - No action required - uses default mavsdk-drone-show-sitl:latest image
 #   - Uses: git@github.com:alireza787b/mavsdk_drone_show.git@main-candidate
 #   - Simply run: bash create_dockers.sh <number_of_drones>
 #
 # FOR ADVANCED USERS (Custom Docker Images & Repositories):
 #   - Build custom image first (see tools/build_custom_image.sh)
 #   - Set environment variables before running this script:
-#     export MDS_DOCKER_IMAGE="company-drone:v1.0"
+#     export MDS_DOCKER_IMAGE="company-mds-sitl:v1.0"
 #     export MDS_REPO_URL="git@github.com:company/fork.git"
 #     export MDS_BRANCH="production"
+#     export MDS_GIT_AUTH_TOKEN_FILE="/secure/path/github_read_token"   # private GitHub HTTPS only
 #   - All containers will use your custom image and repository
 #
 # ENVIRONMENT VARIABLES SUPPORTED:
-#   MDS_DOCKER_IMAGE  - Docker image name to use (default: drone-template:latest)
-#   MDS_REPO_URL      - Git repository URL (passed to containers)
-#   MDS_BRANCH        - Git branch name (passed to containers)
+#   MDS_DOCKER_IMAGE  - Docker image name to use (default: mavsdk-drone-show-sitl:latest)
+#   Any MDS_* runtime variable exported on the host is forwarded into the
+#   container, except the internal MDS_BASE_DIR / MDS_HWID_DIR paths which are
+#   fixed by this launcher.
 #
 # EXAMPLES:
 #   # Normal usage (no environment variables):
 #   bash create_dockers.sh 5
 #
 #   # Advanced usage with custom image and repository:
-#   export MDS_DOCKER_IMAGE="mycompany-drone:v2.0"
+#   export MDS_DOCKER_IMAGE="mycompany-mds-sitl:v2.0"
 #   export MDS_REPO_URL="git@github.com:mycompany/drone-fork.git"
 #   export MDS_BRANCH="production"
 #   bash create_dockers.sh 10
 # =============================================================================
 
 # Global variables (with environment variable override support)
-STARTUP_SCRIPT_HOST="$HOME/mavsdk_drone_show/multiple_sitl/startup_sitl.sh"
-STARTUP_SCRIPT_CONTAINER="/root/mavsdk_drone_show/multiple_sitl/startup_sitl.sh"
-TEMPLATE_IMAGE="${MDS_DOCKER_IMAGE:-drone-template:latest}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+STARTUP_SCRIPT_HOST="$REPO_ROOT/multiple_sitl/startup_sitl.sh"
+STARTUP_SCRIPT_CONTAINER="/tmp/mds_startup_sitl.sh"
+HOST_RUNTIME_ROOT="${MDS_SITL_HOST_RUNTIME_ROOT:-$HOME/.local/share/mavsdk_drone_show/sitl_runtime}"
+RUNTIME_FILES_CONTAINER="/tmp/mds_runtime"
+HWID_CONTAINER_DIR="/root/mavsdk_drone_show"
+STARTUP_SCRIPT_IMAGE="${HWID_CONTAINER_DIR}/multiple_sitl/startup_sitl.sh"
+STARTUP_LOG_CONTAINER="${HWID_CONTAINER_DIR}/logs/startup_sitl.log"
+TEMPLATE_IMAGE="${MDS_DOCKER_IMAGE:-mavsdk-drone-show-sitl:latest}"
+USE_HOST_STARTUP_SCRIPT="${MDS_SITL_USE_HOST_STARTUP_SCRIPT:-false}"
+DOCKER_RESTART_POLICY="${MDS_SITL_DOCKER_RESTART_POLICY:-unless-stopped}"
 VERBOSE=false
+DOCKER_ENV_ARGS=()
+DOCKER_SECRET_ARGS=()
+CREATED_CONTAINERS=()
+READY_CONTAINERS=()
+FAILED_CONTAINERS=()
+WAIT_FOR_READY="${MDS_SITL_WAIT_FOR_READY:-true}"
+READY_TIMEOUT_SECONDS="${MDS_SITL_READY_TIMEOUT_SECONDS:-60}"
+READY_POLL_INTERVAL_SECONDS="${MDS_SITL_READY_POLL_INTERVAL_SECONDS:-2}"
 
 # Variables for custom network, starting drone ID, and starting IP
 CUSTOM_SUBNET="172.18.0.0/24"  # Default subnet
@@ -105,6 +127,154 @@ HOST_BITS=0
 usage() {
     printf "Usage: %s <number_of_instances> [--verbose] [--subnet SUBNET] [--start-id START_ID] [--start-ip START_IP]\n" "$0"
     exit 1
+}
+
+collect_mds_env_args() {
+    DOCKER_ENV_ARGS=(
+        -e "MDS_BASE_DIR=/root/mavsdk_drone_show"
+        -e "MDS_HWID_DIR=${HWID_CONTAINER_DIR}"
+    )
+    DOCKER_SECRET_ARGS=()
+
+    local env_name
+    while IFS='=' read -r env_name _; do
+        case "$env_name" in
+            MDS_BASE_DIR|MDS_HWID_DIR|MDS_GIT_AUTH_TOKEN|MDS_GIT_AUTH_TOKEN_FILE)
+                continue
+                ;;
+        esac
+        DOCKER_ENV_ARGS+=(-e "$env_name")
+    done < <(env | sort | grep '^MDS_[A-Za-z0-9_]*=' || true)
+
+    prepare_git_auth_secret_args
+}
+
+prepare_git_auth_secret_args() {
+    local host_secret_file="${MDS_GIT_AUTH_TOKEN_FILE:-}"
+    local generated_secret_file=""
+    local secret_dir=""
+    local container_secret_file="/run/secrets/mds_git_auth_token"
+
+    if [[ -z "$host_secret_file" && -z "${MDS_GIT_AUTH_TOKEN:-}" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$host_secret_file" ]]; then
+        if [[ ! -r "$host_secret_file" ]]; then
+            printf "Error: MDS_GIT_AUTH_TOKEN_FILE is not readable: %s\n" "$host_secret_file" >&2
+            exit 1
+        fi
+    else
+        secret_dir="${HOST_RUNTIME_ROOT}/_secrets"
+        mkdir -p "$secret_dir"
+        chmod 700 "$secret_dir"
+        generated_secret_file="${secret_dir}/mds_git_auth_token"
+        local old_umask
+        old_umask=$(umask)
+        umask 077
+        printf '%s' "$MDS_GIT_AUTH_TOKEN" > "$generated_secret_file"
+        umask "$old_umask"
+        chmod 600 "$generated_secret_file"
+        host_secret_file="$generated_secret_file"
+    fi
+
+    DOCKER_SECRET_ARGS+=(-v "${host_secret_file}:${container_secret_file}:ro")
+    DOCKER_ENV_ARGS+=(-e "MDS_GIT_AUTH_TOKEN_FILE=${container_secret_file}")
+}
+
+print_launcher_configuration() {
+    echo "Launcher Configuration:"
+    echo "  Docker Image   : ${TEMPLATE_IMAGE}"
+    echo "  Repo Root      : ${REPO_ROOT}"
+    if [[ "${USE_HOST_STARTUP_SCRIPT}" == "true" ]]; then
+        echo "  Startup Script : host override (${STARTUP_SCRIPT_HOST})"
+    else
+        echo "  Startup Script : image-baked (${STARTUP_SCRIPT_IMAGE})"
+    fi
+    echo "  Container Repo : /root/mavsdk_drone_show"
+    echo "  HWID Directory : ${HWID_CONTAINER_DIR}"
+    echo "  Runtime Files  : ${HOST_RUNTIME_ROOT}"
+    echo "  Restart Policy : ${DOCKER_RESTART_POLICY}"
+    echo "  Wait For Ready : ${WAIT_FOR_READY}"
+    echo "  Ready Timeout  : ${READY_TIMEOUT_SECONDS}s"
+    echo "  Ready Poll     : ${READY_POLL_INTERVAL_SECONDS}s"
+
+    local forwarded_names=()
+    local env_name
+    for ((i=0; i<${#DOCKER_ENV_ARGS[@]}; i++)); do
+        if [[ "${DOCKER_ENV_ARGS[$i]}" == "-e" && $((i + 1)) -lt ${#DOCKER_ENV_ARGS[@]} ]]; then
+            env_name="${DOCKER_ENV_ARGS[$((i + 1))]%%=*}"
+            forwarded_names+=("$env_name")
+        fi
+    done
+
+    if [ ${#forwarded_names[@]} -gt 0 ]; then
+        echo "  Forwarded Env  : ${forwarded_names[*]}"
+    fi
+
+    echo
+}
+
+validate_launcher_configuration() {
+    case "$WAIT_FOR_READY" in
+        true|false) ;;
+        *)
+            printf "Error: MDS_SITL_WAIT_FOR_READY must be 'true' or 'false'.\n" >&2
+            exit 1
+            ;;
+    esac
+
+    if ! [[ "$READY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+        printf "Error: MDS_SITL_READY_TIMEOUT_SECONDS must be a positive integer.\n" >&2
+        exit 1
+    fi
+
+    if ! [[ "$READY_POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+        printf "Error: MDS_SITL_READY_POLL_INTERVAL_SECONDS must be a positive integer.\n" >&2
+        exit 1
+    fi
+
+    case "$USE_HOST_STARTUP_SCRIPT" in
+        true|false) ;;
+        *)
+            printf "Error: MDS_SITL_USE_HOST_STARTUP_SCRIPT must be 'true' or 'false'.\n" >&2
+            exit 1
+            ;;
+    esac
+
+    if [[ -z "$DOCKER_RESTART_POLICY" ]]; then
+        printf "Error: MDS_SITL_DOCKER_RESTART_POLICY must not be empty.\n" >&2
+        exit 1
+    fi
+}
+
+print_scale_guidance() {
+    local num_instances="$1"
+    local effective_git_sync="${MDS_SITL_GIT_SYNC:-true}"
+    local effective_requirements_sync="${MDS_SITL_REQUIREMENTS_SYNC:-true}"
+
+    if (( num_instances >= 10 )) && [[ "$effective_git_sync" == "true" ]]; then
+        printf "Warning: launching %d containers with MDS_SITL_GIT_SYNC=true will trigger %d runtime git fetch/reset operations.\n" "$num_instances" "$num_instances" >&2
+        printf "For validated large-fleet runs, prefer a rebuilt image plus MDS_SITL_GIT_SYNC=false.\n" >&2
+    fi
+
+    if (( num_instances >= 10 )) && [[ "$effective_requirements_sync" == "true" ]]; then
+        printf "Notice: if requirements.txt changes, MDS_SITL_REQUIREMENTS_SYNC=true can also trigger one pip sync per container at boot.\n" >&2
+        printf "For validated large-fleet runs, usually keep MDS_SITL_REQUIREMENTS_SYNC=false after baking the approved venv into the image.\n" >&2
+    fi
+}
+
+ensure_container_git_excludes() {
+    local container_name=$1
+    local repo_dir="/root/mavsdk_drone_show"
+
+    docker exec "$container_name" bash -lc "
+        set -e
+        cd '$repo_dir'
+        mkdir -p .git/info
+        touch .git/info/exclude
+        grep -qxF '*.hwID' .git/info/exclude || echo '*.hwID' >> .git/info/exclude
+    " >/dev/null
 }
 
 # Validate the number of instances and inputs
@@ -195,6 +365,12 @@ setup_docker_network() {
         echo "Creating Docker network '${DOCKER_NETWORK_NAME}' with subnet '${CUSTOM_SUBNET}'..."
         docker network create --subnet="$CUSTOM_SUBNET" "$DOCKER_NETWORK_NAME"
     else
+        local existing_subnet
+        existing_subnet=$(docker network inspect "$DOCKER_NETWORK_NAME" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+        if [[ "$existing_subnet" != "$CUSTOM_SUBNET" ]]; then
+            printf "Error: Docker network '%s' already exists with subnet '%s' (requested '%s').\n" "$DOCKER_NETWORK_NAME" "$existing_subnet" "$CUSTOM_SUBNET" >&2
+            exit 1
+        fi
         echo "Docker network '${DOCKER_NETWORK_NAME}' already exists. Using existing network."
     fi
 
@@ -215,7 +391,12 @@ create_instance() {
     local instance_num=$1
     local drone_id=$((START_ID + instance_num -1))
     local container_name="drone-$drone_id"
-    local hwid_file="${drone_id}.hwID"
+    local runtime_dir
+    local hwid_file
+    local startup_script_container
+    local startup_bootstrap
+    local detached_command
+    local docker_run_args=()
 
     printf "\nCreating container '%s'...\n" "$container_name"
 
@@ -224,6 +405,11 @@ create_instance() {
         printf "Container '%s' already exists. Removing it...\n" "$container_name"
         docker rm -f "$container_name" >/dev/null 2>&1
     fi
+
+    runtime_dir="${HOST_RUNTIME_ROOT}/${container_name}"
+    rm -rf "$runtime_dir"
+    mkdir -p "$runtime_dir"
+    hwid_file="${runtime_dir}/${drone_id}.hwID"
 
     # Create an empty .hwID file for the container
     if ! touch "$hwid_file"; then
@@ -238,75 +424,132 @@ create_instance() {
     # Check for reserved IP addresses
     if [[ "$last_octet" -eq 0 || "$last_octet" -eq 255 ]]; then
         printf "Error: Calculated IP address ends with reserved octet '%d'\n" "$last_octet" >&2
-        rm -f "$hwid_file"
+        rm -rf "$runtime_dir"
         return 1
     fi
 
-    # Run the container with specified network and IP (pass environment variables for repository config)
-    if ! docker run --name "$container_name" --network "$DOCKER_NETWORK_NAME" --ip "$IP_ADDRESS" \
-        -e MDS_REPO_URL="${MDS_REPO_URL:-}" \
-        -e MDS_BRANCH="${MDS_BRANCH:-}" \
-        -d "$TEMPLATE_IMAGE" tail -f /dev/null >/dev/null; then
-        printf "Error: Failed to start container '%s'\n" "$container_name" >&2
-        rm -f "$hwid_file"  # Clean up local .hwID file
-        return 1
+    startup_script_container="$STARTUP_SCRIPT_IMAGE"
+    docker_run_args=(
+        --name "$container_name"
+        --network "$DOCKER_NETWORK_NAME"
+        --ip "$IP_ADDRESS"
+        --restart "$DOCKER_RESTART_POLICY"
+        "${DOCKER_ENV_ARGS[@]}"
+        "${DOCKER_SECRET_ARGS[@]}"
+        -v "${runtime_dir}:${RUNTIME_FILES_CONTAINER}:ro"
+    )
+
+    if [[ "${USE_HOST_STARTUP_SCRIPT}" == "true" ]]; then
+        startup_script_container="$STARTUP_SCRIPT_CONTAINER"
+        docker_run_args+=(-v "${STARTUP_SCRIPT_HOST}:${STARTUP_SCRIPT_CONTAINER}:ro")
     fi
 
-    printf "Container '%s' started successfully with IP '%s'.\n" "$container_name" "$IP_ADDRESS"
-
-    # Ensure the directory exists inside the container
-    if ! docker exec "$container_name" mkdir -p "/root/mavsdk_drone_show/multiple_sitl/"; then
-        printf "Error: Failed to create directory in '%s'\n" "$container_name" >&2
-        docker stop "$container_name" >/dev/null
-        docker rm "$container_name" >/dev/null
-        rm -f "$hwid_file"
-        return 1
-    fi
-
-    # Transfer the .hwID file to the container
-    if ! docker cp "$hwid_file" "${container_name}:/root/mavsdk_drone_show/"; then
-        printf "Error: Failed to copy hwID file to container '%s'\n" "$container_name" >&2
-        docker stop "$container_name" >/dev/null
-        docker rm "$container_name" >/dev/null
-        rm -f "$hwid_file"
-        return 1
-    fi
-    rm -f "$hwid_file"  # Clean up local .hwID file
-
-    # Transfer the startup script to the container
-    if ! docker cp "$STARTUP_SCRIPT_HOST" "${container_name}:${STARTUP_SCRIPT_CONTAINER}"; then
-        printf "Error: Failed to copy startup script to container '%s'\n" "$container_name" >&2
-        docker stop "$container_name" >/dev/null
-        docker rm "$container_name" >/dev/null
-        return 1
-    fi
-
-    # Make the startup script executable inside the container
-    if ! docker exec "$container_name" chmod +x "$STARTUP_SCRIPT_CONTAINER"; then
-        printf "Error: Failed to make startup script executable in '%s'\n" "$container_name" >&2
-        docker stop "$container_name" >/dev/null
-        docker rm "$container_name" >/dev/null
-        return 1
-    fi
+    startup_bootstrap="mkdir -p '$HWID_CONTAINER_DIR/logs' && cp '$RUNTIME_FILES_CONTAINER'/*.hwID '$HWID_CONTAINER_DIR/' && exec bash '$startup_script_container'"
+    detached_command="${startup_bootstrap} >> '$STARTUP_LOG_CONTAINER' 2>&1"
 
     # If verbose mode is enabled, run attached mode for debugging purposes
     if $VERBOSE; then
         printf "\nVerbose mode is enabled. Running container '%s' in attached mode for debugging.\n" "$container_name"
         printf "To exit the attached mode, press CTRL+C.\n"
-        docker exec -it "$container_name" bash "$STARTUP_SCRIPT_CONTAINER" --verbose
+        if [[ -t 0 && -t 1 ]]; then
+            docker run "${docker_run_args[@]}" -it "$TEMPLATE_IMAGE" bash -lc "${startup_bootstrap} --verbose"
+        else
+            printf "No interactive TTY detected. Falling back to non-TTY verbose mode.\n"
+            docker run "${docker_run_args[@]}" -i "$TEMPLATE_IMAGE" bash -lc "${startup_bootstrap} --verbose"
+        fi
         return 0
     fi
 
-    # Run the startup SITL script inside the container in detached mode
-    printf "Executing startup script in container '%s' (detached)...\n" "$container_name"
-    if ! docker exec -d "$container_name" bash "$STARTUP_SCRIPT_CONTAINER"; then
-        printf "Error: Failed to execute startup script in '%s'\n" "$container_name" >&2
-        docker stop "$container_name" >/dev/null  # Stop container if startup fails
-        docker rm "$container_name" >/dev/null
+    # Run the startup SITL script as the container's main process so restart
+    # semantics remain correct after host reboots or docker restarts.
+    printf "Starting container '%s' with startup_sitl.sh as PID 1...\n" "$container_name"
+    if ! docker run "${docker_run_args[@]}" -d "$TEMPLATE_IMAGE" bash -lc "$detached_command" >/dev/null; then
+        printf "Error: Failed to start container '%s'\n" "$container_name" >&2
+        rm -rf "$runtime_dir"
         return 1
     fi
 
-    printf "Instance '%s' configured and started successfully.\n" "$container_name"
+    printf "Container '%s' started successfully with IP '%s'.\n" "$container_name" "$IP_ADDRESS"
+
+    if ! ensure_container_git_excludes "$container_name"; then
+        printf "Error: Failed to configure local git excludes in '%s'\n" "$container_name" >&2
+        docker stop "$container_name" >/dev/null
+        docker rm "$container_name" >/dev/null
+        rm -rf "$runtime_dir"
+        return 1
+    fi
+
+    printf "Instance '%s' launched. Awaiting readiness verification.\n" "$container_name"
+    CREATED_CONTAINERS+=("$container_name")
+}
+
+instance_is_ready() {
+    local container_name="$1"
+    docker exec "$container_name" bash -lc '
+        px4_dir="${MDS_PX4_DIR:-/root/PX4-Autopilot}"
+        base_dir="${MDS_BASE_DIR:-/root/mavsdk_drone_show}"
+        pgrep -f "${px4_dir}/build/px4_sitl_default/bin/px4" >/dev/null &&
+        pgrep -x mavlink-routerd >/dev/null &&
+        pgrep -f "${base_dir}/coordinator.py" >/dev/null
+    ' >/dev/null 2>&1
+}
+
+print_container_failure_logs() {
+    local container_name="$1"
+
+    printf "Recent startup diagnostics for '%s':\n" "$container_name" >&2
+    docker exec "$container_name" bash -lc "
+        echo '--- startup_sitl.log ---'
+        tail -n 60 '$STARTUP_LOG_CONTAINER' 2>/dev/null || true
+        echo '--- mavlink_router.log ---'
+        tail -n 40 '$HWID_CONTAINER_DIR/logs/mavlink_router.log' 2>/dev/null || true
+        echo '--- coordinator.log ---'
+        tail -n 40 '$HWID_CONTAINER_DIR/logs/coordinator.log' 2>/dev/null || true
+        echo '--- sitl_simulation.log ---'
+        tail -n 40 '$HWID_CONTAINER_DIR/logs/sitl_simulation.log' 2>/dev/null || true
+    " >&2 || true
+}
+
+wait_for_instances_ready() {
+    local pending=("${CREATED_CONTAINERS[@]}")
+    local next_pending=()
+    local elapsed=0
+    local container_name
+
+    if [ ${#pending[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    printf "\nWaiting for %d container(s) to become ready...\n" "${#pending[@]}"
+
+    while [ ${#pending[@]} -gt 0 ] && [ "$elapsed" -lt "$READY_TIMEOUT_SECONDS" ]; do
+        next_pending=()
+
+        for container_name in "${pending[@]}"; do
+            if instance_is_ready "$container_name"; then
+                READY_CONTAINERS+=("$container_name")
+                printf "Ready: %s\n" "$container_name"
+            else
+                next_pending+=("$container_name")
+            fi
+        done
+
+        pending=("${next_pending[@]}")
+        if [ ${#pending[@]} -eq 0 ]; then
+            return 0
+        fi
+
+        sleep "$READY_POLL_INTERVAL_SECONDS"
+        elapsed=$((elapsed + READY_POLL_INTERVAL_SECONDS))
+    done
+
+    FAILED_CONTAINERS=("${pending[@]}")
+    for container_name in "${FAILED_CONTAINERS[@]}"; do
+        printf "Error: '%s' did not become ready within %ss.\n" "$container_name" "$READY_TIMEOUT_SECONDS" >&2
+        print_container_failure_logs "$container_name"
+    done
+
+    return 1
 }
 
 # Function: report container-specific resource usage
@@ -359,6 +602,11 @@ main() {
 
     # Validate inputs
     validate_input "$num_instances"
+    validate_launcher_configuration
+
+    collect_mds_env_args
+    print_launcher_configuration
+    print_scale_guidance "$num_instances"
 
     # Setup Docker network
     setup_docker_network
@@ -382,6 +630,13 @@ main() {
         fi
     done
 
+    if ! $VERBOSE && [[ "$WAIT_FOR_READY" == "true" ]]; then
+        if ! wait_for_instances_ready; then
+            printf "Error: one or more containers failed readiness checks.\n" >&2
+            exit 1
+        fi
+    fi
+
     # Introductory banner
     cat << "EOF"
     ___  ___  ___  _   _ ___________ _   __ ____________ _____ _   _  _____   _____ _   _ _____  _    _    ____  ________  _______  
@@ -394,7 +649,11 @@ main() {
 EOF
 
     echo
-    printf "All %d instance(s) created and configured successfully.\n" "$num_instances"
+    if ! $VERBOSE && [[ "$WAIT_FOR_READY" == "true" ]]; then
+        printf "All %d instance(s) created and verified ready.\n" "$num_instances"
+    else
+        printf "All %d instance(s) created and configured successfully.\n" "$num_instances"
+    fi
     echo "========================================================="
     echo
     printf "Instances created with starting drone ID: %d\n" "$START_ID"
@@ -418,14 +677,15 @@ EOF
     printf "  bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --sitl\n"
     printf "You can access the swarm dashboard at http://GCS_SERVER_IP:3030\n\n"
 
-    printf "To access QGC on another system, ensure 'mavlink-router' is installed:\n"
-    printf "  bash ~/mavsdk_drone_show/tools/mavlink-router-install.sh\n\n"
+    printf "For remote QGroundControl / multi-GCS routing, use the current routing guide:\n"
+    printf "  ~/mavsdk_drone_show/docs/guides/mavlink-routing-setup.md\n\n"
 
-    printf "Then run one of the following commands:\n"
-    printf "  mavlink-routerd -e REMOTE_GCS_IP:24550 0.0.0.0:34550\n"
-    printf "  bash ~/mavsdk_drone_show/tools/mavlink_route.sh REMOTE_GCS_IP:24550\n\n"
+    printf "If you need the host-side MAVLink router helper, install it with:\n"
+    printf "  git clone https://github.com/alireza787b/mavlink-anywhere\n"
+    printf "  cd mavlink-anywhere\n"
+    printf "  sudo ./install_mavlink_router.sh\n\n"
 
-    printf "Now you can connect via QGC on port 24550 UDP from the remote GCS client.\n"
+    printf "Then point your remote GCS/QGC workflow at UDP port 24550 as documented in the routing guide.\n"
 
     # Provide cleanup command to remove all drone containers
     echo
@@ -434,8 +694,8 @@ EOF
     echo
 }
 
-# Ensure the startup script exists
-if [[ ! -f "$STARTUP_SCRIPT_HOST" ]]; then
+# Ensure the startup script exists when host override mode is enabled
+if [[ "${USE_HOST_STARTUP_SCRIPT}" == "true" ]] && [[ ! -f "$STARTUP_SCRIPT_HOST" ]]; then
     printf "Error: Startup script '%s' not found.\n" "$STARTUP_SCRIPT_HOST" >&2
     exit 1
 fi

@@ -1,9 +1,15 @@
 # src/led_controller.py
 
 import time
-import logging
 import threading
+
+from mds_logging import get_logger
+from typing import Union, Tuple, TYPE_CHECKING
 from src.params import Params
+
+# Import LED color definitions
+if TYPE_CHECKING:
+    from src.led_colors import LEDState
 
 # ===================================================================================
 # LED LIBRARY IMPORTS - SAFE FAILOVER APPROACH
@@ -26,22 +32,23 @@ PixelStrip = None
 Color = None
 Pi5Neo = None
 
-# Try Raspberry Pi 4 library first (default, proven method)
-try:
-    from rpi_ws281x import PixelStrip, Color
-    LED_LIBRARY = 'rpi_ws281x'
-    print("[LED] Loaded rpi_ws281x library (Pi 4 default)")
-except ImportError:
-    print("[LED] rpi_ws281x not available, trying Pi5Neo...")
-    # Fallback to Raspberry Pi 5 library
+if not Params.sim_mode:
+    # Try Raspberry Pi 4 library first (default, proven method)
     try:
-        from Pi5Neo import Pi5Neo
-        LED_LIBRARY = 'Pi5Neo'
-        print("[LED] Loaded Pi5Neo library (Pi 5 fallback)")
+        from rpi_ws281x import PixelStrip, Color
+        LED_LIBRARY = 'rpi_ws281x'
+        print("[LED] Loaded rpi_ws281x library (Pi 4 default)")
     except ImportError:
-        LED_LIBRARY = None
-        print("[LED] WARNING: No LED library available - LED support disabled")
-        print("[LED] Install: pip install rpi-ws281x (Pi 4) OR pip install Pi5Neo (Pi 5)")
+        print("[LED] rpi_ws281x not available, trying Pi5Neo...")
+        # Fallback to Raspberry Pi 5 library
+        try:
+            from Pi5Neo import Pi5Neo
+            LED_LIBRARY = 'Pi5Neo'
+            print("[LED] Loaded Pi5Neo library (Pi 5 fallback)")
+        except ImportError:
+            LED_LIBRARY = None
+            print("[LED] WARNING: No LED library available - LED support disabled")
+            print("[LED] Install: pip install rpi-ws281x (Pi 4) OR pip install Pi5Neo (Pi 5)")
 
 
 class LEDController:
@@ -77,8 +84,7 @@ class LEDController:
             raise Exception("This class is a singleton!")
 
         # Setup logging
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger = get_logger("led")
 
         self.strip = None
         self.led_library = None
@@ -228,6 +234,64 @@ class LEDController:
             except Exception as e:
                 # Never crash - just log error
                 instance.logger.error(f"Error setting LED color: {e}")
+
+    @staticmethod
+    def set_state(state: Union['LEDState', str]):
+        """
+        Sets all LEDs to the color defined by an LEDState enum or state name.
+
+        This is the preferred method for setting LED colors as it ensures
+        consistent color usage across the application.
+
+        Args:
+            state: Either an LEDState enum value or a string state name
+                   (e.g., 'BOOT_STARTED', 'GIT_SYNCING', 'IDLE_CONNECTED')
+
+        Example:
+            from src.led_colors import LEDState
+            LEDController.set_state(LEDState.BOOT_STARTED)
+            # or
+            LEDController.set_state('BOOT_STARTED')
+
+        Safety:
+            Never crashes - returns silently if state invalid or LED unavailable
+        """
+        try:
+            # Import here to avoid circular imports
+            from src.led_colors import LEDState, LEDColors
+
+            # Handle string input
+            if isinstance(state, str):
+                state_obj = LEDState.from_name(state)
+                if state_obj is None:
+                    # Try as color name fallback
+                    from src.led_colors import get_color_by_name
+                    try:
+                        r, g, b = get_color_by_name(state)
+                        LEDController.set_color(r, g, b)
+                        return
+                    except ValueError:
+                        instance = LEDController.get_instance()
+                        instance.logger.warning(f"Unknown LED state: {state}")
+                        return
+                state = state_obj
+
+            # Set color from LEDState
+            r, g, b = state.rgb
+            LEDController.set_color(r, g, b)
+
+            # Log state transition
+            if not Params.sim_mode:
+                instance = LEDController.get_instance()
+                instance.logger.info(f"LED state: {state.name} ({state.description})")
+
+        except Exception as e:
+            # Never crash on LED operations
+            try:
+                instance = LEDController.get_instance()
+                instance.logger.error(f"Error setting LED state: {e}")
+            except Exception:
+                pass
 
     @staticmethod
     def color_wipe(r: int, g: int, b: int, wait_ms=50):

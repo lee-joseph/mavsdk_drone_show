@@ -1,32 +1,31 @@
 
-# MDS Simulation Server Setup Guide MDS 3
+# MDS Simulation Server Setup Guide
 
 ## Introduction
 
-Welcome to the MDS Simulation Server Setup Guide. This document provides a **basic demonstration setup** for evaluation and learning purposes.
+Welcome to the MDS Simulation Server Setup Guide. This is the validated first-run path for loading the official SITL image, bootstrapping the GCS, and launching a quick demo on a fresh Ubuntu VPS.
 
-> **🎯 This guide is for DEMO and EVALUATION only**
+> **Scope**
 >
-> For production deployments, custom features, or real hardware implementation:
-> - **Email:** [p30planets@gmail.com](mailto:p30planets@gmail.com)
-> - **LinkedIn:** [Alireza Ghaderi](https://www.linkedin.com/in/alireza787b/)
+> This guide is the official quick-start for evaluation, demos, and repeatable SITL validation on a clean server.
+> For custom images, fork maintenance, or customer-specific redistribution, use [Advanced SITL Configuration](advanced-sitl.md) and [SITL Custom Release Workflow](sitl-custom-release-workflow.md).
+>
+> Advanced customization and real-hardware deployment require solid PX4/Linux/networking knowledge plus licensing, regulatory, and operational review. For private assistance or deployment consulting, contact [Alireza on LinkedIn](https://www.linkedin.com/in/alireza787b/) or [p30planets@gmail.com](mailto:p30planets@gmail.com).
 
-This document provides a complete, all-in-one framework for setting up and running either:
-- **Decentralized Drone Shows** (offline, pre-planned trajectories), and
-- **Live, Cooperative Swarm Missions** (real-time, leader–follower clustering with dynamic role changes).
+This same stack also powers multiple operator modes. Use this SITL guide first, then branch into the mode-specific docs you need:
 
-MDS 3.5 is built on the [`mavsdk_drone_show`](https://github.com/alireza787b/mavsdk_drone_show) repository (released September 2025). It supports:
-- **Offline Choreography Modes:** Preload "ShowMode" trajectory files (e.g., Spiral, Wave, Heart) that every drone executes in sync.
-- **Real-Time Swarm Mode:** A clustered leader–follower architecture with smart leader-failure handling, automatic leader re-election, dynamic formation reshuffling, and per-drone role changes on the fly.
+- **[Drone Show](../features/drone-show.md)** for SkyBrush ZIP import, show processing, and synchronized launch control
+- **[Smart Swarm](../features/smart-swarm.md)** for live leader-follower runtime operations
+- **[Swarm Trajectory](../features/swarm-trajectory.md)** for cluster trajectory generation and analysis
+- **[QuickScout](../quickscout.md)** for SAR / recon planning and mission execution
+- Additional modes may be added over time; new audited guides should appear in the [Documentation Index](../README.md)
 
-In other words, you can use the **same system** either to run an elaborate, pre-programmed drone-show performance or to orchestrate a live, fully decentralized cooperative mission—with failsafe checks, global setpoints, and robust startup sequences baked in. Both drone-show artists and swarm-mission engineers will find this guide relevant for taking advantage of MDS 3.5's unified feature set.
-
-For a step-by-step walkthrough beginning with version 0.1, see our YouTube tutorial playlist linked in the [GitHub repository](https://github.com/alireza787b/mavsdk_drone_show).
+For a step-by-step walkthrough beginning with version 0.1, use the [project YouTube playlist](https://www.youtube.com/watch?v=dg5jyhV15S8&list=PLVZvZdBQdm_7ViwRhUFrmLFpFkP3VSakk&pp=sAgC).
 
 
 ## Watch the Setup Video
 
-Check out our detailed **100-Drone SITL Test in Clustered Cloud Servers | MDS Mavsdk Drone Show Version 2** video for a visual guide on setting up and running the simulation.
+Check out our detailed **100-Drone SITL Test in Clustered Cloud Servers** video for a visual guide on setting up and running the simulation.
 
 [![100-Drone SITL Test](https://img.youtube.com/vi/VsNs3kFKEvU/maxresdefault.jpg)](https://www.youtube.com/watch?v=VsNs3kFKEvU)
 
@@ -50,7 +49,7 @@ The minimum resource allocation required for running two drone instances is **2 
 
 Create a Virtual Machine (VM) based on your requirements. For example, using Linode, choose sufficient resources based on the number of drones you want to simulate.
 
-**Recommended OS:** Ubuntu 234.
+**Recommended OS:** Ubuntu 22.04 or 24.04.
 
 ### Pointing a Domain or Subdomain (Optional)
 
@@ -87,70 +86,121 @@ ssh root@your_server_ip
 
 ### Package and Software Installation
 
-First, ensure that your system package list and Python3 pip package are up-to-date by running the following commands:
+First, install the base packages required for the SITL workflow, then install the official `MEGAcmd` Ubuntu package from MEGA so downloads and archive operations use one consistent client:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip tmux lsof git
+sudo apt install -y curl python3 python3-venv python3-pip tmux lsof git p7zip-full
+curl -fsSLo /tmp/megacmd-xUbuntu_24.04_amd64.deb \
+  https://mega.nz/linux/repo/xUbuntu_24.04/amd64/megacmd-xUbuntu_24.04_amd64.deb
+sudo apt install -y /tmp/megacmd-xUbuntu_24.04_amd64.deb
 ```
 
-#### Installing Mediafire Downloader
+#### Downloading the Official SITL Docker Image
 
-Install the Mediafire downloader to fetch the specialized drone image:
+The current SITL image is **temporarily** distributed from MEGA rather than GitHub Releases. If you prefer, you can also download the same `.7z` archive manually in a browser on the same machine, then continue with the exact same `7z` and `docker load` steps below.
 
-```bash
-pip3 install git+https://github.com/Juvenal-Yescas/mediafire-dl
-```
+The public archive keeps one stable filename:
+- `mavsdk-drone-show-sitl-image.7z`
 
-#### Downloading the Custom Drone Image
-
-In your home directory, download the latest image:
-
-```bash
-mediafire-dl 
-```
-
-If the script failed to download automatically from Mediafire (Mediafire Limitation), open [this link](http://www.mediafire.com/file/b44u4fs1rytjfoh/drone-template_v3.tar) in your browser, start downloading the file. Then pause the download and copy the download link. Now you can use `wget` to download the file as a workaround.
+Do **not** look for version numbers in the filename. Release versioning lives in the Docker tags restored by `docker load`.
 
 ```bash
 cd ~
-http://www.mediafire.com/file/b44u4fs1rytjfoh/drone-template_v3.tar
+# Public Mega download via the official MEGAcmd client; large archives may take several minutes.
+mega-get 'https://mega.nz/file/qewEgKDZ#KHah4cc_2zjLTEnHAGQuGF5sNlQ0K8de-3Uf_6w6a4I' .
+# Validate the archive before extracting it.
+7z t mavsdk-drone-show-sitl-image.7z
+# Extraction also takes time on large images.
+7z x mavsdk-drone-show-sitl-image.7z
 ```
+
+After extraction you should have:
+- `mavsdk-drone-show-sitl-image.7z` - compressed archive from Mega
+- `mavsdk-drone-show-sitl-image.tar` - Docker image tar produced by `7z`
+
+> **Notes**
+> - This guide standardizes on the official `MEGAcmd` client for both public downloads and authenticated archive operations.
+> - If you already downloaded the `.7z` in a browser, skip `mega-get` and continue with `7z t`, `7z x`, and `docker load`.
+> - If MEGA free-tier throttling blocks the public download, sign in and retry with `mega-login`.
+> - The public link may change over time, but the archive filename stays stable.
+> - The official HTTPS/demo bootstrap path keeps `MDS_GIT_AUTO_PUSH=false` by default, so first-time imports/config saves stay clean on read-only evaluation setups.
 
 ### Docker Installation
 
 Install Docker:
 
 ```bash
-sudo apt install docker.io
+sudo apt install -y docker.io
 ```
 
-Load the downloaded image into Docker:
+Load the extracted image into Docker:
 
 ```bash
-docker load < drone-template_v3.
-docker tag drone-template:v3.0 drone-template:latest
+# Large image imports may take several minutes.
+docker load -i mavsdk-drone-show-sitl-image.tar
 ```
+
+The archive already contains the official Docker tags. After `docker load`, confirm them with:
+
+```bash
+docker image ls mavsdk-drone-show-sitl
+```
+
+You should see the current official tags, including:
+- `mavsdk-drone-show-sitl:latest`
+- `mavsdk-drone-show-sitl:v5`
+
+After a successful `docker load`, you can reclaim several GB on smaller VPSes by deleting the temporary archive files:
+
+```bash
+rm -f ~/mavsdk-drone-show-sitl-image.tar ~/mavsdk-drone-show-sitl-image.7z
+```
+
+> **Important:** `create_dockers.sh` now defaults to `mavsdk-drone-show-sitl:latest`, so no manual retagging is required when you use the official archive. The archive filename stays stable; Docker tags carry the release version.
+>
+> **Still supported for advanced users:** This does **not** remove custom image or custom repository support. If you need your own fork, branch, or image tag, keep using `MDS_DOCKER_IMAGE`, `MDS_REPO_URL`, and `MDS_BRANCH` as documented in [Advanced SITL Configuration](advanced-sitl.md).
+>
+> **Need a custom release workflow?** See [SITL Custom Release Workflow](sitl-custom-release-workflow.md) for the clean path to maintain your own fork, rebuild a validated image, package it, and redistribute it without relying on ad hoc container edits.
+>
+> **Large-fleet note:** for validated demo/production runs with many containers, prefer a rebuilt image plus `MDS_SITL_GIT_SYNC=false` and usually `MDS_SITL_REQUIREMENTS_SYNC=false` so startup does not fan out into one remote git fetch or Python re-sync per container.
 
 #### Image Features and Components
 
 This custom image is a plug-and-play solution built on Ubuntu 22.04. It includes:
 
-- **PX4 1.16**
-- **mavsdk_drone_show**
+- **PX4 SITL with Gazebo Harmonic support**
+- **mavsdk_drone_show** preloaded as a shallow git checkout so each container can sync the latest branch state on startup
+- **Python virtual environment** prebuilt from `requirements.txt` for faster container startup
 - **mavlink-router**
-- **mavlink2rest**
-- **Gazebo**
+- **mavlink2rest-ready routing target** on `127.0.0.1:14569` for optional future use
+- **Gazebo Sim (`gz`)**
 - **SITL workflow dependencies**
 - **All other necessary dependencies**
 
 Moreover, it has an auto hardware ID detection and instance creation system for automated drone instance creation.
 
+> **Current Docker SITL standard**
+> - `startup_sitl.sh` now launches **headless PX4 Gazebo Harmonic** with `HEADLESS=1 make px4_sitl gz_x500`
+> - the image keeps one prebuilt PX4 SITL build tree, the real PX4 git checkout plus submodule metadata, one baked `mavsdk_server` binary, and one prebuilt Python venv; old release layer history is flattened out during packaging
+> - release image prep removes the PX4 ARM firmware toolchain by default to save space because it is not required for normal SITL runtime; set `MDS_SITL_KEEP_ARM_TOOLCHAIN=true` before rebuilding if you intentionally need that toolchain in a custom image
+> - each container can still fetch and hard-reset to the latest configured MDS branch on startup, and that sync now also cleans untracked MDS files while preserving runtime artifacts such as `venv/`, `logs/`, `*.hwID`, and the baked `mavsdk_server`
+> - PX4 and the baked `mavsdk_server` binary are pinned inside the image and are updated only through a validated image rebuild; they are not auto-pulled during container startup
+> - `MDS_SITL_GIT_SYNC=true` is a mutable latest-on-boot mode. It is convenient for active development, but it is not the same as a reproducible validated release because the runtime MDS checkout may move ahead of the pinned PX4/image contents
+> - image prep writes build metadata and PX4 provenance into the repo root so startup logs can show what was baked into the image
+> - `requirements.txt` changes trigger a venv sync automatically; unchanged requirements do not reinstall on every boot
+> - runtime file logs are bounded by default so containers stay small, common PX4 `pxh>` prompt noise is reduced in the raw SITL log, and those logs disappear when the container is removed
+> - `QT_QPA_PLATFORM=offscreen` is set automatically for headless runs
+> - each drone gets its own Gazebo transport partition by default to avoid cross-container interference
+> - legacy Gazebo Classic / jMAVSim modes are no longer the supported Docker SITL path
+> - `create_dockers.sh` now waits for PX4, `mavlink-routerd`, and `coordinator.py` before it reports a container as ready; `startup_sitl.sh` runs as the container main process with Docker restart policy `unless-stopped` by default, and startup-wrapper diagnostics are written to `logs/startup_sitl.log`
+> - the default launcher now uses the image-baked `startup_sitl.sh` for reproducible release behavior; set `MDS_SITL_USE_HOST_STARTUP_SCRIPT=true` only when you intentionally want a host-side debug override
+
 #### Need Custom Repository or Advanced Configuration?
 
 The default setup works perfectly for demos and testing. For advanced users who need custom repositories or production deployments:
 
-📖 **[Advanced SITL Configuration Guide](advanced_sitl.md)** - Custom repository setup with simple copy-paste commands
+📖 **[Advanced SITL Configuration Guide](advanced-sitl.md)** - Custom repository setup with simple copy-paste commands
 
 > **⚠️ Note:** Advanced configuration requires good understanding of Git, Docker, and Linux. Contact [p30planets@gmail.com](mailto:p30planets@gmail.com) for help.
 
@@ -164,50 +214,89 @@ docker run -d -p 8000:8000 -p 9443:9443 --name portainer --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
 ```
 
-YoAccess Portainer via the browser using your domain, IP address, or the reverse DNS provided by your hosting service like Linode. e.g., `https://drone.YOUR_DOMAIN.com:9443`
+Access Portainer via the browser using your domain, IP address, or the reverse DNS provided by your hosting service like Linode. e.g., `https://drone.YOUR_DOMAIN.com:9443`
 
 ## Drone Configuration and Setup
 
 ### GCS Server Setup
+
+#### Option A: Automated Setup (Recommended)
+
+The bootstrap installer handles Python, Node.js, venv, npm, firewall, repository setup, and configuration:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alireza787b/mavsdk_drone_show/main-candidate/tools/install_gcs.sh | sudo bash
+```
+
+See the [GCS Setup Guide](gcs-setup.md) for full details and CLI options (for example `--dry-run`, `-y`, or `--fork`).
+
+Notes:
+- This installer now handles headless SSH sessions cleanly. If no interactive TTY is available, it automatically switches to non-interactive defaults instead of trying to read from `/dev/tty`.
+- After the installer finishes and you launch the dashboard, give the backend a few seconds to come up before treating a first `curl` failure as a problem. The quickest readiness check is:
+  ```bash
+  curl http://127.0.0.1:5000/health
+  ```
+
+#### Option B: Manual Setup
+
+If you prefer to set things up manually:
+
+> **Important:** the manual path assumes a working Python `3.11+` interpreter.
+> On Ubuntu 22.04, `python3` is often still `3.10`, so prefer **Option A** on a fresh VPS unless you have already installed Python 3.11 or newer yourself.
 
 ```bash
 cd ~
 git clone https://github.com/alireza787b/mavsdk_drone_show
 cd mavsdk_drone_show
 git checkout main-candidate
-python3 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Webserver Software Installations
+Install Node.js (Node.js 22 LTS recommended via [nvm](https://nodejs.org/en/download/package-manager); Node.js 20 is still tolerated if you need it), then:
 
-MDS's swarm dashboard requires Node.js and npm. Install them by following the instructions for your operating system on the [official Node.js website](https://nodejs.org/en/download/package-manager) (version 20 using nvm is recommended).
-After Installing the Node.js and npm, setup your react dashboard project using following command:
 ```bash
 cd ~/mavsdk_drone_show/app/dashboard/drone-dashboard
-npm install
+npm ci
 ```
-Now you can Run the automated webserver run script anytime you need:
+
+#### Start the Dashboard
 
 ```bash
 bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --sitl
 ```
 
-- If it's your first time running the server, it will ask you to enter the webserver IP which is accessible by client. It can be your server public IP.
-- To change the IP next times, either remove the `.env` file or use the `--overwrite-ip "YOUR_SERVER_IP"` argument.
+- `--sitl` by itself starts the dashboard in **development mode**: React `npm start` on port `3030` plus FastAPI with auto-reload on port `5000`.
+- Use `bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --prod --sitl` when you want the optimized production-style launch instead.
+- Production currently uses a single Gunicorn worker on purpose because heartbeat state, command tracking, and background pollers still live in process memory.
+- Production serves the React build with SPA route fallback, so direct browser refresh on routes like `/logs` or `/mission-config` keeps working.
+- On smaller VPSes, raise the React build heap before `--prod` if needed:
+  `export MDS_REACT_BUILD_MAX_OLD_SPACE_SIZE=4096`
+- Console logs now default to `INFO` for both `--sitl` and `--prod`; session/file logs still keep `DEBUG`. If you need deeper live console tracing, set `export MDS_GCS_CONSOLE_LOG_LEVEL=DEBUG` before launch.
+- The launcher uses `npm ci` by default and refuses to mutate `package-lock.json` with `npm install` unless you explicitly opt in with `MDS_ALLOW_NPM_INSTALL_FALLBACK=true`.
+- Raw Uvicorn/Gunicorn access logs are disabled by default because MDS already emits structured API request logs. Re-enable them only when you explicitly need that extra layer with `export MDS_GCS_ACCESS_LOGS=true`.
+- The dashboard auto-detects the server IP from the browser URL — no manual IP configuration needed.
+- To override the IP: use `--overwrite-ip "YOUR_SERVER_IP"` or edit the `.env` file.
+- The official stock SITL package now auto-seeds a default launch origin from `data/origin.sitl.default.json` (Azadi Stadium). That gives first-time testers an immediate green Mission Config baseline without a manual `/set-origin`.
+- If you later change origin from the dashboard or API, MDS writes a local runtime override to `data/origin.json`. That file is intentionally untracked and overrides the packaged SITL default on that server until you replace or remove it.
+- If you want to return a server back to the stock Azadi demo baseline, delete the local `data/origin.json` override and restart the normal SITL flow.
 
-You should now be able to access the GUI via a browser using your domain, IP, or reverse DNS (if set). E.g., `http://drone.YOUR_DOMAIN.com:3000`
+You should now be able to access the GUI via a browser using your domain, IP, or reverse DNS (if set). E.g., `http://drone.YOUR_DOMAIN.com:3030`
 
-> **Note:** If you can't access the page, make sure your firewall rules allow communication on ports **3000**, **7070**, **5000** (defined in `params` and `.env`).
+> **Note:** If you can't access the page, make sure your firewall rules allow communication on ports **3030** (dashboard), **5000** (GCS API), and **14550/udp** (MAVLink). See the [GCS Setup Guide](gcs-setup.md#firewall-ports) for the full port list.
 
 ### Mission Configuration and Customization (Optional)
 
 You can configure your mission, swarm design, or drone show using SkyBrush or similar tools.
 
-Remember, if you want to make any changes to these configurations, you should push those changes to your own forked GitHub repo; otherwise, none of these settings will take effect and will be overwritten (pulled) from the main MDS repo.
+If you are running the default mutable latest-on-boot mode with `MDS_SITL_GIT_SYNC=true`, container startup fetches and hard-resets the MDS repo to the configured branch, so uncommitted container-local edits are disposable by design.
 
-Certainly! Below is the updated **Run Drone Instances** section for your README. It is structured to cater to both novice users and advanced users who wish to deploy drones across multiple servers (VPS). The section includes clear instructions, detailed explanations, and links to additional resources for advanced configurations.
+For the stock official SITL package, Mission Config initially uses the tracked Azadi Stadium demo origin. That is just the packaged first-run baseline for repeatable validation. Operators can still set a different origin in the UI/API at any time, which creates a local `data/origin.json` runtime override on that server.
+
+For an official or validated release workflow, do **not** rely on in-container edits. Commit changes to git first, rebuild or release a clean image, and then redeploy containers from that image. See [SITL Custom Release Workflow](sitl-custom-release-workflow.md) if you maintain your own fork or customer-specific image.
+
+The following section covers the standard flow for launching SITL drone instances, with an optional note for multi-server scaling.
 
 ---
 
@@ -244,7 +333,7 @@ Certainly! Below is the updated **Run Drone Instances** section for your README.
     bash multiple_sitl/create_dockers.sh 2
     ```
 
-    **Explanation:** The script `create_dockers.sh` initializes Docker containers representing your simulated drones. The number **"2"** specifies how many drones to create. Ensure your server has sufficient resources (CPU, memory, disk space) to handle the specified number of drones. The created instances will appear in your Portainer container list, where you can manage, monitor, and remove them as needed.
+    **Explanation:** The script `create_dockers.sh` initializes Docker containers representing your simulated drones. Each container forwards the active `MDS_*` runtime variables, bind-mounts only per-drone runtime state such as the generated `.hwID` file, and launches the image-baked `startup_sitl.sh` as the container's main process by default. That startup path can optionally hard-reset the MDS repo to the latest configured branch, re-syncs the Python venv only if `requirements.txt` changed, verifies the baked `mavsdk_server` binary, starts headless PX4 `gz_x500`, applies any SITL PX4 parameter overrides via launch-time `PX4_PARAM_*` environment variables, validates PX4 startup, and brings up MAVLink routing plus `coordinator.py`. Use `MDS_SITL_USE_HOST_STARTUP_SCRIPT=true` only when you intentionally want a host-side debug override instead of the image-baked startup path.
 
     > **Hints:** For debugging purposes, use the `--verbose` flag to create a single drone and view detailed logs.
 
@@ -262,6 +351,13 @@ Each server should operate within a distinct Docker network subnet to prevent IP
    bash multiple_sitl/create_dockers.sh 50 --subnet 172.19.0.0/24 --start-id 51 --start-ip 2 # On server 2
   ```
 
+> **Important:** the stock SITL files in this repo define only 5 drones by default:
+> - `config_sitl.json`
+> - `swarm_sitl.json`
+>
+> Creating 50+ containers requires matching expanded SITL config/swarm files and usually a validated custom image or fork workflow. Do not assume `create_dockers.sh 50` alone is sufficient on the stock 5-drone config.
+> Use [Advanced SITL Configuration](advanced-sitl.md) for that path.
+
 - `--subnet SUBNET`: (Optional) Specify a custom Docker network subnet. Defaults to `172.18.0.0/24` if not provided.
 - `--start-id START_ID`: (Optional) Define the starting drone ID. Defaults to `1` if not specified.
 - `--start-ip START_IP`: (Optional) Set the starting IP address's last octet within the subnet. Defaults to `2` to avoid reserved IPs.
@@ -271,7 +367,11 @@ To enable communication between drones across different subnets (i.e., different
 
 
 
-### Netbird VPN Setup (Optional but Recommended for MAVLink Streaming)
+### Netbird VPN Setup (Optional for External QGroundControl / Remote GCS Streaming)
+
+This section is **not** required for the normal first-run SITL path in this guide.
+
+Docker SITL already handles the internal routing between the GCS and the drone containers through `startup_sitl.sh`. Only use the NetBird / external MAVLink routing path when you intentionally want a separate remote QGroundControl or another external GCS to receive forwarded MAVLink traffic from this server.
 
 Netbird is a zero-config VPN solution that allows you to easily and securely connect your devices, including your server and local PC. This is especially useful if you want to set up a Ground Control Station (e.g., QGroundControl) on your local PC or smartphone and monitor your drone's data in real-time. Netbird is recommended for this setup to ensure efficient and secure data transmission.
 
@@ -352,11 +452,12 @@ When your drones are being managed by a GCS on the server, the MAVLink data pack
 Before we proceed with the MAVLink routing, we first need to ensure MAVLink Router is installed on the server. Follow these steps to install MAVLink Router:
 
 ```bash
-cd ~/mavsdk_drone_show
-sudo bash tools/mavlink-router-install.sh
+git clone https://github.com/alireza787b/mavlink-anywhere
+cd mavlink-anywhere
+sudo ./install_mavlink_router.sh
 ```
 
-This script will handle the installation process for MAVLink Router. Once completed, you can proceed with configuring the router.
+This installs the current recommended MAVLink Router helper. For the complete routing model and current port expectations, see [MAVLink Routing Setup](mavlink-routing-setup.md).
 
 ##### Understanding the Command
 
@@ -374,7 +475,7 @@ sudo ufw allow 14550/udp
 sudo ufw allow 24550/udp
 sudo ufw allow 34550/udp
 sudo ufw allow 5000
-sudo ufw allow 3000
+sudo ufw allow 3030
 ```
 or
 ```bash
@@ -383,8 +484,7 @@ sudo iptables -A INPUT -p udp --dport 24550 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 34550 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 5000 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 5000 -j ACCEPT
-sudo iptables -A INPUT -p udp --dport 3000 -j ACCEPT
-sudo iptables -A INPUT -p tcp --dport 3000 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 3030 -j ACCEPT
 sudo iptables-save | sudo tee /etc/iptables/rules.v4
 ```
 
@@ -399,7 +499,7 @@ In the given command, MAVLink messages are being sent initially on port `34550` 
 On your local GCS, open QGroundControl and navigate to **'Application Settings'** > **'Comm Links'**. Create a new comm link, name it (e.g., **'server1'**), check the **'High Latency'** mode, set the connection type to **'UDP'**, set the port to **`24550`**, and add the server (`SERVER_GCS_NETBIRD_IP`). Save and select this comm link to connect. All your drones should now be auto-detected.
 
 #### Using MAVLink2REST
-While its not yet fully implemented, soon MDS will rely more on MAVLink2REST. If you setup the routing and Netbird network, you should be able to access each drone via REST API on port 8088 eg. http://172.18.0.2:8088 . visit [MAVLINK2REST documentation](https://github.com/mavlink/mavlink2rest) for more.
+The current Docker SITL workflow does **not** auto-start a per-drone `mavlink2rest` server. The router still forwards MAVLink to `127.0.0.1:14569` so a future or custom `mavlink2rest` process can subscribe there, but you should **not** assume `http://DRONE_IP:8088` is available from the stock image today. If you intentionally add `mavlink2rest`, use the routed local endpoint and review the upstream [MAVLink2REST documentation](https://github.com/mavlink/mavlink2rest) for the expected process and REST port behavior.
 
 
 ## Clean-Up
@@ -434,27 +534,27 @@ While SITL simulations are great for testing, they are not a substitute for real
 
 We are committed to regularly updating this project to make it a reliable product soon. Thank you for your interest, and happy flying!
 
-## Enhancements in Version 3.5 (Released September 2025)
+## Smart Swarm Notes
 
-With the switch from Version 2 to Version 3, we have fully re-enabled and hardened the smart swarm’s Leader–Follower mode, and overhauled the drone-show workflow. Details:
+Smart Swarm is the live leader-follower mission mode in MDS. For the current operator model, failover behavior, and runtime control surface, use the dedicated guide:
 
-- **Leader–Follower Mode Now Fully Operational**  
-  - Basic leader failure handling is implemented: if the leader goes offline or fails to respond, followers automatically revert to a safe loiter point and await a new leader assignment.  
-  - Followers transition smoothly when the leader changes, with minimal jitter.  
-  - Queueing logic has been optimized so that newly joining drones sync to the current formation without disrupting existing members.
+- [Smart Swarm Guide](../features/smart-swarm.md)
 
-- **Drone-Show Workflow Improvements**  
-  - **Global Mode Setpoints:** You can now specify a single global “ShowMode” parameter in the mission file. All drones read this parameter at startup to determine flight patterns (e.g., “Spiral,” “Wave,” “Heart”).  
-  - **Enhanced Failsafe Checks:**  
-    - Preflight sanity checks verify that every drone’s parameters (battery, GPS lock, ESC responsiveness) meet minimum thresholds before arming.  
-    - In-flight failsafes detect communication timeouts, altimeter discrepancies, and ESC reboot events; the system automatically issues a “Return-to-Home” or “Loiter” command if any failsafe is triggered.  
-  - **Stable Startup Sequence:**  
-    - Each drone now waits for a global “OK-to-Start” broadcast from the GCS. This ensures that all SITL instances have connected and parameterized before any takeoff commands are sent.  
-    - The initialization handshake has been simplified: three-way acknowledgments (drone⇄PX4, PX4⇄MAVSDK, MAVSDK⇄GCS) guarantee that no drone launches prematurely.  
-  - **Robustness & Bug Fixes:**  
-    - Fixed a race condition where, under high CPU load, some drones would skip critical parameter uploads and end up in GUIDED mode instead of AUTO.  
-    - Resolved an issue in which emergency land commands were occasionally ignored when issued during a mode transition.  
-    - Optimized network-buffer handling to prevent packet drops when simulating large swarms (100+ drones).  
+Current behavior summary:
+
+- single-drone commands remain scoped to the addressed drone
+- swarm-level intent should use the `Smart Swarm Runtime` controls on the `Swarm Design` page
+- use `Overview` to confirm live `READY` state before you start Smart Swarm from the dashboard
+- use `Formation Analysis` to choose a specific cluster; `All executable clusters` is plot-only and does not become one fleet-wide runtime target
+- followers do not silently stop just because one unrelated drone receives an individual override
+- if the addressed drone is a leader or relay leader, followers can still react through leader-loss logic
+- leader-loss handling now defaults to an `upstream_or_hold` policy instead of jumping across unrelated drones
+
+If you want the validated 5-drone Smart Swarm acceptance run from the command line after launching SITL, use:
+
+```bash
+python3 tools/validate_smart_swarm_runtime.py
+```
 
 
 ## Additional Resources

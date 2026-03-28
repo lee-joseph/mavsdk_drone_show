@@ -7,18 +7,21 @@ import {
   faSave,
   faPlus,
   faUpload,
+  faFileExport,
   faFileCsv,
   faUndo,
   faMapMarkerAlt,
   faServer,
   faSync,
+  faCodeBranch,
 } from '@fortawesome/free-solid-svg-icons';
 import { CircularProgress } from '@mui/material';
+import { useSyncDrones } from '../hooks/useSyncDrones';
 
 /**
  * ControlButtons
  *
- * Provides top-level actions: Save, Add Drone, Set Origin, Configure GCS, Import, Export, Revert
+ * Provides top-level actions: Save, Add Drone, Set Origin, Configure GCS, Import, Export, Revert, Sync Drones
  * with a consistent UI/UX approach.
  */
 const ControlButtons = ({
@@ -27,6 +30,7 @@ const ControlButtons = ({
   handleRevertChanges,
   handleFileChange,
   exportConfig,
+  exportConfigCSV,
   openOriginModal,
   openGcsConfigModal,
   handleResetToDefault,
@@ -35,6 +39,7 @@ const ControlButtons = ({
   loading,
 }) => {
   const fileInputRef = useRef(null);
+  const { syncing, syncDrones: handleSyncDrones } = useSyncDrones();
 
   const triggerFileInput = () => {
     if (fileInputRef.current) {
@@ -66,6 +71,26 @@ const ControlButtons = ({
           )}
         </button>
 
+        {/* Sync Drones */}
+        <button
+          className="sync-drones"
+          onClick={handleSyncDrones}
+          title="Trigger git pull on all drones to sync with GCS"
+          disabled={syncing}
+        >
+          {syncing ? (
+            <>
+              <CircularProgress size={20} color="inherit" />
+              &nbsp;Syncing...
+            </>
+          ) : (
+            <>
+              <FontAwesomeIcon icon={faCodeBranch} />
+              Sync Drones
+            </>
+          )}
+        </button>
+
         {/* Add New Drone */}
         <button className="add" onClick={addNewDrone} title="Add a new drone">
           <FontAwesomeIcon icon={faPlus} />
@@ -87,32 +112,44 @@ const ControlButtons = ({
 
       {/* Secondary Actions */}
       <div className="secondary-actions">
-        {/* Import CSV */}
+        {/* Import Config (JSON or CSV) */}
         <button
           className="file-upload-btn"
           onClick={triggerFileInput}
-          title="Import drone config from CSV"
+          title="Import drone config from JSON or CSV"
         >
           <FontAwesomeIcon icon={faUpload} />
-          Import CSV
+          Import
         </button>
         <input
           type="file"
           ref={fileInputRef}
           onChange={handleFileChange}
           style={{ display: 'none' }}
-          accept=".csv"
+          accept=".json,.csv"
         />
 
-        {/* Export Config */}
+        {/* Export Config (JSON) */}
         <button
           className="export-config"
           onClick={exportConfig}
-          title="Export current drone configs to CSV"
+          title="Export current drone configs to JSON"
         >
-          <FontAwesomeIcon icon={faFileCsv} />
-          Export Config
+          <FontAwesomeIcon icon={faFileExport} />
+          Export JSON
         </button>
+
+        {/* Export Config (CSV) */}
+        {exportConfigCSV && (
+          <button
+            className="export-config"
+            onClick={exportConfigCSV}
+            title="Export current drone configs to CSV (legacy)"
+          >
+            <FontAwesomeIcon icon={faFileCsv} />
+            Export CSV
+          </button>
+        )}
 
         {/* Revert */}
         <button className="revert" onClick={handleRevertChanges} title="Revert all unsaved changes">
@@ -124,10 +161,10 @@ const ControlButtons = ({
         <button
           className="reset-default"
           onClick={handleResetToDefault}
-          title="Reset all drones to default (hw_id = pos_id)"
+          title="Reset all drones so each one flies its own show slot (Position ID = Hardware ID)"
         >
           <FontAwesomeIcon icon={faSync} />
-          Reset to Default
+          Reset Slot Assignments
         </button>
       </div>
     </div>
@@ -140,6 +177,7 @@ ControlButtons.propTypes = {
   handleRevertChanges: PropTypes.func.isRequired,
   handleFileChange: PropTypes.func.isRequired,
   exportConfig: PropTypes.func.isRequired,
+  exportConfigCSV: PropTypes.func,
   openOriginModal: PropTypes.func.isRequired,
   openGcsConfigModal: PropTypes.func.isRequired,
   handleResetToDefault: PropTypes.func.isRequired,

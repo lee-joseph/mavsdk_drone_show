@@ -30,7 +30,7 @@ The **Swarm Trajectory Feature** enables coordinated drone swarm missions where 
 - **Hierarchical Support**: Multi-level leader-follower relationships (leaders can have sub-leaders)
 - **Global Coordinates**: Uses lat/lon/alt throughout - no local conversions needed
 - **Smooth Interpolation**: Converts waypoints to smooth trajectories at 0.05s intervals
-- **Formation Integrity**: Maintains precise relative positioning using swarm.csv offsets
+- **Formation Integrity**: Maintains precise relative positioning using swarm.json offsets
 - **Visualization**: Generates 3D plots for trajectory analysis
 - **Google Earth Export**: KML files for 3D terrain visualization with time animation
 - **Mission Integration**: Seamlessly integrates with existing mission system
@@ -44,7 +44,7 @@ The **Swarm Trajectory Feature** enables coordinated drone swarm missions where 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Frontend UI   │────│  Backend API    │────│   Processing    │
-│  (React + CSS)  │    │  (Flask REST)   │    │   Pipeline      │
+│  (React + CSS)  │    │ (FastAPI REST)  │    │   Pipeline      │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                                 │                        │
                                 ▼                        ▼
@@ -61,15 +61,15 @@ The **Swarm Trajectory Feature** enables coordinated drone swarm missions where 
 - ✅ **No NED Conversion**: Trajectories are smoothed directly in global coordinates  
 - ✅ **Cubic Spline Interpolation**: Waypoints → smooth trajectory at 0.05s intervals
 
-**Follower Processing (Respects swarm.csv Configuration)**:
-- **Body Coordinate Mode** (`body_coord=1`): Forward/Right relative to lead drone's heading
+**Follower Processing (Respects swarm.json Configuration)**:
+- **Body Frame** (`frame="body"`): Forward/Right relative to lead drone's heading
   ```python
-  # offset_n=5m Forward, offset_e=3m Right → rotated by lead drone's yaw
+  # offset_x=5m Forward, offset_y=3m Right → rotated by lead drone's yaw
   # Maintains formation relative to heading direction
   ```
-- **NED Coordinate Mode** (`body_coord=0`): Fixed North/East geographic directions  
+- **NED Frame** (`frame="ned"`): Fixed North/East geographic directions
   ```python
-  # offset_n=5m North, offset_e=3m East → fixed geographic formation
+  # offset_x=5m North, offset_y=3m East → fixed geographic formation
   # Formation maintains geographic orientation regardless of heading
   ```
 
@@ -98,7 +98,7 @@ The **Swarm Trajectory Feature** enables coordinated drone swarm missions where 
 ### Data Flow
 
 1. **Upload**: User uploads leader trajectories via UI
-2. **Analysis**: System analyzes swarm.csv for leader-follower structure  
+2. **Analysis**: System analyzes swarm.json for leader-follower structure
 3. **Processing**: Smooth leader trajectories, calculate follower positions
 4. **Generation**: Create individual CSV files for each drone
 5. **Visualization**: Generate 3D plots for analysis
@@ -155,8 +155,9 @@ functions/
 #### API Layer (`gcs-server/`)
 ```
 gcs-server/
-├── swarm_trajectory_routes.py # REST API endpoints
-└── app.py                     # Route registration
+└── app_fastapi.py             # FastAPI route registration
+functions/
+└── swarm_trajectory_service.py # Shared route/service logic
 ```
 
 #### Frontend (`app/dashboard/drone-dashboard/src/`)
@@ -324,7 +325,7 @@ swarm_missing_leader_strategy = 'skip'  # 'skip' or 'error'
 ### Common Issues
 
 #### "No lead drones found"
-- **Cause**: swarm.csv missing or no drones with `follow=0`
+- **Cause**: swarm.json missing or no drones with `follow=0`
 - **Fix**: Verify swarm configuration has top leaders defined
 
 #### "Trajectory processing failed"  
@@ -332,12 +333,12 @@ swarm_missing_leader_strategy = 'skip'  # 'skip' or 'error'
 - **Fix**: Ensure CSV has all required columns (Name, Latitude, Longitude, etc.)
 
 #### "Files not found during execution"
-- **Cause**: Path resolution issue between gcs-server and root directory
-- **Fix**: Check file paths in `get_swarm_trajectory_folders()`
+- **Cause**: The project is being launched from an unexpected working directory
+- **Fix**: `get_swarm_trajectory_folders()` now resolves from the repository root; if this persists, verify the repo checkout itself is intact
 
 #### "Clear all doesn't delete everything"
-- **Cause**: Path resolution issue - clearing from wrong directory
-- **Status**: Known issue, fix in progress
+- **Cause**: Usually indicates manual files were placed outside `shapes*/swarm_trajectory/`
+- **Fix**: Re-run the clear action and verify stray files are not being written outside the standard swarm trajectory folders
 
 ### Debugging Tips
 

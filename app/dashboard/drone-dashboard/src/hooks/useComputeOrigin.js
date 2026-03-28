@@ -16,31 +16,29 @@ const useComputeOrigin = () => {
 
   /**
    * Triggers the origin computation.
-   * @param {object} params - { current_lat, current_lon, intended_east, intended_north }
+   * @param {object} params - { current_lat, current_lon, pos_id }
    */
   const computeOrigin = async (params) => {
-    const { current_lat, current_lon, intended_east, intended_north } = params;
+    const { current_lat, current_lon, pos_id } = params;
 
     // Validate input parameters
     if (
       current_lat === undefined ||
       current_lon === undefined ||
-      intended_east === undefined ||
-      intended_north === undefined
+      pos_id === undefined
     ) {
       setError('Incomplete parameters for origin computation.');
       return;
     }
 
     setLoading(true);
-    const backendURL = getBackendURL(process.env.REACT_APP_FLASK_PORT || '5000');
+    const backendURL = getBackendURL(); // Uses REACT_APP_GCS_PORT
 
     try {
       const response = await axios.post(`${backendURL}/compute-origin`, {
         current_lat,
         current_lon,
-        intended_east,
-        intended_north,
+        pos_id,
       });
 
       if (

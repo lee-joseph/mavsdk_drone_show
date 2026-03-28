@@ -1,11 +1,11 @@
 // src/components/CommandSender.js
 
-import React, { useState } from 'react';
+import React, { useMemo, useReducer, useState } from 'react';
 import ReactDOM from 'react-dom';
 import PropTypes from 'prop-types';
 import MissionTrigger from './MissionTrigger';
 import DroneActions from './DroneActions';
-import { sendDroneCommand } from '../services/droneApiService';
+import CommandPreflightSummary from './CommandPreflightSummary';
 import { toast } from 'react-toastify';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faRocket, faCog } from '@fortawesome/free-solid-svg-icons';
@@ -14,7 +14,14 @@ import {
   DRONE_ACTION_TYPES,
   getCommandName,
 } from '../constants/droneConstants';
+import { submitCommandWithLifecycleFeedback } from '../utilities/commandLifecycleFeedback';
+import {
+  formatClockOffsetLabel,
+  formatCommandAbsoluteTime,
+  getFleetReferenceClock,
+} from '../utilities/commandScheduling';
 import '../styles/CommandSender.css';
+import { FIELD_NAMES } from '../constants/fieldMappings';
 
 const CommandSender = ({ drones }) => {
   const [activeTab, setActiveTab] = useState('missionTrigger');
@@ -24,22 +31,89 @@ const CommandSender = ({ drones }) => {
   const [currentCommandData, setCurrentCommandData] = useState(null);
   const [confirmationMessage, setConfirmationMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const [, forceClockTick] = useReducer((value) => value + 1, 0);
+
+  React.useEffect(() => {
+    const interval = setInterval(forceClockTick, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const browserNowMs = Date.now();
+  const fleetClock = useMemo(
+    () => getFleetReferenceClock(drones, browserNowMs),
+    [browserNowMs, drones],
+  );
+  const clockOffsetLabel = formatClockOffsetLabel(fleetClock.offsetMs);
+  const selectedLookup = useMemo(
+    () => new Set(selectedDrones.map((value) => String(value))),
+    [selectedDrones],
+  );
+  const targetCount = targetMode === 'selected' ? selectedLookup.size : drones.length;
+  const targetLabel = targetMode === 'selected'
+    ? `${selectedDrones.length} selected drone${selectedDrones.length === 1 ? '' : 's'}`
+    : `all ${drones.length} drone${drones.length === 1 ? '' : 's'}`;
+  const targetDescriptor = targetMode === 'selected'
+    ? `Selected drones: ${selectedDrones.join(', ')}`
+    : 'Target scope: all configured drones';
+
+  const renderConfirmationDetails = () => {
+    if (!currentCommandData) {
+      return null;
+    }
+
+    const uiMeta = currentCommandData.uiMeta || {};
+    const showExecution = currentCommandData?.uiMeta?.triggerSummary
+      && currentCommandData.uiMeta.triggerSummary !== 'Immediate on acceptance';
+    const detailRows = [
+      {
+        label: 'Targets',
+        value: targetLabel,
+      },
+      ...(showExecution
+        ? [{
+          label: 'Execution',
+          value: uiMeta.triggerSummary || formatCommandAbsoluteTime(currentCommandData.triggerTime),
+        }]
+        : []),
+      ...((clockOffsetLabel && showExecution)
+        ? [{
+          label: 'Clock note',
+          value: `Scheduling uses the GCS-aligned clock. ${clockOffsetLabel}.`,
+        }]
+        : []),
+      ...((uiMeta.details || []).map((detail) => ({
+        label: detail.label,
+        value: detail.value,
+      }))),
+    ];
+
+    return detailRows.map((detail) => (
+      <p key={`${detail.label}-${detail.value}`}>
+        <strong>{detail.label}:</strong> {detail.value}
+      </p>
+    ));
+  };
 
   // Handle new command from child components (MissionTrigger/DroneActions)
   const handleSendCommand = (commandData) => {
-    let targetDronesList = 'All Drones';
     if (targetMode === 'selected') {
       if (selectedDrones.length === 0) {
         toast.error('No drones selected. Please select at least one drone.');
         return;
       }
-      targetDronesList = selectedDrones.join(', ');
     }
 
     const missionName = getCommandName(commandData.missionType);
-    setCurrentCommandData(commandData);
+    setCurrentCommandData({
+      ...commandData,
+      uiMeta: {
+        ...(commandData.uiMeta || {}),
+        operatorLabel: missionName,
+      },
+    });
     setConfirmationMessage(
-      `Command "${missionName}" will be sent to: ${targetDronesList}. Are you sure?`
+      commandData.uiMeta?.confirmationMessage
+        || `${missionName} → ${targetLabel}. Confirm dispatch.`
     );
     setModalOpen(true);
   };
@@ -55,13 +129,7 @@ const CommandSender = ({ drones }) => {
           commandDataToSend.target_drones = selectedDrones;
         }
 
-        const response = await sendDroneCommand(commandDataToSend);
-
-        if (response.status === 'success') {
-          toast.success('Command sent successfully!');
-        } else {
-          toast.error(`Error sending command: ${response.message}`);
-        }
+        await submitCommandWithLifecycleFeedback(commandDataToSend);
       } catch (error) {
         console.error('Error sending command:', error);
         toast.error('Error sending command. Please check console for details.');
@@ -88,7 +156,7 @@ const CommandSender = ({ drones }) => {
   };
 
   const selectAllDrones = () => {
-    const allDroneIds = drones.map((drone) => drone.hw_ID);
+    const allDroneIds = drones.map((drone) => drone[FIELD_NAMES.HW_ID]);
     setSelectedDrones(allDroneIds);
   };
 
@@ -102,15 +170,20 @@ const CommandSender = ({ drones }) => {
 
       {/* Target Selection UI */}
       <div className="target-selection">
-        <label htmlFor="targetMode" style={{ marginRight: '10px' }}>Command Target:</label>
-        <select
-          id="targetMode"
-          value={targetMode}
-          onChange={(e) => setTargetMode(e.target.value)}
-        >
-          <option value="all">All Drones</option>
-          <option value="selected">Select Drones</option>
-        </select>
+        <div className="target-selection__row">
+          <div>
+            <label htmlFor="targetMode" style={{ marginRight: '10px' }}>Command Target</label>
+            <p className="target-selection__hint">Choose whether this panel addresses the whole fleet or a controlled subset.</p>
+          </div>
+          <select
+            id="targetMode"
+            value={targetMode}
+            onChange={(e) => setTargetMode(e.target.value)}
+          >
+            <option value="all">All Drones</option>
+            <option value="selected">Select Drones</option>
+          </select>
+        </div>
 
         {targetMode === 'selected' && (
           <div className="drone-selection">
@@ -121,13 +194,13 @@ const CommandSender = ({ drones }) => {
             <div className="drone-grid">
               {drones.map((drone) => (
                 <div
-                  key={drone.hw_ID}
+                  key={drone[FIELD_NAMES.HW_ID]}
                   className={`drone-item ${
-                    selectedDrones.includes(drone.hw_ID) ? 'selected' : ''
+                    selectedDrones.includes(drone[FIELD_NAMES.HW_ID]) ? 'selected' : ''
                   }`}
-                  onClick={() => toggleDroneSelection(drone.hw_ID)}
+                  onClick={() => toggleDroneSelection(drone[FIELD_NAMES.HW_ID])}
                 >
-                  {drone.hw_ID}
+                  {drone[FIELD_NAMES.HW_ID]}
                 </div>
               ))}
             </div>
@@ -137,6 +210,14 @@ const CommandSender = ({ drones }) => {
           </div>
         )}
       </div>
+
+      <CommandPreflightSummary
+        drones={drones}
+        targetMode={targetMode}
+        selectedDrones={selectedDrones}
+        referenceNowMs={fleetClock.referenceNowMs}
+        clockOffsetLabel={clockOffsetLabel}
+      />
 
       {/* Tab Navigation with Expert UI/UX Icons */}
       <div className="tab-bar">
@@ -164,12 +245,17 @@ const CommandSender = ({ drones }) => {
           <MissionTrigger
             missionTypes={DRONE_MISSION_TYPES}
             onSendCommand={handleSendCommand}
+            referenceNowMs={fleetClock.referenceNowMs}
+            clockOffsetLabel={clockOffsetLabel}
           />
         )}
         {activeTab === 'actions' && (
           <DroneActions
             actionTypes={DRONE_ACTION_TYPES}
             onSendCommand={handleSendCommand}
+            targetCount={targetCount}
+            referenceNowMs={fleetClock.referenceNowMs}
+            clockOffsetLabel={clockOffsetLabel}
           />
         )}
       </div>
@@ -180,6 +266,12 @@ const CommandSender = ({ drones }) => {
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h3>Confirm Command</h3>
             <p>{confirmationMessage}</p>
+            <p className="command-confirmation-target-note">{targetDescriptor}</p>
+            {currentCommandData && (
+              <div className="command-confirmation-details">
+                {renderConfirmationDetails()}
+              </div>
+            )}
             <div className="modal-actions">
               <button className="confirm-button" onClick={handleConfirmSendCommand}>
                 Yes

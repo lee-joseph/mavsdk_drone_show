@@ -10,37 +10,39 @@
  * For commercial licensing, contact: p30planets@gmail.com
  */
 
-import React, { useState } from 'react';
+import React, { useState, Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 
 // Import theme system
 import { ThemeProvider } from './contexts/ThemeContext';
+import { MapProvider } from './contexts/MapContext';
 
 // Import design tokens first
 import './styles/DesignTokens.css';
 
-// Import pages and components
+// Eagerly loaded — primary operational views
 import Overview from './pages/Overview';
-import Detail from './components/DroneDetail';
-import SidebarMenu from './components/SidebarMenu';
-import SwarmDesign from './pages/SwarmDesign';
 import MissionConfig from './pages/MissionConfig';
-import DroneShowDesign from './pages/DroneShowDesign';
-import CustomShowPage from './pages/CustomShowPage';
-import GlobeView from './pages/GlobeView';
-import ManageDroneShow from './pages/ManageDroneShow';
-import SwarmTrajectory from './pages/SwarmTrajectory';
+import SidebarMenu from './components/SidebarMenu';
+import SyncWarningBanner from './components/SyncWarningBanner';
+import ErrorBoundary from './components/ErrorBoundary';
 
-// Clean import - no error boundary needed with Mapbox
-import TrajectoryPlanning from './pages/TrajectoryPlanning';
-
-// Import external styles
+// External styles and toast
 import { ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import 'leaflet/dist/leaflet.css';
-
-// Import main app styles (should come after design tokens)
 import './App.css';
+
+// Lazy loaded — heavy visualization pages (three.js, plotly, cytoscape, mapbox)
+const Detail = lazy(() => import('./components/DroneDetail'));
+const SwarmDesign = lazy(() => import('./pages/SwarmDesign'));
+const CustomShowPage = lazy(() => import('./pages/CustomShowPage'));
+const GlobeView = lazy(() => import('./pages/GlobeView'));
+const ManageDroneShow = lazy(() => import('./pages/ManageDroneShow'));
+const SwarmTrajectory = lazy(() => import('./pages/SwarmTrajectory'));
+const TrajectoryPlanning = lazy(() => import('./pages/TrajectoryPlanning'));
+const QuickScoutPage = lazy(() => import('./pages/QuickScoutPage'));
+const LogViewer = lazy(() => import('./pages/LogViewer'));
 
 /**
  * Main Application Component
@@ -53,16 +55,25 @@ const App = () => {
 
   return (
     <ThemeProvider>
-      <Router>
+      <ErrorBoundary>
+      <MapProvider>
+      <Router
+        future={{
+          v7_startTransition: true,
+          v7_relativeSplatPath: true,
+        }}
+      >
       <div className="app-container">
         <SidebarMenu
           collapsed={sidebarCollapsed}
           onToggle={setSidebarCollapsed}
         />
         <div className={`content ${sidebarCollapsed ? 'sidebar-collapsed' : 'sidebar-expanded'}`}>
+          <SyncWarningBanner />
+          <Suspense fallback={<div className="page-loading">Loading...</div>}>
           <Routes>
             {/* Main drone management routes */}
-            <Route path="/drone-show-design" element={<DroneShowDesign />} />
+            <Route path="/drone-show-design" element={<ManageDroneShow />} />
             <Route path="/swarm-design" element={<SwarmDesign />} />
             <Route path="/mission-config" element={<MissionConfig />} />
             <Route path="/drone-detail" element={<Detail drone={selectedDrone} goBack={() => setSelectedDrone(null)} />} />
@@ -73,10 +84,20 @@ const App = () => {
             
             {/* Enhanced Trajectory Planning Route with unified design system */}
             <Route path="/trajectory-planning" element={<TrajectoryPlanning />} />
+
+            {/* QuickScout SAR */}
+            <Route path="/quickscout" element={<QuickScoutPage />} />
+
+            {/* System */}
+            <Route path="/logs" element={<LogViewer />} />
+
+            {/* Backward-compatible alias used by workflow guidance */}
+            <Route path="/mission-control" element={<Overview setSelectedDrone={setSelectedDrone} />} />
             
             {/* Default route */}
             <Route path="/" element={<Overview setSelectedDrone={setSelectedDrone} />} />
           </Routes>
+          </Suspense>
         </div>
       </div>
       <ToastContainer 
@@ -96,6 +117,8 @@ const App = () => {
         progressClassName="toast-progress"
       />
       </Router>
+      </MapProvider>
+      </ErrorBoundary>
     </ThemeProvider>
   );
 };

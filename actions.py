@@ -50,10 +50,8 @@ This script executes various drone actions using MAVSDK:
 import argparse
 import asyncio
 import csv
-import glob
-import logging
-import logging.handlers
 import os
+import requests
 import socket
 import subprocess
 import sys
@@ -62,8 +60,17 @@ import time
 import psutil
 from mavsdk import System, telemetry, action
 from mavsdk.action import ActionError
+from src.drone_config import ConfigLoader
 from src.led_controller import LEDController
 from src.params import Params
+
+# Unified logging system
+from mds_logging.drone import init_drone_logging
+from mds_logging import get_logger, register_component
+
+register_component("actions", "drone", "Drone action execution")
+init_drone_logging()
+logger = get_logger("actions")
 
 # Return codes: 0 = success, 1 = failure
 RETURN_CODE = 0
@@ -71,27 +78,6 @@ RETURN_CODE = 0
 GRPC_PORT = Params.DEFAULT_GRPC_PORT
 UDP_PORT = Params.mavsdk_port
 HW_ID = None
-
-# Configure logging
-logs_directory = os.path.join("logs", "action_logs")
-os.makedirs(logs_directory, exist_ok=True)
-
-logger = logging.getLogger("action_logger")
-logger.setLevel(logging.DEBUG)
-
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s: %(message)s', '%Y-%m-%d %H:%M:%S')
-
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(formatter)
-
-log_file = os.path.join(logs_directory, "actions.log")
-file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(formatter)
-
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
 
 # -----------------------
 # Helper / Setup Functions
@@ -135,7 +121,17 @@ def wait_for_port(port, host='localhost', timeout=10.0):
 async def log_mavsdk_output(mavsdk_server):
     """
     Asynchronously reads MAVSDK server's stdout/stderr for logging.
+    Filters known cleanup messages that appear during normal server shutdown.
     """
+    # Known non-error messages that appear during normal MAVSDK cleanup
+    CLEANUP_PATTERNS = [
+        "Socket closed",
+        "connection reset",
+        "Broken pipe",
+        "Connection refused",
+        "EOF",
+    ]
+
     loop = asyncio.get_event_loop()
     try:
         while True:
@@ -151,62 +147,14 @@ async def log_mavsdk_output(mavsdk_server):
             line = await loop.run_in_executor(None, mavsdk_server.stderr.readline)
             if not line:
                 break
-            logger.error(f"MAVSDK Server Error: {line.decode().strip()}")
+            msg = line.decode().strip()
+            # Check if this is a known cleanup message (not a real error)
+            if any(pattern.lower() in msg.lower() for pattern in CLEANUP_PATTERNS):
+                logger.debug(f"MAVSDK cleanup: {msg}")
+            else:
+                logger.error(f"MAVSDK Server Error: {msg}")
     except Exception:
         logger.exception("Error reading MAVSDK server stderr")
-
-def read_hw_id():
-    """
-    Attempts to read the first *.hwID file in the current directory
-    and parse it as an integer hardware ID.
-    """
-    hwid_files = glob.glob('*.hwID')
-    if hwid_files:
-        filename = hwid_files[0]
-        hw_id_str = os.path.splitext(filename)[0]
-        logger.info(f"Hardware ID file detected: {filename}")
-        try:
-            hw_id = int(hw_id_str)
-            logger.info(f"Hardware ID {hw_id} detected.")
-            return hw_id
-        except ValueError:
-            logger.error(f"Invalid hardware ID format in {filename}. Expected an integer.")
-            return None
-    else:
-        logger.warning("No .hwID file found.")
-        return None
-
-def read_config(filename=Params.config_csv_name):
-    """
-    Reads the drone configuration from a CSV file matching the HW_ID.
-    Returns a dictionary with drone_config or None if not found/failed.
-    """
-    global HW_ID
-    logger.info("Reading drone configuration...")
-    try:
-        with open(filename, newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                hw_id = int(row.get('hw_id', -1))
-                if hw_id == HW_ID:
-                    drone_config = {
-                        'hw_id': hw_id,
-                        'pos_id': int(row.get('pos_id', -1)),
-                        'x': float(row.get('x', 0.0)),
-                        'y': float(row.get('y', 0.0)),
-                        'ip': row.get('ip', ''),
-                        'udp_port': int(row.get('mavlink_port', UDP_PORT)),
-                        'grpc_port': 50040 + hw_id,  # Standard GRPC port calculation
-                        # Note: gcs_ip removed - now centralized in Params.GCS_IP
-                    }
-                    logger.info(f"Drone configuration: {drone_config}")
-                    return drone_config
-        logger.warning(f"No matching HW_ID {HW_ID} found in config file.")
-    except FileNotFoundError:
-        logger.error(f"Config file '{filename}' not found.")
-    except Exception:
-        logger.exception("Error reading config file")
-    return None
 
 def stop_mavsdk_server(mavsdk_server):
     """
@@ -322,7 +270,7 @@ async def perform_action(action, altitude=None, parameters=None, branch=None, re
 
     # For init_sysid, we do need a valid HW_ID. That is checked later in init_sysid logic.
     # For apply_common_params or normal flight actions, we also read HW_ID for consistency.
-    HW_ID = read_hw_id()
+    HW_ID = ConfigLoader.get_hw_id()
 
     if action not in ["init_sysid", "update_code"]:
         # For normal flight actions (and apply_common_params), we also read config
@@ -331,7 +279,7 @@ async def perform_action(action, altitude=None, parameters=None, branch=None, re
             fail()
             return
 
-        drone_config = read_config()
+        drone_config = ConfigLoader.read_config(HW_ID)  # Returns raw CSV row dict (keys: hw_id, pos_id, ip, mavlink_port, serial_port, baudrate)
         if not drone_config:
             logger.error("Drone config not found, cannot proceed.")
             fail()
@@ -426,6 +374,118 @@ async def wait_for_drone_connection(drone, timeout=10):
         if time.time() - start > timeout:
             return False
         await asyncio.sleep(0.5)
+
+
+async def wait_for_telemetry_condition(stream_factory, predicate, description, timeout=20):
+    """
+    Wait until a MAVSDK telemetry stream satisfies a predicate.
+
+    This keeps action completion aligned with actual vehicle state changes
+    instead of treating MAVSDK RPC acceptance as the terminal success signal.
+    """
+    deadline = time.monotonic() + timeout
+    async for sample in stream_factory():
+        if predicate(sample):
+            logger.info(f"{description} confirmed.")
+            return sample
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for {description}")
+
+
+def _get_local_drone_state_snapshot(timeout: float = 1.0):
+    """Read the local drone API state as a fallback readiness signal for this container."""
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{Params.drone_api_port}/get_drone_state",
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            return response.json()
+    except requests.RequestException:
+        return None
+    return None
+
+
+def _get_local_home_position_snapshot(timeout: float = 1.0):
+    """Read the local drone API home position as a fallback altitude reference."""
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{Params.drone_api_port}/{Params.get_drone_home_URI}",
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            return response.json()
+    except requests.RequestException:
+        return None
+    return None
+
+
+def _get_local_relative_altitude_snapshot(timeout: float = 1.0):
+    """Derive relative altitude from the local drone API when MAVSDK telemetry lags."""
+    drone_state = _get_local_drone_state_snapshot(timeout=timeout)
+    home_position = _get_local_home_position_snapshot(timeout=timeout)
+    if not drone_state or not home_position:
+        return None
+
+    try:
+        current_altitude = float(drone_state.get("position_alt"))
+        home_altitude = float(home_position.get("altitude"))
+    except (TypeError, ValueError):
+        return None
+
+    return current_altitude - home_altitude
+
+
+async def wait_until_armed_state(drone, expected: bool, timeout=15):
+    state_label = "armed" if expected else "disarmed"
+    return await wait_for_telemetry_condition(
+        drone.telemetry.armed,
+        lambda armed: armed is expected,
+        f"vehicle to become {state_label}",
+        timeout=timeout,
+    )
+
+
+async def wait_until_landed_state(drone, expected_states, description, timeout=20):
+    expected_states = set(expected_states)
+    return await wait_for_telemetry_condition(
+        drone.telemetry.landed_state,
+        lambda state: state in expected_states,
+        description,
+        timeout=timeout,
+    )
+
+
+async def wait_until_flight_mode(drone, expected_mode, timeout=15):
+    return await wait_for_telemetry_condition(
+        drone.telemetry.flight_mode,
+        lambda mode: mode == expected_mode,
+        f"flight mode {expected_mode.name}",
+        timeout=timeout,
+    )
+
+
+async def wait_until_relative_altitude(drone, minimum_relative_altitude_m: float, timeout=30):
+    try:
+        return await wait_for_telemetry_condition(
+            drone.telemetry.position,
+            lambda position: position.relative_altitude_m >= minimum_relative_altitude_m,
+            f"relative altitude >= {minimum_relative_altitude_m:.1f}m",
+            timeout=timeout,
+        )
+    except TimeoutError:
+        local_relative_altitude = _get_local_relative_altitude_snapshot(timeout=1.0)
+        if (
+            local_relative_altitude is not None
+            and local_relative_altitude >= minimum_relative_altitude_m
+        ):
+            logger.warning(
+                "Relative altitude confirmed via local drone API fallback: %.2fm >= %.2fm",
+                local_relative_altitude,
+                minimum_relative_altitude_m,
+            )
+            return local_relative_altitude
+        raise
 
 async def safe_action(func, *args, **kwargs):
     """
@@ -556,25 +616,50 @@ async def apply_common_params(drone, reboot_after=False):
 # Action Implementations
 # -----------------------
 
-async def ensure_ready_for_flight(drone):
+async def ensure_ready_for_flight(drone, timeout: float | None = None):
     """
     Before takeoff, ensure the drone is healthy, global position is good,
     and home position is set.
     """
+    preflight_timeout = float(timeout or getattr(Params, "TAKEOFF_PREFLIGHT_TIMEOUT_SEC", 30))
     logger.info("Checking preflight conditions...")
-    start = time.time()
+    start = time.monotonic()
     gps_ok = False
     home_ok = False
+    last_reported_state = None
     async for health in drone.telemetry.health():
         if health.is_global_position_ok:
             gps_ok = True
         if health.is_home_position_ok:
             home_ok = True
+
+        local_state = _get_local_drone_state_snapshot()
+        local_home_ok = bool(local_state and local_state.get("home_position_set"))
+        if local_home_ok:
+            home_ok = True
+
+        home_source = "mavsdk" if health.is_home_position_ok else ("drone_api" if local_home_ok else "pending")
+        current_state = (gps_ok, home_ok, home_source)
+        if current_state != last_reported_state:
+            logger.info(
+                "Preflight health update: gps_ok=%s, home_ok=%s, home_source=%s, elapsed=%.1fs/%.1fs",
+                gps_ok,
+                home_ok,
+                home_source,
+                time.monotonic() - start,
+                preflight_timeout,
+            )
+            last_reported_state = current_state
         if gps_ok and home_ok:
             logger.info("Preflight checks passed: GPS and Home position are good.")
             return True
-        if time.time() - start > 15:
-            logger.error("Preflight checks timed out. GPS or Home not ready.")
+        if time.monotonic() - start > preflight_timeout:
+            logger.error(
+                "Preflight checks timed out. GPS or Home not ready (gps_ok=%s, home_ok=%s, timeout=%.1fs).",
+                gps_ok,
+                home_ok,
+                preflight_timeout,
+            )
             return False
         await asyncio.sleep(1)
 
@@ -589,13 +674,27 @@ async def takeoff(drone, altitude):
 
     # Try arming
     try:
+        target_altitude = float(altitude)
         led_controller.set_color(255, 255, 0)  # Yellow: starting
         await asyncio.sleep(0.5)
-        await drone.action.set_takeoff_altitude(float(altitude))
+        await drone.action.set_takeoff_altitude(target_altitude)
         await drone.action.arm()
+        await wait_until_armed_state(drone, True, timeout=10)
         led_controller.set_color(255, 255, 255)  # White: armed
         await asyncio.sleep(0.5)
         await drone.action.takeoff()
+        await wait_until_landed_state(
+            drone,
+            {telemetry.LandedState.TAKING_OFF, telemetry.LandedState.IN_AIR},
+            "takeoff state transition",
+            timeout=15,
+        )
+        minimum_altitude = max(1.5, min(target_altitude - 0.5, target_altitude * 0.8))
+        await wait_until_relative_altitude(
+            drone,
+            minimum_altitude,
+            timeout=Params.TAKEOFF_ALTITUDE_CONFIRM_TIMEOUT_SEC,
+        )
     except ActionError as e:
         logger.error(f"Failed to take off: {e}")
         raise
@@ -622,6 +721,7 @@ async def land(drone):
 
     try:
         await drone.action.hold()
+        await wait_until_flight_mode(drone, telemetry.FlightMode.HOLD, timeout=10)
         await asyncio.sleep(1)
 
         # Indicate landing in progress (blue pulses)
@@ -632,6 +732,13 @@ async def land(drone):
             await asyncio.sleep(0.5)
 
         await drone.action.land()
+        await wait_until_landed_state(
+            drone,
+            {telemetry.LandedState.LANDING, telemetry.LandedState.ON_GROUND},
+            "landing state transition",
+            timeout=15,
+        )
+        await wait_until_armed_state(drone, False, timeout=45)
 
         for _ in range(3):
             led_controller.set_color(0, 255, 0)
@@ -657,6 +764,7 @@ async def return_rtl(drone):
 
     try:
         await drone.action.hold()
+        await wait_until_flight_mode(drone, telemetry.FlightMode.HOLD, timeout=10)
         await asyncio.sleep(1)
 
         for _ in range(3):
@@ -666,6 +774,7 @@ async def return_rtl(drone):
             await asyncio.sleep(0.5)
 
         await drone.action.return_to_launch()
+        await wait_until_flight_mode(drone, telemetry.FlightMode.RETURN_TO_LAUNCH, timeout=15)
 
         for _ in range(3):
             led_controller.set_color(0, 255, 0)
@@ -694,7 +803,7 @@ async def kill_terminate(drone):
 
     try:
         await drone.action.terminate()
-        await asyncio.sleep(1)
+        await wait_until_armed_state(drone, False, timeout=10)
         for _ in range(3):
             led_controller.set_color(0, 255, 0)
             await asyncio.sleep(0.2)
@@ -720,6 +829,7 @@ async def hold(drone):
     await asyncio.sleep(0.5)
     try:
         await drone.action.hold()
+        await wait_until_flight_mode(drone, telemetry.FlightMode.HOLD, timeout=10)
         led_controller.set_color(0, 0, 255)
         await asyncio.sleep(1)
         led_controller.turn_off()
@@ -740,7 +850,7 @@ async def test(drone):
         led_controller.set_color(255, 0, 0)
         await asyncio.sleep(1)
         await drone.action.arm()
-        led_controller.set_color(255, 255, white)
+        led_controller.set_color(255, 255, 255)
         await asyncio.sleep(1)
         led_controller.set_color(0, 0, 255)
         await asyncio.sleep(1)
@@ -816,7 +926,7 @@ async def update_code(branch=None):
         script_path = os.path.join('tools', 'update_repo_ssh.sh')
         command = [script_path]
         if branch:
-            command.append(branch)
+            command.extend(['--branch', branch])
         logger.info(f"Executing update script: {' '.join(command)}")
 
         process = await asyncio.create_subprocess_exec(
@@ -825,7 +935,20 @@ async def update_code(branch=None):
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
-            logger.error(f"Update script failed: {stderr.decode().strip()}")
+            stderr_text = stderr.decode().strip()
+            stdout_text = stdout.decode().strip()
+            logger.error(f"Update script failed (exit={process.returncode}): {stderr_text}")
+            # Parse structured failure result if available
+            for line in stdout_text.splitlines():
+                if line.startswith("GIT_SYNC_RESULT="):
+                    try:
+                        import json
+                        result = json.loads(line[len("GIT_SYNC_RESULT="):])
+                        logger.error(f"Sync failure detail: error={result.get('error')}, "
+                                     f"message={result.get('message')}")
+                    except Exception:
+                        pass
+                    break
             fail()
             for _ in range(3):
                 led_controller.set_color(255, 0, 0)
@@ -833,7 +956,20 @@ async def update_code(branch=None):
                 led_controller.turn_off()
                 await asyncio.sleep(0.2)
         else:
-            logger.info(f"Update script successful: {stdout.decode().strip()}")
+            stdout_text = stdout.decode().strip()
+            logger.info(f"Update script successful: {stdout_text}")
+            # Parse structured result if available
+            for line in stdout_text.splitlines():
+                if line.startswith("GIT_SYNC_RESULT="):
+                    try:
+                        import json
+                        result = json.loads(line[len("GIT_SYNC_RESULT="):])
+                        logger.info(f"Sync result: branch={result.get('branch')}, "
+                                    f"commit={result.get('commit')}, "
+                                    f"duration={result.get('duration')}s")
+                    except (json.JSONDecodeError, Exception) as parse_err:
+                        logger.warning(f"Could not parse GIT_SYNC_RESULT: {parse_err}")
+                    break
             for _ in range(3):
                 led_controller.set_color(0, 255, 0)
                 await asyncio.sleep(0.2)
@@ -872,7 +1008,9 @@ async def init_sysid(drone):
         led_controller.set_color(255, 255, 0)
         await asyncio.sleep(0.5)
 
-        # Set MAV_SYS_ID param
+        # TODO(deferred): Decouple hw_id from MAV_SYS_ID for >254 drone support.
+        # Currently hw_id == MAV_SYS_ID. MAVLink limits to uint8 (1-254).
+        # See docs/TODO_deferred.md #1
         await drone.param.set_param_int("MAV_SYS_ID", HW_ID)
         logger.info("MAV_SYS_ID parameter set successfully.")
 

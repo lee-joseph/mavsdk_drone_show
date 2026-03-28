@@ -3,6 +3,65 @@
 import os
 import struct
 from enum import Enum
+from pathlib import Path
+
+from mds_logging import get_logger
+
+logger = get_logger("params")
+
+# ===================================================================================
+# LOCAL CONFIGURATION LOADING
+# ===================================================================================
+# Load local overrides from /etc/mds/local.env if it exists.
+# This allows per-drone configuration without modifying the repository.
+#
+# Priority: local.env settings > environment variables > hardcoded defaults
+#
+# See tools/local.env.template for available settings.
+# ===================================================================================
+_local_env_path = Path('/etc/mds/local.env')
+if _local_env_path.exists():
+    try:
+        with open(_local_env_path) as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    # Only set if not already set (allows env vars to override)
+                    if key not in os.environ:
+                        os.environ[key] = value
+        logger.debug(f"Loaded local config from {_local_env_path}")
+    except Exception as e:
+        logger.warning(f"Failed to load local config from {_local_env_path}: {e}")
+
+
+def _safe_int(value: str, default: int) -> int:
+    """Safely convert string to int with fallback to default."""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid integer value '{value}', using default {default}")
+        return default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean feature flag from environment or local.env."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+
+    logger.warning(f"Invalid boolean value for {name!r}: {value!r}. Using default {default}.")
+    return default
+
 
 class Params:
     """
@@ -16,8 +75,8 @@ class Params:
 
     Attributes:
         sim_mode (bool): Indicates if the system is in simulation mode.
-        config_csv_name (str): Filename for the configuration CSV.
-        swarm_csv_name (str): Filename for the swarm CSV.
+        config_file_name (str): Filename for the configuration file (JSON).
+        swarm_file_name (str): Filename for the swarm file (JSON).
         GIT_BRANCH (str): Git branch name used for synchronization.
         (Other attributes as per project requirements.)
     """
@@ -29,12 +88,10 @@ class Params:
     # If 'real.mode' exists, sim_mode is False (real-life mode)
     sim_mode = not os.path.exists(real_mode_file)
 
-    # Debug: Print the current mode
-    print(f"[DEBUG] Simulation Mode: {sim_mode}")
-
+    # Configuration CSV filenames (determined by mode)
     # URLs for configuration files (not used in current implementation)
-    config_url = 'https://nb1.joomtalk.ir/download/config.csv'  # Ugit addRL for the configuration file
-    swarm_url = 'https://nb1.joomtalk.ir/download/swarm.csv'    # URL for the swarm file
+    config_url = 'https://nb1.joomtalk.ir/download/config.json'
+    swarm_url = 'https://nb1.joomtalk.ir/download/swarm.json'
 
     # Git Configuration
     # ===================================================================================
@@ -54,10 +111,11 @@ class Params:
     #   - All Python components (GCS server, functions, etc.) automatically use your config
     #
     # ENVIRONMENT VARIABLES:
-    #   MDS_REPO_URL  - Git repository URL (SSH or HTTPS)
-    #   MDS_BRANCH    - Git branch name
+    #   MDS_REPO_URL       - Git repository URL (SSH or HTTPS)
+    #   MDS_BRANCH         - Git branch name
+    #   MDS_GIT_AUTO_PUSH  - Enable/disable automatic commit+push from GCS workflows
     # ===================================================================================
-    GIT_AUTO_PUSH = True
+    GIT_AUTO_PUSH = _env_flag('MDS_GIT_AUTO_PUSH', True)
     GIT_REPO_URL = os.environ.get('MDS_REPO_URL', 'git@github.com:alireza787b/mavsdk_drone_show.git')
     GIT_BRANCH = os.environ.get('MDS_BRANCH', 'main-candidate')
 
@@ -68,34 +126,32 @@ class Params:
     #   - Heartbeat sending
     #   - MAVLink routing
     #   - Telemetry reporting
-    #   - Flask API communication
+    #   - API communication
     #   - Origin coordinate fetching
     #
     # Mode-specific GCS IP configuration:
     #   - SITL: Uses Docker gateway (172.18.0.1)
     #   - Real: Uses Tailscale/physical network IP
+    #
+    # Override via MDS_GCS_IP environment variable or /etc/mds/local.env
     # ===================================================================================
     if sim_mode:
-        GCS_IP = "172.18.0.1"              # SITL: Docker gateway IP
+        GCS_IP = os.environ.get('MDS_GCS_IP', "172.18.0.1")  # SITL: Docker gateway IP
     else:
-        GCS_IP = "100.96.32.75"            # Real mode: GCS IP (★ CHANGE THIS FOR YOUR SETUP ★)
+        GCS_IP = os.environ.get('MDS_GCS_IP', "100.96.32.75")  # Real mode: default GCS IP
 
-    GCS_FLASK_PORT = 5000                  # GCS Flask backend port
-    connectivity_check_ip = GCS_IP         # Use GCS_IP for connectivity checks
-    connectivity_check_port = GCS_FLASK_PORT
+    gcs_api_port = _safe_int(os.environ.get('MDS_GCS_API_PORT', '5000'), 5000)
+    connectivity_check_ip = os.environ.get('MDS_CONNECTIVITY_IP', GCS_IP)
+    connectivity_check_port = _safe_int(os.environ.get('MDS_CONNECTIVITY_PORT', str(gcs_api_port)), gcs_api_port)
     connectivity_check_interval = 10       # Interval in seconds between connectivity checks
 
     # Conditional Configuration File Names based on sim_mode
     if sim_mode:
-        config_csv_name = "config_sitl.csv"
-        swarm_csv_name = "swarm_sitl.csv"
+        config_file_name = "config_sitl.json"
+        swarm_file_name = "swarm_sitl.json"
     else:
-        config_csv_name = "config.csv"
-        swarm_csv_name = "swarm.csv"
-
-    # Debug: Print the selected configuration files
-    print(f"[DEBUG] Configuration CSV: {config_csv_name}")
-    print(f"[DEBUG] Swarm CSV: {swarm_csv_name}")
+        config_file_name = "config.json"
+        swarm_file_name = "swarm.json"
 
     # General Settings
     enable_drones_http_server = True  # Enable HTTP server on drones
@@ -105,6 +161,9 @@ class Params:
     default_sitl = True               # Use default 14550 port for single drone simulation
     online_sync_time = True           # Sync time from Internet Time Servers
     MAX_STALE_DURATION = 10           # Max time delay follower would still use the leader data
+    SMART_SWARM_LEADER_STATE_TIMEOUT_SEC = 1.0   # Per-request timeout for follower -> leader state fetches
+    SMART_SWARM_GCS_CONFIG_TIMEOUT_SEC = 2.0     # Per-request timeout for follower -> GCS swarm config refresh
+    SMART_SWARM_GCS_NOTIFY_TIMEOUT_SEC = 2.0     # Per-request timeout for follower -> GCS leader-change notify
     
     reboot_after_params = True
     
@@ -114,15 +173,20 @@ class Params:
 
     # minimum seconds between successive elections
     LEADER_ELECTION_COOLDOWN = 30
+    SMART_SWARM_LEADER_LOSS_STRATEGY = "upstream_or_hold"
 
     
     csv_dt = 0.05                     # default step time of the processed CSV file to generate (s)
 
 
 
-    # Flask Server Configuration
-    drones_flask_port = 7070                # Port for the drone's Flask server
-    polling_interval = 1                    # Polling interval in seconds
+    # API Server Configuration
+    drone_api_port = 7070                   # Port for the drone's API server
+    polling_interval = 1                    # Polling interval in seconds (legacy, used by standalone git_status.py)
+    telem_poll_interval = 1                 # GCS telemetry polling interval in seconds
+    git_poll_interval = 10                  # GCS git status polling interval in seconds
+    GCS_TELEMETRY_REQUEST_TIMEOUT_SEC = 2.0 # Per-request timeout for GCS -> drone telemetry pulls
+    GCS_GIT_STATUS_REQUEST_TIMEOUT_SEC = 5.0  # Per-request timeout for GCS -> drone git-status pulls
     get_drone_state_URI = 'get_drone_state' # URI for getting drone state
     send_drone_command_URI = 'api/send-command'  # Replace with actual URI
 
@@ -146,7 +210,12 @@ class Params:
 
     get_drone_home_URI = 'get-home-pos'     # URI for getting drone home position
     get_drone_gps_origin_URI = 'get-gps-global-origin'  # URI for getting drone GPS global origin position
-    flask_telem_socket_port = 5000          # Flask telemetry socket port
+
+    # GCS Server Port Configuration (Legacy Aliases)
+    GCS_PORT = gcs_api_port                 # DEPRECATED: Use gcs_api_port instead
+    gcs_server_port = gcs_api_port          # DEPRECATED: Use gcs_api_port instead
+    flask_telem_socket_port = gcs_api_port  # DEPRECATED: Use gcs_api_port instead
+    GCS_FLASK_PORT = gcs_api_port           # DEPRECATED: Use gcs_api_port instead
 
     get_position_deviation_URI = 'get-position-deviation'
     acceptable_deviation = 3.0              # Acceptable deviation in meters
@@ -158,8 +227,9 @@ class Params:
     
     enable_connectivity_check  = True # Enable Connectivity check Thread to ping GCS
 
-    # Environment Mode
-    env_mode = 'development'  # Change to 'production' for production mode
+    # Environment Mode - controls logging verbosity
+    # Set ENV_MODE environment variable to 'production' for cleaner logs
+    env_mode = os.getenv('ENV_MODE', 'production')  # Default to production (less verbose)
 
     # UDP Telemetry Configuration
     enable_udp_telemetry = False         # Enable/disable UDP telemetry
@@ -169,22 +239,24 @@ class Params:
     extra_swarm_telem = []               # Extra swarm telemetry IPs
     income_packet_check_interval = 0.1   # Interval for checking incoming packets
 
-    # MAVLink Connection Configuration
-    serial_mavlink = True              # Use serial connection for MAVLink
-    serial_mavlink_port = '/dev/ttyS0' # Serial port for Raspberry Pi Zero TTL
-    serial_baudrate = 57600            # Serial connection baudrate
-    sitl_port = 14550                  # SITL port
-    hw_udp_port = 14550
-    gcs_mavlink_port = 34550           # Port for sending MAVLink messages to GCS
-    mavsdk_port = 14540                # MAVSDK port
-    local_mavlink_port = 12550         # Local MAVLink port
-    local_mavlink2rest_port = 14569
-    shared_gcs_port = True             # Shared GCS port
-    extra_devices = [
-        f"127.0.0.1:{local_mavlink_port}",
-        f"127.0.0.1:{local_mavlink2rest_port}",
-        "100.96.64.247:14550", # GCS PC
-    ]  # Extra devices for MAVLink routing
+    # -------------------------------------------------------------------------
+    # MAVLink Ports Configuration
+    # -------------------------------------------------------------------------
+    # MAVLink routing is EXTERNAL (not managed by this application):
+    #   - SITL: tools/run_mavlink_router.sh (started by startup_sitl.sh)
+    #   - Real hardware: mavlink-anywhere systemd service
+    # See docs/guides/mavlink-routing-setup.md for setup instructions.
+    #
+    # These ports must match the external router configuration:
+    mavsdk_port = 14540                # MAVSDK SDK connection
+    local_mavlink_port = 12550         # LocalMavlinkController (pymavlink telemetry)
+    local_mavlink2rest_port = 14569    # mavlink2rest REST API bridge
+    gcs_mavlink_port = 14550           # Ground Control Station (QGC)
+
+    # Serial port defaults (used as fallback in drone_config if not specified in config)
+    # These are reference values for mavlink-anywhere configuration on real hardware
+    serial_mavlink_port = '/dev/ttyS0' # Default serial port (Raspberry Pi UART)
+    serial_baudrate = 57600            # Default serial baudrate
 
     hard_reboot_command_enabled = True  # Allow hard reboot commands (ensure root privileges)
     force_reboot = True
@@ -197,6 +269,8 @@ class Params:
 
     max_takeoff_alt = 100          # Maximum allowable takeoff altitude
     default_takeoff_alt = 10       # Default takeoff altitude
+    TAKEOFF_PREFLIGHT_TIMEOUT_SEC = 30  # MAVSDK GPS/home readiness wait before takeoff
+    TAKEOFF_ALTITUDE_CONFIRM_TIMEOUT_SEC = 60  # Allow slower multi-drone SITL climbs before declaring takeoff failure
 
     # LED Configuration
     led_count = 25        # Number of LED pixels
@@ -225,7 +299,7 @@ class Params:
     # Heartbeat interval (in seconds)
     heartbeat_interval = 10  
 
-    # The Flask endpoint path for receiving drone heartbeats on GCS
+    # The API endpoint path for receiving drone heartbeats on GCS
     gcs_heartbeat_endpoint = "/drone-heartbeat"
 
     netbird_ip_prefix = "100."
@@ -317,6 +391,7 @@ class Params:
     PD_KP = 0.5            # Proportional gain
     PD_KD = 0.1            # Derivative gain
     MAX_VELOCITY = 3.0     # Maximum velocity in m/s
+    SMART_SWARM_LEADER_VELOCITY_FEEDFORWARD = 1.0  # Scale factor for leader velocity feedforward
 
     # Low-Pass Filter Parameter
     LOW_PASS_FILTER_ALPHA = 0.2  # Smoothing factor between 0 and 1
@@ -427,8 +502,7 @@ class Params:
             filename
         )
         
-        # Debug: Print the trajectory file path
-        print(f"[DEBUG] Swarm Trajectory File: {trajectory_path}")
+        logger.debug(f"Swarm Trajectory File: {trajectory_path}")
         return trajectory_path
 
     @classmethod
@@ -458,8 +532,7 @@ class Params:
                 'shapes', custom_csv
             )
 
-        # Debug: Print the selected trajectory files
-        print(f"[DEBUG] Drone Trajectory File: {drone_show_trajectory_filename}")
-        print(f"[DEBUG] Custom Trajectory File: {custom_show_trajectory_filename}")
+        logger.debug(f"Drone Trajectory File: {drone_show_trajectory_filename}")
+        logger.debug(f"Custom Trajectory File: {custom_show_trajectory_filename}")
 
         return (drone_show_trajectory_filename, custom_show_trajectory_filename)

@@ -8,6 +8,7 @@ import useComputeOrigin from '../hooks/useComputeOrigin';
 import PropTypes from 'prop-types';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faSyncAlt } from '@fortawesome/free-solid-svg-icons';
+import { FIELD_NAMES } from '../constants/fieldMappings';
 
 /**
  * OriginModal
@@ -37,7 +38,6 @@ const OriginModal = ({
 
   // Altitude support (optional)
   const [altitude, setAltitude] = useState('');
-  const [altitudeSource, setAltitudeSource] = useState('manual');
 
   // A flag to ensure we auto-compute only once when a drone is first picked.
   const [hasAutoComputed, setHasAutoComputed] = useState(false);
@@ -58,13 +58,11 @@ const OriginModal = ({
         // Load altitude if available
         if (currentOrigin.alt !== undefined && currentOrigin.alt !== null) {
           setAltitude(currentOrigin.alt.toString());
-          setAltitudeSource(currentOrigin.alt_source || 'manual');
         }
       } else {
         setCoordinateInput('');
         setSelectedLatLon(null);
         setAltitude('');
-        setAltitudeSource('manual');
       }
 
       // Reset states
@@ -98,15 +96,14 @@ const OriginModal = ({
       const {
         current_lat,
         current_lon,
-        intended_east,
-        intended_north,
+        pos_id,
         isValid,
       } = extractDroneParameters(selectedDrone);
       if (!isValid) {
         setErrors({ drone: 'No valid telemetry or lat/lon is (0,0). Drone not connected?' });
         return;
       }
-      computeOrigin({ current_lat, current_lon, intended_east, intended_north });
+      computeOrigin({ current_lat, current_lon, pos_id });
     }
   }, [
     originMethod,
@@ -128,17 +125,15 @@ const OriginModal = ({
   // ------------------------------------------
   const extractDroneParameters = (drone) => {
     const tData = telemetryData[drone.hw_id] || {};
-    const lat = parseFloat(tData.lat || tData.Position_Lat || 0);
-    const lon = parseFloat(tData.lon || tData.Position_Long || 0);
+    const lat = parseFloat(tData[FIELD_NAMES.POSITION_LAT] || 0);
+    const lon = parseFloat(tData[FIELD_NAMES.POSITION_LONG] || 0);
 
     // If lat/lon ~ zero or missing => invalid
     if (Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001) {
       return {
         current_lat: 0,
         current_lon: 0,
-        // CRITICAL FIX: x = North, y = East (matches config.csv schema)
-        intended_north: parseFloat(drone.x) || 0,  // x is North
-        intended_east: parseFloat(drone.y) || 0,   // y is East
+        pos_id: drone.pos_id,
         isValid: false,
       };
     }
@@ -146,9 +141,7 @@ const OriginModal = ({
     return {
       current_lat: lat,
       current_lon: lon,
-      // CRITICAL FIX: x = North, y = East (matches config.csv schema)
-      intended_north: parseFloat(drone.x) || 0,  // x is North
-      intended_east: parseFloat(drone.y) || 0,   // y is East
+      pos_id: drone.pos_id,
       isValid: true,
     };
   };
@@ -185,8 +178,7 @@ const OriginModal = ({
     const {
       current_lat,
       current_lon,
-      intended_east,
-      intended_north,
+      pos_id,
       isValid,
     } = extractDroneParameters(selectedDrone);
 
@@ -195,7 +187,7 @@ const OriginModal = ({
       return;
     }
     // Attempt re-compute
-    computeOrigin({ current_lat, current_lon, intended_east, intended_north });
+    computeOrigin({ current_lat, current_lon, pos_id });
   };
 
   // ------------------------------------------
@@ -237,7 +229,7 @@ const OriginModal = ({
         // Add altitude from drone telemetry if available
         const selectedDrone = configData.find((d) => d.hw_id === selectedDroneId);
         const tData = telemetryData[selectedDrone?.hw_id] || {};
-        const droneAlt = tData.absolute_altitude_m || tData.Position_Alt;
+        const droneAlt = tData[FIELD_NAMES.POSITION_ALT];
 
         const originData = { ...origin };
         if (droneAlt && !isNaN(parseFloat(droneAlt))) {
@@ -346,7 +338,7 @@ const OriginModal = ({
                 <option value="">-- Select Drone --</option>
                 {configData.map((drone) => (
                   <option key={drone.hw_id} value={drone.hw_id}>
-                    Drone {drone.hw_id}
+                    Position {drone.pos_id} (HW {drone.hw_id})
                   </option>
                 ))}
               </select>
@@ -364,7 +356,7 @@ const OriginModal = ({
                 {selectedDroneId && (() => {
                   const selectedDrone = configData.find((d) => d.hw_id === selectedDroneId);
                   const tData = telemetryData[selectedDrone?.hw_id] || {};
-                  const droneAlt = tData.absolute_altitude_m || tData.Position_Alt;
+                  const droneAlt = tData[FIELD_NAMES.POSITION_ALT];
                   return droneAlt && !isNaN(parseFloat(droneAlt)) ? (
                     <p>Altitude: {parseFloat(droneAlt).toFixed(1)}m MSL (from drone)</p>
                   ) : null;

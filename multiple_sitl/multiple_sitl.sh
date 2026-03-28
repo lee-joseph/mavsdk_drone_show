@@ -15,13 +15,44 @@ ENABLE_LOGGING=false
 
 # Global counter
 declare -i COUNTER=0
-function get_coords_from_csv() {
-    local line_number=$1
-    # Get the directory of the script
+function get_coords() {
+    local hw_id=$1
     local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local x=`awk -v line=$line_number -F "," 'NR==line {print $3}' "$script_dir/../config.csv"`
-    local y=`awk -v line=$line_number -F "," 'NR==line {print $4}' "$script_dir/../config.csv"`
-    echo "Extracted coords for drone $line_number: x=$x, y=$y" >&2
+    local config_file="$script_dir/../config_sitl.json"
+
+    # Require jq for JSON parsing
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required. Install with: apt-get install -y jq" >&2
+        exit 1
+    fi
+
+    # Parse pos_id from JSON config
+    local pos_id
+    pos_id=$(jq -r ".drones[] | select(.hw_id == $hw_id) | .pos_id" "$config_file" 2>/dev/null)
+
+    if [[ -z "$pos_id" || "$pos_id" == "null" ]]; then
+        pos_id="$hw_id"
+        echo "Warning: hw_id=$hw_id not found in config, using pos_id=$hw_id" >&2
+    fi
+
+    # Read x,y from trajectory CSV (single source of truth for positions)
+    local traj_file="$script_dir/../shapes_sitl/swarm/processed/Drone ${pos_id}.csv"
+    local x=0
+    local y=0
+    if [ -f "$traj_file" ]; then
+        # Read first data row, extract px (North) and py (East) columns by header name
+        local header=$(head -1 "$traj_file")
+        local px_col=$(echo "$header" | tr ',' '\n' | grep -n '^px$' | cut -d: -f1)
+        local py_col=$(echo "$header" | tr ',' '\n' | grep -n '^py$' | cut -d: -f1)
+        if [ -n "$px_col" ] && [ -n "$py_col" ]; then
+            x=$(awk -v col="$px_col" -F "," 'NR==2 {print $col}' "$traj_file")
+            y=$(awk -v col="$py_col" -F "," 'NR==2 {print $col}' "$traj_file")
+        fi
+    else
+        echo "Warning: Trajectory file not found: $traj_file, using (0,0)" >&2
+    fi
+
+    echo "Drone hw_id=$hw_id pos_id=$pos_id: x=$x, y=$y (from trajectory CSV)" >&2
     echo $x $y
 }
 
@@ -39,7 +70,7 @@ function spawn_model() {
     X=$3
     Y=$4
 
-    local coords=$(get_coords_from_csv $(($N+1)))
+    local coords=$(get_coords $N)
     X=$(echo $coords | cut -d' ' -f1)
     Y=$(echo $coords | cut -d' ' -f2)
     echo "Using coords for drone $N: x=$X, y=$Y" >&2
@@ -111,7 +142,7 @@ do
 done
 
 num_vehicles=${NUM_VEHICLES:=4}
-#num_vehicles=${NUM_VEHICLES:=$(($(wc -l < ../config.csv) - 1))}
+#num_vehicles=${NUM_VEHICLES:=$(($(jq '.drones | length' ../config_sitl.json)))}
 
 world=${WORLD:=empty}
 target=${TARGET:=px4_sitl_default}

@@ -2,11 +2,11 @@
 
 import React, { useEffect, useState } from 'react';
 import '../styles/DronePositionMap.css';
-import { MapContainer, TileLayer, Marker, Popup, LayersControl } from 'react-leaflet';
+import { Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
 import LatLon from 'geodesy/latlon-spherical';
-
-const { BaseLayer } = LayersControl;
+import LeafletMapBase from './map/LeafletMapBase';
+import { normalizeComparableId } from '../utilities/missionIdentityUtils';
 
 // Fix the default icon issue in Leaflet
 delete L.Icon.Default.prototype._getIconUrl;
@@ -19,7 +19,13 @@ L.Icon.Default.mergeOptions({
     'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
-const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) => {
+const DronePositionMap = ({
+  originLat,
+  originLon,
+  drones,
+  trajectoryPositionsByPosId,
+  forwardHeading = 0,
+}) => {
   const [dronePositions, setDronePositions] = useState([]);
 
   useEffect(() => {
@@ -38,10 +44,15 @@ const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) 
 
       const positions = drones
         .map((drone) => {
-          const x = parseFloat(drone.x); // north
-          const y = parseFloat(drone.y); // east
+          const posId = normalizeComparableId(drone.pos_id, drone.hw_id) || normalizeComparableId(drone.hw_id);
+          const trajectoryPosition = trajectoryPositionsByPosId?.[posId];
+          const x = Number(
+            trajectoryPosition?.x !== undefined ? trajectoryPosition.x : drone.x
+          ); // north
+          const y = Number(
+            trajectoryPosition?.y !== undefined ? trajectoryPosition.y : drone.y
+          ); // east
           if (!isValidNumber(x) || !isValidNumber(y)) {
-            console.error(`Invalid drone coords for hw_id=${drone.hw_id}:`, { x, y });
             return null;
           }
 
@@ -71,7 +82,7 @@ const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) 
           return destination
             ? {
                 hw_id: drone.hw_id,
-                pos_id: drone.pos_id,
+                pos_id: posId,
                 lat: destination.lat,
                 lon: destination.lon,
               }
@@ -83,14 +94,14 @@ const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) 
     } else {
       setDronePositions([]);
     }
-  }, [originLat, originLon, drones, forwardHeading]);
+  }, [originLat, originLon, drones, trajectoryPositionsByPosId, forwardHeading]);
 
   if (!originLat || !originLon) {
     return <p>Please set the origin coordinates to view the drone positions on the map.</p>;
   }
 
   if (dronePositions.length === 0) {
-    return <p>No drone positions available to display on the map.</p>;
+    return <p>No trajectory-based launch positions are available to display on the map.</p>;
   }
 
   const avgLat = dronePositions.reduce((sum, d) => sum + d.lat, 0) / dronePositions.length;
@@ -108,22 +119,12 @@ const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) 
   return (
     <div className="drone-position-map">
       <h3>Drone Positions on Map (Heading = {forwardHeading}°)</h3>
-      <MapContainer center={[avgLat, avgLon]} zoom={16} maxZoom={22} scrollWheelZoom>
-        <LayersControl position="topright">
-          <BaseLayer checked name="Satellite">
-            <TileLayer
-              url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-              attribution="&copy; Esri &mdash; Esri, DeLorme, NAVTEQ"
-            />
-          </BaseLayer>
-          <BaseLayer name="OpenStreetMap">
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='&copy; <a href="https://osm.org/copyright">OSM</a>'
-            />
-          </BaseLayer>
-        </LayersControl>
-
+      <LeafletMapBase
+        center={[avgLat, avgLon]}
+        zoom={16}
+        defaultLayer="esriSatellite"
+        showLayerControl={false}
+      >
         {dronePositions.map((drone) => (
           <Marker
             key={drone.hw_id}
@@ -141,7 +142,7 @@ const DronePositionMap = ({ originLat, originLon, drones, forwardHeading = 0 }) 
             </Popup>
           </Marker>
         ))}
-      </MapContainer>
+      </LeafletMapBase>
     </div>
   );
 };

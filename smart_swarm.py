@@ -16,14 +16,14 @@
  Description:
    This project implements a smart swarm control system using MAVSDK, designed
    to operate drones in a coordinated formation. The system distinguishes
-   between leader and follower drones based on configuration CSV files. Followers
+   between leader and follower drones based on configuration JSON files. Followers
    receive state updates from the leader, process these with a Kalman filter, and
    compute velocity commands using a PD controller (with low-pass filtering).
    The code is built using Python's asyncio framework for concurrent tasks such as
    state updates, control loops, and dynamic configuration updates.
 
  Features:
-   - Reads drone and swarm configuration from CSV files.
+   - Reads drone and swarm configuration from JSON files.
    - Dynamically updates swarm configuration (role, formation offsets, etc.) during flight.
    - Integrates a primary (telemetry API) and a fallback (HTTP API) source for fetching
      the drone's GPS global origin.
@@ -37,7 +37,7 @@
  Workflow:
    1. Initialization:
       - Read the hardware ID from a .hwID file.
-      - Load drone configuration from config.csv and swarm configuration from swarm.csv.
+      - Load drone configuration from config.json and swarm configuration from swarm.json.
       - Determine if the drone is operating as a Leader or Follower.
       - Set formation offsets and body coordinate mode based on the swarm configuration.
       - For followers, extract leader information and initialize a Kalman filter.
@@ -49,7 +49,7 @@
       - Set the reference position for NED coordinate conversion.
    
    3. Dynamic Configuration Update:
-      - A periodic task (update_swarm_config_periodically) re-reads the swarm CSV at a defined
+      - A periodic task (update_swarm_config_periodically) re-reads the swarm config at a defined
         interval to detect any configuration changes (role, offsets, etc.).
       - On detecting changes:
           * If switching from follower to leader, the follower tasks are cancelled.
@@ -73,7 +73,7 @@
 
  Notes:
    - The project is part of the "mavsdk_drone_show" repository.
-   - Future improvements may include replacing the CSV-based configuration update with a
+   - Future improvements may include replacing the JSON-based configuration update with a
      direct query to a Ground Control Station (GCS) endpoint.
    - This file serves as the central orchestrator for the swarm behavior and leverages
      several modules (e.g., Kalman filter, PD controller, LED controller) for a modular
@@ -84,15 +84,15 @@
 
 import os
 import sys
+import logging
 import time
 import asyncio
 import csv
 import subprocess
-import logging
-import logging.handlers
 import socket
 import psutil
 import argparse
+from typing import Optional
 from datetime import datetime
 from collections import namedtuple
 from mavsdk import System
@@ -100,9 +100,9 @@ from mavsdk.offboard import PositionNedYaw, VelocityBodyYawspeed, VelocityNedYaw
 from mavsdk.action import ActionError
 from tenacity import retry, stop_after_attempt, wait_fixed
 import navpy
-import requests
 import numpy as np  # Added for numerical computations
 
+from src.drone_config import ConfigLoader
 from src.led_controller import LEDController
 from src.params import Params
 import aiohttp 
@@ -110,14 +110,19 @@ import aiohttp
 from smart_swarm_src.kalman_filter import LeaderKalmanFilter
 from smart_swarm_src.pd_controller import PDController  # New import
 from smart_swarm_src.low_pass_filter import LowPassFilter  # New import
+from smart_swarm_src.failover import choose_leader_loss_response
 from smart_swarm_src.utils import (
     transform_body_to_nea,
     is_data_fresh,
     fetch_home_position,
     lla_to_ned
 )
+from src.swarm_runtime_state import write_runtime_swarm_assignment
 
-from drone_show_src.utils import configure_logging
+# Unified logging system
+from mds_logging.drone import init_drone_logging
+from mds_logging import get_logger, register_component
+from mds_logging.cli import add_log_arguments, apply_log_args
 
 # ----------------------------- #
 #        Data Structures        #
@@ -128,7 +133,7 @@ DroneConfig = namedtuple(
 )
 
 SwarmConfig = namedtuple(
-    "SwarmConfig", "hw_id follow offset_n offset_e offset_alt body_coord"
+    "SwarmConfig", "hw_id follow offset_x offset_y offset_z frame"
 )
 
 # ----------------------------- #
@@ -136,14 +141,14 @@ SwarmConfig = namedtuple(
 # ----------------------------- #
 
 HW_ID = None  # Hardware ID of the drone
-DRONE_CONFIG = {}  # Drone configurations from config.csv
-SWARM_CONFIG = {}  # Swarm configurations from swarm.csv
+DRONE_CONFIG = {}  # Drone configurations from config.json
+SWARM_CONFIG = {}  # Swarm configurations from swarm.json
 DRONE_STATE = {}  # Own drone's state
 LEADER_STATE = {}  # Leader drone's state
 OWN_STATE = {}  # Own drone's NED state
 IS_LEADER = False  # Flag indicating if this drone is a leader
-OFFSETS = {'n': 0.0, 'e': 0.0, 'alt': 0.0}  # Offsets from the leader
-BODY_COORD = False  # Flag indicating if offsets are in body coordinates
+OFFSETS = {'x': 0.0, 'y': 0.0, 'z': 0.0}  # Offsets from the leader
+FRAME = "ned"  # Coordinate frame for offsets: "ned" or "body"
 LEADER_HW_ID = None  # Hardware ID of the leader drone
 LEADER_IP = None  # IP address of the leader drone
 LEADER_KALMAN_FILTER = None  # Kalman filter instance for leader state estimation
@@ -157,6 +162,7 @@ FOLLOWER_TASKS = {}  # Dictionary to hold tasks for follower mode (leader update
 
 leader_unreachable_count = 0  # Initialize the counter for failed leader fetch attempts
 max_unreachable_attempts = Params.MAX_LEADER_UNREACHABLE_ATTEMPTS  # Set the max retries before leader election
+LEADER_FAILOVER_IN_PROGRESS = False  # Prevent duplicate failover runs while leader health is degraded
 
 # for leader-election cooldown
 last_election_time = 0.0
@@ -177,6 +183,192 @@ def parse_float(field_value, default=0.0):
     except (TypeError, ValueError):
         logger.warning(f"parse_float: Invalid or missing value '{field_value}', using default={default}")
         return default
+
+
+def normalize_hw_id(hw_id):
+    """Normalize a hardware ID for dict lookups. Returns None for leader/no-follow."""
+    try:
+        normalized = int(hw_id)
+    except (TypeError, ValueError):
+        return None
+
+    if normalized <= 0:
+        return None
+    return str(normalized)
+
+
+def get_drone_config_for_hw_id(hw_id):
+    """Resolve a drone config entry regardless of string/int HW ID input."""
+    normalized = normalize_hw_id(hw_id)
+    if normalized is None:
+        return None
+    return DRONE_CONFIG.get(normalized)
+
+
+def reset_leader_tracking():
+    """Drop leader-estimation state when the follow target changes."""
+    global LEADER_STATE, LEADER_KALMAN_FILTER, leader_unreachable_count, LEADER_FAILOVER_IN_PROGRESS
+    LEADER_STATE.clear()
+    LEADER_KALMAN_FILTER = LeaderKalmanFilter()
+    leader_unreachable_count = 0
+    LEADER_FAILOVER_IN_PROGRESS = False
+
+
+def assign_leader_target(new_leader_hw_id):
+    """Apply a new follow target and reset estimation state."""
+    global LEADER_HW_ID, LEADER_IP
+
+    normalized = normalize_hw_id(new_leader_hw_id)
+    if normalized is None:
+        LEADER_HW_ID = None
+        LEADER_IP = None
+        reset_leader_tracking()
+        return None
+
+    leader_cfg = get_drone_config_for_hw_id(normalized)
+    if leader_cfg is None:
+        return None
+
+    LEADER_HW_ID = normalized
+    LEADER_IP = leader_cfg['ip']
+    reset_leader_tracking()
+    return leader_cfg
+
+
+def persist_current_swarm_assignment(logger=None):
+    """Persist the latest local assignment so telemetry reflects live swarm changes."""
+    assignment = SWARM_CONFIG.get(str(HW_ID))
+    if not assignment:
+        return
+
+    try:
+        write_runtime_swarm_assignment(dict(assignment))
+    except Exception as exc:
+        active_logger = logger or logging.getLogger(__name__)
+        active_logger.debug("Failed to persist runtime swarm assignment: %s", exc)
+
+
+async def cancel_follower_tasks(logger):
+    """Cancel follower-mode tasks without leaking unfinished coroutines."""
+    global FOLLOWER_TASKS
+
+    if not FOLLOWER_TASKS:
+        return
+
+    for task_name, task in list(FOLLOWER_TASKS.items()):
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.debug("Cancelled follower task: %s", task_name)
+        except Exception:
+            logger.exception("Follower task %s exited with an error during cancellation", task_name)
+    FOLLOWER_TASKS.clear()
+
+
+def _follower_task_missing(task_name: str) -> bool:
+    task = FOLLOWER_TASKS.get(task_name)
+    return task is None or task.done()
+
+
+async def ensure_offboard_active_for_follower(drone: System, logger, reason: str) -> bool:
+    """Start follower offboard mode if it is not already active."""
+    try:
+        await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+        await drone.offboard.start()
+        logger.info("Follower offboard control active (%s).", reason)
+        return True
+    except OffboardError as exc:
+        message = str(exc).lower()
+        if "already" in message and "offboard" in message:
+            logger.debug("Follower offboard control already active (%s).", reason)
+            return True
+        logger.error("Failed to start follower offboard control (%s): %s", reason, exc)
+        return False
+    except Exception as exc:
+        logger.error("Unexpected error while starting follower offboard control (%s): %s", reason, exc)
+        return False
+
+
+async def ensure_follower_runtime(drone: System, logger, reason: str) -> bool:
+    """Ensure the follower control runtime is fully active and recover crashed tasks."""
+    if not await ensure_offboard_active_for_follower(drone, logger, reason):
+        return False
+
+    if _follower_task_missing('leader_update_task'):
+        FOLLOWER_TASKS['leader_update_task'] = asyncio.create_task(update_leader_state())
+    if _follower_task_missing('own_state_task'):
+        FOLLOWER_TASKS['own_state_task'] = asyncio.create_task(update_own_state(drone))
+    if _follower_task_missing('control_task'):
+        FOLLOWER_TASKS['control_task'] = asyncio.create_task(control_loop(drone))
+    return True
+
+
+async def handle_leader_unavailability(drone: System, logger, reason: str):
+    """Run one failover sequence at a time when leader health is lost."""
+    global LEADER_FAILOVER_IN_PROGRESS
+
+    if LEADER_FAILOVER_IN_PROGRESS:
+        logger.debug("Leader failover already in progress (%s).", reason)
+        return
+
+    LEADER_FAILOVER_IN_PROGRESS = True
+    try:
+        await execute_failsafe(drone, reason=reason)
+        await elect_new_leader()
+    finally:
+        LEADER_FAILOVER_IN_PROGRESS = False
+
+
+async def transition_to_leader_mode(drone: System, logger, reason: str):
+    """Stop follower control and leave the vehicle in an explicit leader-safe HOLD state."""
+    global IS_LEADER
+
+    IS_LEADER = True
+    assign_leader_target(0)
+    persist_current_swarm_assignment(logger)
+    await cancel_follower_tasks(logger)
+
+    try:
+        await drone.offboard.stop()
+        logger.info("Stopped offboard control while switching to leader mode (%s).", reason)
+    except OffboardError as exc:
+        logger.debug("Offboard was not active during leader transition (%s): %s", reason, exc)
+    except Exception as exc:
+        logger.warning("Failed to stop offboard during leader transition (%s): %s", reason, exc)
+
+    try:
+        await drone.action.hold()
+        logger.info("Drone transitioned to leader mode and entered HOLD (%s).", reason)
+    except ActionError as exc:
+        logger.warning("Failed to command HOLD during leader transition (%s): %s", reason, exc)
+    except Exception as exc:
+        logger.warning("Unexpected error while entering HOLD during leader transition (%s): %s", reason, exc)
+
+
+async def transition_to_follower_mode(drone: System, new_leader_hw_id, logger, reason: str):
+    """Start follower-mode tasks against a validated leader target."""
+    global IS_LEADER
+
+    leader_cfg = assign_leader_target(new_leader_hw_id)
+    if leader_cfg is None:
+        logger.error("[Periodic Update] Leader config missing for HW_ID=%s", new_leader_hw_id)
+        return False
+
+    logger.info("[Periodic Update] Ensuring follower runtime (%s).", reason)
+    if not await ensure_follower_runtime(drone, logger, reason):
+        IS_LEADER = True
+        logger.warning(
+            "[Periodic Update] Follower runtime unavailable for leader %s (%s); keeping leader-mode flag so the runtime retries.",
+            new_leader_hw_id,
+            reason,
+        )
+        return False
+
+    IS_LEADER = False
+    persist_current_swarm_assignment(logger)
+    return True
 
 # Legacy configure_logging function - now using shared one from drone_show_src.utils
 # def configure_logging():
@@ -218,85 +410,64 @@ def parse_float(field_value, default=0.0):
 #     # Limit the number of log files TODO!
 #     #limit_log_files(logs_directory, MAX_LOG_FILES)
 
-def read_hw_id() -> int:
+def read_config(filename: str):
     """
-    Read the hardware ID from a file with the extension '.hwID'.
-
-    Returns:
-        int: Hardware ID if found, else None.
-    """
-    logger = logging.getLogger(__name__)
-    # Adjust the path to look for the hwID file in the same directory as the script
-    hwid_files = [f for f in os.listdir('.') if f.endswith('.hwID')]
-    if hwid_files:
-        filename = hwid_files[0]
-        hw_id = os.path.splitext(filename)[0]  # Get filename without extension
-        logger.info(f"Hardware ID {hw_id} detected.")
-        try:
-            return int(hw_id)
-        except ValueError:
-            logger.error(f"Invalid HW ID format in file '{filename}'. Must be an integer.")
-            return None
-    else:
-        logger.error("Hardware ID file not found.")
-        return None
-
-def read_config_csv(filename: str):
-    """
-    Reads the drone configurations from the config CSV file and populates DRONE_CONFIG.
+    Reads the drone configurations from the config JSON file and populates DRONE_CONFIG.
 
     Note: x,y positions now come from trajectory CSV files (single source of truth),
-    not from config.csv.
+    not from config.json.
 
     Args:
-        filename (str): Path to the config CSV file.
+        filename (str): Path to the config JSON file.
     """
     logger = logging.getLogger(__name__)
     global DRONE_CONFIG
     try:
-        with open(filename, newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
+        import json
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        entries = data.get('drones', data) if isinstance(data, dict) else data
+        for entry in entries:
+            try:
+                hw_id = str(int(entry["hw_id"]))
+                pos_id = int(entry["pos_id"])
+
+                # Get position from trajectory CSV (single source of truth)
+                base_dir = 'shapes_sitl' if Params.sim_mode else 'shapes'
+                trajectory_file = os.path.join(
+                    os.path.dirname(__file__),  # Project root
+                    base_dir,
+                    'swarm',
+                    'processed',
+                    f"Drone {pos_id}.csv"
+                )
+
+                x, y = 0.0, 0.0  # Default values
                 try:
-                    hw_id = str(int(row["hw_id"]))
-                    pos_id = int(row["pos_id"])
+                    if os.path.exists(trajectory_file):
+                        with open(trajectory_file, 'r') as traj_f:
+                            traj_reader = csv.DictReader(traj_f)
+                            first_waypoint = next(traj_reader, None)
+                            if first_waypoint:
+                                x = float(first_waypoint.get('px', 0))  # North
+                                y = float(first_waypoint.get('py', 0))  # East
+                            else:
+                                logger.warning(f"Trajectory file empty for pos_id={pos_id}")
+                    else:
+                        logger.warning(f"Trajectory file not found for pos_id={pos_id}: {trajectory_file}")
+                except Exception as e:
+                    logger.error(f"Error reading trajectory for pos_id={pos_id}: {e}")
 
-                    # Get position from trajectory CSV (single source of truth)
-                    base_dir = 'shapes_sitl' if Params.sim_mode else 'shapes'
-                    trajectory_file = os.path.join(
-                        os.path.dirname(__file__),  # Project root
-                        base_dir,
-                        'swarm',
-                        'processed',
-                        f"Drone {pos_id}.csv"
-                    )
-
-                    x, y = 0.0, 0.0  # Default values
-                    try:
-                        if os.path.exists(trajectory_file):
-                            with open(trajectory_file, 'r') as traj_f:
-                                traj_reader = csv.DictReader(traj_f)
-                                first_waypoint = next(traj_reader, None)
-                                if first_waypoint:
-                                    x = float(first_waypoint.get('px', 0))  # North
-                                    y = float(first_waypoint.get('py', 0))  # East
-                                else:
-                                    logger.warning(f"Trajectory file empty for pos_id={pos_id}")
-                        else:
-                            logger.warning(f"Trajectory file not found for pos_id={pos_id}: {trajectory_file}")
-                    except Exception as e:
-                        logger.error(f"Error reading trajectory for pos_id={pos_id}: {e}")
-
-                    DRONE_CONFIG[hw_id] = {
-                        'hw_id': hw_id,
-                        'pos_id': pos_id,
-                        'x': x,
-                        'y': y,
-                        'ip': row["ip"],
-                        'mavlink_port': int(row["mavlink_port"]),
-                    }
-                except ValueError as ve:
-                    logger.error(f"Invalid data type in config file row: {row}. Error: {ve}")
+                DRONE_CONFIG[hw_id] = {
+                    'hw_id': hw_id,
+                    'pos_id': pos_id,
+                    'x': x,
+                    'y': y,
+                    'ip': entry["ip"],
+                    'mavlink_port': int(entry["mavlink_port"]),
+                }
+            except ValueError as ve:
+                logger.error(f"Invalid data type in config file entry: {entry}. Error: {ve}")
         logger.info(f"Read {len(DRONE_CONFIG)} drone configurations from '{filename}' with positions from trajectory CSV.")
     except FileNotFoundError:
         logger.exception(f"Config file '{filename}' not found.")
@@ -305,38 +476,98 @@ def read_config_csv(filename: str):
         logger.exception(f"Error reading config file '{filename}'.")
         sys.exit(1)
 
-def read_swarm_csv(filename: str):
+def read_swarm(filename: str):
     """
-    Reads the swarm configurations from the swarm CSV file and populates SWARM_CONFIG.
+    Reads the swarm configurations from the swarm JSON file and populates SWARM_CONFIG.
 
     Args:
-        filename (str): Path to the swarm CSV file.
+        filename (str): Path to the swarm JSON file.
     """
     logger = logging.getLogger(__name__)
-    global SWARM_CONFIG
     try:
-        with open(filename, newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                try:
-                    hw_id = str(int(row["hw_id"]))
-                    SWARM_CONFIG[hw_id] = {
-                        'hw_id': hw_id,
-                        'follow': row["follow"],
-                        'offset_n': float(row["offset_n"]),
-                        'offset_e': float(row["offset_e"]),
-                        'offset_alt': float(row["offset_alt"]),
-                        'body_coord': row["body_coord"] == '1',
-                    }
-                except ValueError as ve:
-                    logger.error(f"Invalid data type in swarm file row: {row}. Error: {ve}")
-        logger.info(f"Read {len(SWARM_CONFIG)} swarm configurations from '{filename}'.")
+        import json
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        entries = data.get('assignments', data) if isinstance(data, dict) else data
+        replace_swarm_config(entries, source_name=f"local file '{filename}'", announce_level=logging.INFO)
     except FileNotFoundError:
         logger.exception(f"Swarm file '{filename}' not found.")
         sys.exit(1)
     except Exception:
         logger.exception(f"Error reading swarm file '{filename}'.")
         sys.exit(1)
+
+
+def parse_swarm_entries(entries):
+    """Parse raw swarm assignment entries into the normalized in-memory map."""
+    logger = logging.getLogger(__name__)
+    parsed = {}
+    for entry in entries:
+        try:
+            hw_id = str(int(entry["hw_id"]))
+            parsed[hw_id] = {
+                'hw_id': hw_id,
+                'follow': int(entry["follow"]),
+                'offset_x': float(entry["offset_x"]),
+                'offset_y': float(entry["offset_y"]),
+                'offset_z': float(entry["offset_z"]),
+                'frame': str(entry.get("frame", "ned")),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("Invalid swarm entry %s. Error: %s", entry, exc)
+    return parsed
+
+
+def replace_swarm_config(entries, source_name: str, announce_level=logging.DEBUG):
+    """Replace the global swarm assignment map from a raw entry list."""
+    global SWARM_CONFIG
+
+    SWARM_CONFIG.clear()
+    SWARM_CONFIG.update(parse_swarm_entries(entries))
+    logging.getLogger(__name__).log(
+        announce_level,
+        "Loaded %d swarm configurations from %s.",
+        len(SWARM_CONFIG),
+        source_name,
+    )
+
+
+async def refresh_swarm_config_from_gcs(logger, source_label: str, session: Optional[aiohttp.ClientSession] = None):
+    """
+    Refresh swarm assignments from GCS.
+
+    Returns True when the GCS snapshot was fetched and applied, False when the
+    local swarm file remains in effect.
+    """
+    state_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/get-swarm-data"
+    owns_session = session is None
+    active_session = session
+
+    try:
+        if active_session is None:
+            timeout = aiohttp.ClientTimeout(total=Params.SMART_SWARM_GCS_CONFIG_TIMEOUT_SEC)
+            active_session = aiohttp.ClientSession(timeout=timeout)
+
+        async with active_session.get(state_url) as resp:
+            resp.raise_for_status()
+            api_data = await resp.json()
+
+        replace_swarm_config(
+            api_data,
+            source_name=f"GCS API ({source_label})",
+            announce_level=logging.INFO if source_label == "startup" else logging.DEBUG,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[%s] Failed to refresh swarm configuration from GCS; continuing with local swarm file. Error: %s",
+            source_label,
+            exc,
+        )
+        return False
+    finally:
+        if owns_session and active_session is not None:
+            await active_session.close()
 
 def get_mavsdk_server_path():
     """
@@ -526,66 +757,48 @@ async def update_swarm_config_periodically(drone):
     If a role change is detected (e.g., switching from follower to leader or vice versa),
     it starts or cancels follower-specific tasks accordingly.
 
-    NOTE: Requires Params.GCS_IP and Params.flask_telem_socket_port to be set.
+    NOTE: Requires Params.GCS_IP and Params.gcs_api_port to be set.
     """
-    global SWARM_CONFIG, IS_LEADER, OFFSETS, BODY_COORD
+    global SWARM_CONFIG, IS_LEADER, OFFSETS, FRAME
     global LEADER_HW_ID, LEADER_IP, LEADER_KALMAN_FILTER, FOLLOWER_TASKS
     global HW_ID
 
     logger = logging.getLogger(__name__)
 
-    # Resolve the GCS endpoint using centralized GCS IP from Params
-    str_HW_ID = str(HW_ID)
-    drone_cfg = DRONE_CONFIG.get(str_HW_ID)
-    if not drone_cfg:
+    str_hw_id = str(HW_ID)
+    if not DRONE_CONFIG.get(str_hw_id):
         logger.error(f"[Periodic Update] Cannot resolve drone config for HW_ID={HW_ID}")
         return
-
-    gcs_ip = Params.GCS_IP
-    state_url = f"http://{gcs_ip}:{Params.flask_telem_socket_port}/get-swarm-data"
 
     # Shared session for connection reuse
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                logger.info("[Periodic Update] Checking swarm configuration")
-                # Fetch JSON list of swarm entries
-                async with session.get(state_url) as resp:
-                    resp.raise_for_status()
-                    api_data = await resp.json()
-
-                # Rebuild our in-memory SWARM_CONFIG
-                SWARM_CONFIG.clear()
-                for entry in api_data:
-                    hw_str = str(entry['hw_id'])
-
-                    # Safely parse each offset
-                    offset_n_val   = parse_float(entry.get('offset_n', None), default=0.0)
-                    offset_e_val   = parse_float(entry.get('offset_e', None), default=0.0)
-                    offset_alt_val = parse_float(entry.get('offset_alt', None), default=0.0)
-
-                    SWARM_CONFIG[hw_str] = {
-                        'follow':     entry.get('follow', '0'),
-                        'offset_n':   offset_n_val,
-                        'offset_e':   offset_e_val,
-                        'offset_alt': offset_alt_val,
-                        'body_coord': entry.get('body_coord', '0') == '1',
-                    }
+                logger.debug("[Periodic Update] Checking swarm configuration")
+                refreshed = await refresh_swarm_config_from_gcs(
+                    logger,
+                    source_label="periodic update",
+                    session=session,
+                )
+                if not refreshed:
+                    await asyncio.sleep(Params.CONFIG_UPDATE_INTERVAL)
+                    continue
 
                 # Grab this drone's new config
                 new_cfg = SWARM_CONFIG.get(str(HW_ID))
                 if new_cfg is None:
                     logger.error(f"[Periodic Update] No swarm entry for HW_ID={HW_ID}")
                 else:
-                    # Determine new role/offsets/body_coord
+                    persist_current_swarm_assignment(logger)
+                    # Determine new role/offsets/frame
                     new_offsets     = {
-                        'n':   new_cfg['offset_n'],
-                        'e':   new_cfg['offset_e'],
-                        'alt': new_cfg['offset_alt']
+                        'x':   new_cfg['offset_x'],
+                        'y':   new_cfg['offset_y'],
+                        'z':   new_cfg['offset_z']
                     }
-                    new_body_coord  = new_cfg['body_coord']
+                    new_frame       = new_cfg['frame']
                     new_leader      = new_cfg['follow']
-                    new_is_leader   = (new_leader == '0')
+                    new_is_leader   = (new_leader == 0)
 
                     # ROLE CHANGE?
                     if new_is_leader != IS_LEADER:
@@ -594,46 +807,22 @@ async def update_swarm_config_periodically(drone):
                             "Leader" if IS_LEADER else "Follower",
                             "Leader" if new_is_leader else "Follower"
                         )
-                        IS_LEADER = new_is_leader
 
-                        if IS_LEADER:
-                            # Cancel any running follower tasks
-                            if FOLLOWER_TASKS:
-                                logger.info("[Periodic Update] Cancelling follower tasks.")
-                                for task in FOLLOWER_TASKS.values():
-                                    if not task.done():
-                                        task.cancel()
-                                FOLLOWER_TASKS.clear()
+                        if new_is_leader:
+                            await transition_to_leader_mode(drone, logger, "config update")
                         else:
-                            # Start follower tasks under new leader
-                            if not FOLLOWER_TASKS:
-                                LEADER_HW_ID = new_cfg['follow']
-                                leader_cfg = DRONE_CONFIG.get(LEADER_HW_ID)
-                                if not leader_cfg:
-                                    logger.error(
-                                        "[Periodic Update] Leader config missing for HW_ID=%s",
-                                        LEADER_HW_ID
-                                    )
-                                else:
-                                    LEADER_IP             = leader_cfg['ip']
-                                    LEADER_KALMAN_FILTER  = LeaderKalmanFilter()
-                                    logger.info("[Periodic Update] Launching follower tasks.")
-                                    FOLLOWER_TASKS['leader_update_task'] = asyncio.create_task(update_leader_state())
-                                    FOLLOWER_TASKS['own_state_task']    = asyncio.create_task(update_own_state(drone))
-                                    FOLLOWER_TASKS['control_task']      = asyncio.create_task(control_loop(drone))
+                            await transition_to_follower_mode(drone, new_leader, logger, "config update")
 
                     # Handle leader change if drone is a follower
                     if not new_is_leader:
-                        if new_leader != LEADER_HW_ID:
+                        new_leader_hw_id = normalize_hw_id(new_leader)
+                        if new_leader_hw_id != LEADER_HW_ID:
                             logger.info(f"[Periodic Update] Leader change detected. Following new leader {new_leader}.")
-                            LEADER_HW_ID = new_leader
-                            leader_cfg = DRONE_CONFIG.get(LEADER_HW_ID)
+                            leader_cfg = assign_leader_target(new_leader)
                             if not leader_cfg:
                                 logger.error("[Periodic Update] Leader config missing for HW_ID=%s", LEADER_HW_ID)
                             else:
-                                LEADER_IP = leader_cfg['ip']
                                 logger.info(f"[Periodic Update] Following new leader at {LEADER_IP}")
-                                # You can add any logic to update tasks or behavior based on new leader here.
 
                     # OFFSET CHANGE?
                     if new_offsets != OFFSETS:
@@ -643,13 +832,13 @@ async def update_swarm_config_periodically(drone):
                         )
                         OFFSETS.update(new_offsets)
 
-                    # BODY_COORD CHANGE?
-                    if new_body_coord != BODY_COORD:
+                    # FRAME CHANGE?
+                    if new_frame != FRAME:
                         logger.info(
-                            "[Periodic Update] Body coord flag: %s → %s",
-                            BODY_COORD, new_body_coord
+                            "[Periodic Update] Frame changed: %s → %s",
+                            FRAME, new_frame
                         )
-                        BODY_COORD = new_body_coord
+                        FRAME = new_frame
 
             except Exception as e:
                 logger.exception(f"[Periodic Update] Error fetching/updating swarm config: {e}")
@@ -666,6 +855,12 @@ async def update_swarm_config_periodically(drone):
 async def update_leader_state():
     """
     Periodically fetches the leader's state and updates the Kalman filter.
+
+    TODO(next transport phase):
+    Keep the validated HTTP polling path as the fallback transport, but move
+    leader-state delivery behind a transport abstraction so a future
+    WebSocket/subscription path can be added without changing failover,
+    stale-data detection, or control-loop behavior.
     """
     logger = logging.getLogger(__name__)
     global LEADER_STATE, LEADER_KALMAN_FILTER, LEADER_IP
@@ -674,17 +869,25 @@ async def update_leader_state():
     update_interval = 1.0 / Params.LEADER_UPDATE_FREQUENCY
     last_update_time = None
 
-    while True:
-        try:
-            state_url = f"http://{LEADER_IP}:{Params.drones_flask_port}/{Params.get_drone_state_URI}"
-            response = requests.get(state_url, timeout=1)
-            if response.status_code == 200:
-                # reset on success
-                leader_unreachable_count = 0
+    timeout = aiohttp.ClientTimeout(total=Params.SMART_SWARM_LEADER_STATE_TIMEOUT_SEC)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            try:
+                state_url = f"http://{LEADER_IP}:{Params.drone_api_port}/{Params.get_drone_state_URI}"
+                async with session.get(state_url) as response:
+                    if response.status != 200:
+                        raise aiohttp.ClientResponseError(
+                            response.request_info,
+                            response.history,
+                            status=response.status,
+                            message=f"Leader state fetch failed with HTTP {response.status}",
+                            headers=response.headers,
+                        )
+                    data = await response.json()
 
-                data = response.json()
                 leader_update_time = data.get('update_time', None)
                 if leader_update_time and leader_update_time != last_update_time:
+                    leader_unreachable_count = 0
                     last_update_time = leader_update_time
 
                     # Convert lat/lon/alt to NED
@@ -701,7 +904,7 @@ async def update_leader_state():
                         'vel_n': data['velocity_north'],
                         'vel_e': data['velocity_east'],
                         'vel_d': data['velocity_down'],
-                        'yaw':   data.get('yaw', 0.0),
+                        'yaw': data.get('yaw', 0.0),
                         'update_time': leader_update_time
                     })
 
@@ -719,36 +922,34 @@ async def update_leader_state():
                     logger.debug(f"Leader @ {leader_update_time:.3f}s: {measurement}")
                     logger.debug(f"Kalman state: {LEADER_KALMAN_FILTER.get_state()}")
                 else:
-                    logger.error("Leader response missing or unchanged 'update_time'.")
-            else:
-                logger.error(f"Failed to fetch leader state: HTTP {response.status_code}")
-                leader_unreachable_count += 1
-                if leader_unreachable_count >= max_unreachable_attempts:
-                    logger.warning(
-                        f"Leader unreachable for {leader_unreachable_count} attempts. Electing new leader."
+                    leader_unreachable_count += 1
+                    logger.debug(
+                        "Leader response missing a fresh 'update_time' (%s/%s).",
+                        leader_unreachable_count,
+                        max_unreachable_attempts,
                     )
-                    await elect_new_leader()
+                    if leader_unreachable_count >= max_unreachable_attempts and DRONE_INSTANCE is not None:
+                        logger.warning(
+                            "Leader telemetry stopped advancing for %s checks. Starting failover.",
+                            leader_unreachable_count,
+                        )
+                        await handle_leader_unavailability(DRONE_INSTANCE, logger, "stale leader update_time")
+            except Exception as e:
+                leader_unreachable_count += 1
+                logger.debug("Leader state fetch failed (%s/%s): %s", leader_unreachable_count, max_unreachable_attempts, e)
+                if leader_unreachable_count >= max_unreachable_attempts and DRONE_INSTANCE is not None:
+                    logger.warning(
+                        f"Leader unreachable for {leader_unreachable_count} attempts. Starting failover."
+                    )
+                    await handle_leader_unavailability(DRONE_INSTANCE, logger, "leader fetch failures")
 
-        except Exception as e:
-            leader_unreachable_count += 1
-            if leader_unreachable_count >= max_unreachable_attempts:
-                logger.warning(
-                    f"Leader unreachable for {leader_unreachable_count} attempts. Electing new leader."
-                )
-                await elect_new_leader()
-
-        await asyncio.sleep(update_interval)
+            await asyncio.sleep(update_interval)
 
         
 async def elect_new_leader():
     """
     Elect a new leader when the current leader is unreachable.
-    - Enforces a cooldown.
-    - Picks the very next HW_ID (wrapping) in numeric order.
-    - If that ID == self, self-promote: set role=0, cancel followers, stop offboard & HOLD.
-    - Otherwise, notify GCS; if accepted, commit new leader IP & reset counters/filters.
-
-    TODO: Later detect/prevent cycles of intermediate leaders.
+    The exact failover policy is controlled by Params.SMART_SWARM_LEADER_LOSS_STRATEGY.
     """
     global last_election_time
     global SWARM_CONFIG, LEADER_HW_ID, LEADER_IP
@@ -767,73 +968,63 @@ async def elect_new_leader():
 
     logger = logging.getLogger(__name__)
     old_leader = LEADER_HW_ID
-    old_follow  = SWARM_CONFIG[str(HW_ID)]['follow']
+    strategy = getattr(Params, "SMART_SWARM_LEADER_LOSS_STRATEGY", "upstream_or_hold")
+    failover = choose_leader_loss_response(
+        self_hw_id=HW_ID,
+        current_leader_hw_id=old_leader,
+        swarm_config=SWARM_CONFIG,
+        strategy=strategy,
+    )
+    logger.warning(
+        "Leader-loss failover resolved using strategy '%s': %s",
+        failover["strategy"],
+        failover["reason"],
+    )
 
-    # Build sorted list of all drone IDs
-    all_ids = sorted(int(k) for k in SWARM_CONFIG.keys())
-    # Find index of current leader (or -1 if unknown)
-    current_idx = all_ids.index(int(old_leader)) if old_leader and int(old_leader) in all_ids else -1
-
-    # Compute the next candidate (wrap-around)
-    next_idx = (current_idx + 1) % len(all_ids)
-    candidate = all_ids[next_idx]
-    logger.info(f"Election candidate based on offset: {candidate}")
-
-    # Self-promotion if candidate == self
-    if candidate == HW_ID:
-        logger.info("Candidate is self → self-promoting to leader and entering HOLD mode.")
-        # Update manifest
-        SWARM_CONFIG[str(HW_ID)]['follow'] = '0'
-        # Notify GCS (best-effort)
+    if failover["action"] == "self_hold":
+        SWARM_CONFIG[str(HW_ID)]['follow'] = 0
+        persist_current_swarm_assignment(logger)
         try:
-            await notify_gcs_of_leader_change('0')
+            await notify_gcs_of_leader_change(0)
         except Exception:
-            logger.warning("GCS notify failed for self-promotion.")
-        # Flip role
-        IS_LEADER = True
-        LEADER_HW_ID = None
-        LEADER_IP     = None
-        leader_unreachable_count = 0
-        # Cancel follower tasks
-        for task in FOLLOWER_TASKS.values():
-            if not task.done():
-                task.cancel()
-        FOLLOWER_TASKS.clear()
-        # Stop offboard and HOLD
-        try:
-            await DRONE_INSTANCE.offboard.stop()
-            await DRONE_INSTANCE.action.hold()
-            logger.info("Offboard stopped; drone set to HOLD.")
-        except Exception as e:
-            logger.error(f"Error during HOLD mode: {e}")
+            logger.warning("GCS notify failed for self-promotion during failover.")
+        await transition_to_leader_mode(DRONE_INSTANCE, logger, "leader loss failover")
         return
 
-    # Otherwise, propose this candidate as new leader
-    new_leader = str(candidate)
-    logger.info(f"Proposed new leader: {new_leader}")
+    new_leader = failover["leader_hw_id"]
+    if new_leader is None:
+        logger.warning("Failover did not resolve a leader candidate; entering HOLD mode.")
+        SWARM_CONFIG[str(HW_ID)]['follow'] = 0
+        persist_current_swarm_assignment(logger)
+        await transition_to_leader_mode(DRONE_INSTANCE, logger, "leader loss failover")
+        return
 
-    # Stage locally
-    SWARM_CONFIG[str(HW_ID)]['follow'] = new_leader
+    logger.info("Attempting failover to Drone %s.", new_leader)
+    SWARM_CONFIG[str(HW_ID)]['follow'] = int(new_leader)
+    persist_current_swarm_assignment(logger)
 
-    # Notify GCS
     accepted = await notify_gcs_of_leader_change(new_leader)
-    if accepted:
-        # Commit: switch IP, reset Kalman filter & counter
-        LEADER_HW_ID = new_leader
-        LEADER_IP     = DRONE_CONFIG[new_leader]['ip']
-        leader_unreachable_count = 0
-        LEADER_KALMAN_FILTER     = LeaderKalmanFilter()
-        logger.info(f"Leader election committed: now following {new_leader} @ {LEADER_IP}")
-    else:
-        # Revert on rejection
-        SWARM_CONFIG[str(HW_ID)]['follow'] = old_follow
-        logger.warning(f"Leader election aborted; staying with {old_leader}")
+    if accepted and assign_leader_target(new_leader) is not None:
+        logger.info("Leader failover committed: now following %s @ %s", new_leader, LEADER_IP)
+        return
+
+    logger.warning(
+        "Leader failover to %s could not be committed; reverting to self-hold for safety.",
+        new_leader,
+    )
+    SWARM_CONFIG[str(HW_ID)]['follow'] = 0
+    persist_current_swarm_assignment(logger)
+    try:
+        await notify_gcs_of_leader_change(0)
+    except Exception:
+        logger.warning("GCS notify failed while reverting to self-hold after failover rejection.")
+    await transition_to_leader_mode(DRONE_INSTANCE, logger, "failover commit rejected")
 
 
 
     
     
-async def notify_gcs_of_leader_change(new_leader_hw_id: str) -> bool:
+async def notify_gcs_of_leader_change(new_leader_hw_id) -> bool:
     """
     Notify the GCS of our updated leader by sending only our own swarm entry.
     Returns True if the GCS accepted the change, False otherwise.
@@ -841,24 +1032,16 @@ async def notify_gcs_of_leader_change(new_leader_hw_id: str) -> bool:
     logger = logging.getLogger(__name__)
 
     gcs_ip = Params.GCS_IP
-    notify_url = f"http://{gcs_ip}:{Params.flask_telem_socket_port}/request-new-leader"
-
-    current = SWARM_CONFIG.get(str(HW_ID))
-    if not current:
-        logger.error(f"No SWARM_CONFIG entry for HW_ID={HW_ID}")
-        return False
+    notify_url = f"http://{gcs_ip}:{Params.gcs_api_port}/request-new-leader"
 
     payload = {
-        'hw_id':       str(HW_ID),
-        'follow':      new_leader_hw_id,
-        'offset_n':    current['offset_n'],
-        'offset_e':    current['offset_e'],
-        'offset_alt':  current['offset_alt'],
-        'body_coord':  '1' if current['body_coord'] else '0'
+        'hw_id':       int(HW_ID),
+        'follow':      int(new_leader_hw_id),
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=Params.SMART_SWARM_GCS_NOTIFY_TIMEOUT_SEC)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(notify_url, json=payload) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
@@ -871,8 +1054,6 @@ async def notify_gcs_of_leader_change(new_leader_hw_id: str) -> bool:
     except Exception as e:
         logger.error(f"Error notifying GCS of leader change for HW_ID={HW_ID}: {e}")
         return False
-
-        logger.error(f"Error notifying GCS of leader change for HW_ID {HW_ID}: {e}")
 
 
 
@@ -931,12 +1112,34 @@ async def control_loop(drone: System):
     velocity_filter = LowPassFilter(alpha)
 
     previous_time = None
+    state_gate_status = None
 
     try:
         while True:
             current_time = time.time()
             dt = current_time - previous_time if previous_time else loop_interval
             previous_time = current_time
+
+            own_state_ready = 'timestamp' in OWN_STATE
+            leader_state_ready = 'update_time' in LEADER_STATE
+
+            if not own_state_ready:
+                if state_gate_status != 'own':
+                    logger.info("Follower waiting for own-state lock before sending setpoints.")
+                    state_gate_status = 'own'
+                await asyncio.sleep(loop_interval)
+                continue
+
+            if not leader_state_ready:
+                if state_gate_status != 'leader':
+                    logger.info("Follower waiting for leader-state lock before sending setpoints.")
+                    state_gate_status = 'leader'
+                await asyncio.sleep(loop_interval)
+                continue
+
+            if state_gate_status is not None:
+                logger.info("Follower state lock acquired; resuming formation control.")
+                state_gate_status = None
 
             # Check data freshness
             if 'update_time' in LEADER_STATE and is_data_fresh(LEADER_STATE['update_time'], Params.DATA_FRESHNESS_THRESHOLD):
@@ -953,20 +1156,19 @@ async def control_loop(drone: System):
                 leader_yaw = LEADER_STATE.get('yaw', 0.0)
                 logger.debug(f"Predicted leader state at time {current_time:.3f}s: pos_n={leader_n:.2f}m, pos_e={leader_e:.2f}m, pos_d={leader_d:.2f}m, vel_n={leader_vel_n:.2f}m/s, vel_e={leader_vel_e:.2f}m/s, vel_d={leader_vel_d:.2f}m/s, yaw={leader_yaw:.2f}°")
                 # Calculate offsets
-                if BODY_COORD:
-                    # Note: Although offsets are labeled as N and E, in body coordinate mode, they are Forward and Right
-                    offset_n, offset_e = transform_body_to_nea(OFFSETS['n'], OFFSETS['e'], leader_yaw)
-                    logger.debug(f"Offsets in body coordinates: Forward={OFFSETS['n']:.2f}m, Right={OFFSETS['e']:.2f}m, Transformed to NED: offset_n={offset_n:.2f}m, offset_e={offset_e:.2f}m")
+                if FRAME == "body":
+                    offset_x_ned, offset_y_ned = transform_body_to_nea(OFFSETS['x'], OFFSETS['y'], leader_yaw)
+                    logger.debug(f"Offsets in body frame: Forward={OFFSETS['x']:.2f}m, Right={OFFSETS['y']:.2f}m, Transformed to NED: offset_x={offset_x_ned:.2f}m, offset_y={offset_y_ned:.2f}m")
                 else:
-                    offset_n, offset_e = OFFSETS['n'], OFFSETS['e']
-                    logger.debug(f"Offsets in NED coordinates: offset_n={offset_n:.2f}m, offset_e={offset_e:.2f}m")
-                
-                logger.debug(f"Altitude offset: offset_alt={OFFSETS['alt']:.2f}m")
+                    offset_x_ned, offset_y_ned = OFFSETS['x'], OFFSETS['y']
+                    logger.debug(f"Offsets in NED frame: offset_x={offset_x_ned:.2f}m, offset_y={offset_y_ned:.2f}m")
+
+                logger.debug(f"Altitude offset: offset_z={OFFSETS['z']:.2f}m")
                 
                 # Desired positions
-                desired_n = leader_n + offset_n
-                desired_e = leader_e + offset_e
-                desired_d = -1*(leader_d + OFFSETS['alt'])  
+                desired_n = leader_n + offset_x_ned
+                desired_e = leader_e + offset_y_ned
+                desired_d = -1*(leader_d + OFFSETS['z'])  
                 logger.debug(f"Desired positions: desired_n={desired_n:.2f}m, desired_e={desired_e:.2f}m, desired_d={desired_d:.2f}m, yaw={leader_yaw:.2f}°")
 
                 # Get own position
@@ -982,7 +1184,16 @@ async def control_loop(drone: System):
                 ])
 
                 # Compute velocity command using PD controller
-                velocity_command = pd_controller.compute(position_error, dt)
+                velocity_feedforward = np.array([
+                    leader_vel_n,
+                    leader_vel_e,
+                    leader_vel_d,
+                ]) * Params.SMART_SWARM_LEADER_VELOCITY_FEEDFORWARD
+                velocity_command = pd_controller.compute(
+                    position_error,
+                    dt,
+                    velocity_feedforward=velocity_feedforward,
+                )
 
                 # Filter the velocity command
                 filtered_velocity = velocity_filter.filter(velocity_command)
@@ -1000,23 +1211,27 @@ async def control_loop(drone: System):
                 if stale_start_time is None:
                     stale_start_time = current_time
                 elif (current_time - stale_start_time) >= stale_duration_threshold:
-                    logger.warning(f"Leader data has been stale for over {stale_duration_threshold} seconds, executing failsafe.")
-                    await execute_failsafe(drone)
+                    logger.warning(
+                        "Leader data has been stale for over %s seconds. Starting failover.",
+                        stale_duration_threshold,
+                    )
+                    await handle_leader_unavailability(drone, logger, "control-loop stale leader data")
+                    stale_start_time = current_time
             await asyncio.sleep(loop_interval)
     except asyncio.CancelledError:
         logger.info("Control loop cancelled.")
     except OffboardError as e:
         logger.error(f"Offboard error in control loop: {e}")
-        await execute_failsafe(drone)
+        await execute_failsafe(drone, reason="offboard error in control loop")
     except Exception:
         logger.exception("Unexpected error in control loop")
-        await execute_failsafe(drone)
+        await execute_failsafe(drone, reason="unexpected control-loop error")
 
 # ----------------------------- #
 #         Failsafe Function     #
 # ----------------------------- #
 
-async def execute_failsafe(drone: System):
+async def execute_failsafe(drone: System, reason: str = ""):
     """
     Executes a failsafe procedure, such as holding position or landing.
 
@@ -1029,7 +1244,7 @@ async def execute_failsafe(drone: System):
     try:
         # Hold position
         await drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, 0.0, 0.0))
-        logger.info("Failsafe: Holding position.")
+        logger.info("Failsafe: Holding position%s.", f" ({reason})" if reason else "")
     except OffboardError as e:
         logger.error(f"Failsafe offboard error: {e}")
         # Attempt to re-start offboard mode
@@ -1046,9 +1261,9 @@ async def execute_failsafe(drone: System):
 # ----------------------------- #
 
 @retry(stop=stop_after_attempt(Params.PREFLIGHT_MAX_RETRIES), wait=wait_fixed(2))
-async def initialize_drone():
+async def initialize_drone(start_offboard: bool = False):
     """
-    Initializes the drone connection, performs pre-flight checks, and starts offboard mode.
+    Initializes the drone connection and performs pre-flight checks.
 
     Returns:
         drone (System): MAVSDK drone system instance.
@@ -1103,14 +1318,10 @@ async def initialize_drone():
                 raise TimeoutError("Pre-flight checks timed out.")
             await asyncio.sleep(1)
 
-        # Arm the drone and start offboard mode
-        # TODO: Maybe do some checks later on here
-        # logger.info("Arming drone.")
-        # await drone.action.arm() # if not already arm (meaning we start on the ground)
-        logger.info("Starting offboard mode.")
-        # Send an initial setpoint before starting offboard mode
-        await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
-        await drone.offboard.start()
+        if start_offboard:
+            logger.info("Starting offboard mode during initialization.")
+            await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
+            await drone.offboard.start()
         led_controller.set_color(0, 255, 0)  # Green to indicate ready
 
         return drone
@@ -1127,7 +1338,7 @@ async def run_smart_swarm():
     Main function to run the smart swarm mode with dynamic configuration updates.
     """
     logger = logging.getLogger(__name__)
-    global HW_ID, DRONE_CONFIG, SWARM_CONFIG, IS_LEADER, OFFSETS, BODY_COORD, LEADER_HW_ID, LEADER_IP, LEADER_KALMAN_FILTER
+    global HW_ID, DRONE_CONFIG, SWARM_CONFIG, IS_LEADER, OFFSETS, FRAME, LEADER_HW_ID, LEADER_IP, LEADER_KALMAN_FILTER
     global LEADER_HOME_POS, OWN_HOME_POS, REFERENCE_POS
 
     # --------------------------- #
@@ -1135,16 +1346,17 @@ async def run_smart_swarm():
     # --------------------------- #
 
     # Read hardware ID from .hwID file
-    HW_ID = read_hw_id()
+    HW_ID = ConfigLoader.get_hw_id()
     if HW_ID is None:
         logger.error("Hardware ID not found.")
         sys.exit(1)
 
-    # Read configuration CSV files (choose simulation vs. real mode)
-    config_filename = os.path.join('config_sitl.csv' if Params.sim_mode else 'config.csv')
-    swarm_filename = os.path.join('swarm_sitl.csv' if Params.sim_mode else 'swarm.csv')
-    read_config_csv(config_filename)
-    read_swarm_csv(swarm_filename)
+    # Read configuration JSON files
+    config_filename = Params.config_file_name
+    swarm_filename = Params.swarm_file_name
+    read_config(config_filename)
+    read_swarm(swarm_filename)
+    await refresh_swarm_config_from_gcs(logger, source_label="startup")
 
     # Get own drone configuration
     hw_id_str = str(HW_ID)
@@ -1160,17 +1372,18 @@ async def run_smart_swarm():
         sys.exit(1)
 
     # Determine drone role and set formation parameters
-    IS_LEADER = swarm_config['follow'] == '0'
-    OFFSETS['n'] = swarm_config['offset_n']
-    OFFSETS['e'] = swarm_config['offset_e']
-    OFFSETS['alt'] = swarm_config['offset_alt']
-    BODY_COORD = swarm_config['body_coord']
-    logger.info(f"Drone HW_ID {HW_ID} - Initial Role: {'Leader' if IS_LEADER else 'Follower'}, Offsets: {OFFSETS}, Body Coord: {BODY_COORD}")
+    IS_LEADER = swarm_config['follow'] == 0
+    persist_current_swarm_assignment(logger)
+    OFFSETS['x'] = swarm_config['offset_x']
+    OFFSETS['y'] = swarm_config['offset_y']
+    OFFSETS['z'] = swarm_config['offset_z']
+    FRAME = swarm_config['frame']
+    logger.info(f"Drone HW_ID {HW_ID} - Initial Role: {'Leader' if IS_LEADER else 'Follower'}, Offsets: {OFFSETS}, Frame: {FRAME}")
 
     # For followers, set leader info and initialize Kalman filter; for leaders, simply log the role.
     if not IS_LEADER:
-        LEADER_HW_ID = swarm_config['follow']
-        leader_config = DRONE_CONFIG.get(LEADER_HW_ID)
+        LEADER_HW_ID = normalize_hw_id(swarm_config['follow'])
+        leader_config = get_drone_config_for_hw_id(LEADER_HW_ID)
         if leader_config is None:
             logger.error(f"Leader configuration for HW_ID {LEADER_HW_ID} not found.")
             sys.exit(1)
@@ -1195,7 +1408,7 @@ async def run_smart_swarm():
     # --------------------------- #
 
     try:
-        drone = await initialize_drone()
+        drone = await initialize_drone(start_offboard=False)
         global DRONE_INSTANCE
         DRONE_INSTANCE = drone
     except Exception:
@@ -1221,7 +1434,7 @@ async def run_smart_swarm():
         logger.warning(f"Telemetry GPS origin request failed: {e}")
 
     own_ip = '127.0.0.1'
-    fallback_origin = fetch_home_position(own_ip, Params.drones_flask_port, Params.get_drone_gps_origin_URI)
+    fallback_origin = fetch_home_position(own_ip, Params.drone_api_port, Params.get_drone_gps_origin_URI)
     if fallback_origin is not None:
         logger.info(f"Retrieved GPS global origin from fallback API: {fallback_origin}")
     else:
@@ -1245,7 +1458,7 @@ async def run_smart_swarm():
     logger.info(f"Reference position set to: {REFERENCE_POS}")
 
     if not IS_LEADER:
-        leader_home_pos = fetch_home_position(LEADER_IP, Params.drones_flask_port, Params.get_drone_home_URI)
+        leader_home_pos = fetch_home_position(LEADER_IP, Params.drone_api_port, Params.get_drone_home_URI)
         if leader_home_pos is None:
             logger.error("Failed to fetch leader's home position.")
             sys.exit(1)
@@ -1258,9 +1471,9 @@ async def run_smart_swarm():
 
     # For followers, start the corresponding tasks and store them in FOLLOWER_TASKS
     if not IS_LEADER:
-        FOLLOWER_TASKS['leader_update_task'] = asyncio.create_task(update_leader_state())
-        FOLLOWER_TASKS['own_state_task'] = asyncio.create_task(update_own_state(drone))
-        FOLLOWER_TASKS['control_task'] = asyncio.create_task(control_loop(drone))
+        if not await ensure_follower_runtime(drone, logger, "startup"):
+            logger.error("Failed to start follower runtime.")
+            sys.exit(1)
     else:
         logger.info("No follower tasks started as drone is in Leader mode.")
 
@@ -1286,12 +1499,7 @@ async def run_smart_swarm():
             pass
 
         # Cancel follower tasks if any exist
-        for task in FOLLOWER_TASKS.values():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await cancel_follower_tasks(logger)
 
         # Attempt safe shutdown of drone (e.g., stop offboard mode)
         try:
@@ -1313,17 +1521,21 @@ def main():
     """
     Main function to run the smart swarm mode.
     """
-    # Configure logging
-    configure_logging("smart_swarm")
-
-    # Parse command-line arguments if needed
+    # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Smart Swarm Mode')
+    add_log_arguments(parser)
     args = parser.parse_args()
+
+    # Initialize unified logging
+    apply_log_args(args)
+    register_component("smart_swarm", "drone", "Smart swarm following mode")
+    init_drone_logging()
+    _logger = get_logger("smart_swarm")
 
     try:
         asyncio.run(run_smart_swarm())
     except Exception:
-        logging.exception("Unhandled exception in main")
+        _logger.exception("Unhandled exception in main")
         sys.exit(1)
 
 if __name__ == "__main__":

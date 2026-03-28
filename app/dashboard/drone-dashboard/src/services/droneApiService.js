@@ -10,12 +10,12 @@ import { getBackendURL } from '../utilities/utilities';
  * @param {number} triggerTime - Optional trigger time for scheduling (default immediate).
  */
 export const buildActionCommand = (actionType, droneIds = [], triggerTime = 0) => {
-  // Note: If droneIds is empty, backend might interpret as "All Drones" 
+  // Note: If droneIds is empty, backend might interpret as "All Drones"
   // or you can handle that in your caller.
   return {
-    missionType: actionType,
+    missionType: String(actionType), // Convert to string for drone API compatibility
     target_drones: droneIds,
-    triggerTime: String(triggerTime), // ensure it’s a string
+    triggerTime: String(triggerTime), // ensure it's a string
   };
 };
 
@@ -23,27 +23,20 @@ export const sendDroneCommand = async (commandData) => {
   const requestURI = `${getBackendURL()}/submit_command`;
 
   try {
-    console.log('Sending command:', JSON.stringify(commandData));
-    console.log('Request URI:', requestURI);
-    console.log('Base Server URL:', process.env.REACT_APP_SERVER_URL);
-    console.log('Service Port:', process.env.REACT_APP_FLASK_PORT);
-
     const response = await axios.post(requestURI, commandData);
-    console.log('Response received from server:', response.data);
-
-    return response.data; // e.g. { status: 'success', message: ... }
+    return response.data;
   } catch (error) {
-    console.error('Error in sendDroneCommand:', error);
+    throw error;
+  }
+};
 
-    if (error.response) {
-      console.error('Error response data:', error.response.data);
-      console.error('Error status code:', error.response.status);
-    } else if (error.request) {
-      console.error('No response received from the server:', error.request);
-    } else {
-      console.error('Error message:', error.message);
-    }
+export const getCommandStatus = async (commandId) => {
+  const requestURI = `${getBackendURL()}/command/${commandId}`;
 
+  try {
+    const response = await axios.get(requestURI);
+    return response.data;
+  } catch (error) {
     throw error;
   }
 };
@@ -77,7 +70,6 @@ export const getSwarmClusterStatus = async () => {
       processed_trajectories: statusData.status.processed_trajectories || 0
     };
   } catch (error) {
-    console.error('Error fetching swarm cluster status:', error);
     throw error;
   }
 };
@@ -87,7 +79,6 @@ export const getProcessingRecommendation = async () => {
     const response = await axios.get(`${getBackendURL()}/api/swarm/trajectory/recommendation`);
     return response.data;
   } catch (error) {
-    console.error('Error fetching processing recommendation:', error);
     throw error;
   }
 };
@@ -102,7 +93,6 @@ export const processTrajectories = async (options = {}) => {
     });
     return response.data;
   } catch (error) {
-    console.error('Error processing trajectories:', error);
     throw error;
   }
 };
@@ -114,7 +104,6 @@ export const clearProcessedData = async () => {
     const response = await axios.post(requestURI);
     return response.data;
   } catch (error) {
-    console.error('Error clearing processed data:', error);
     throw error;
   }
 };

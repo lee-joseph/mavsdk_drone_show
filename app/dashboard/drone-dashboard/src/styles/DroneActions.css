@@ -11,16 +11,65 @@
     transition: var(--transition-all);
 }
 
+.action-parameter-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--spacing-lg);
+    padding: var(--spacing-lg);
+    border-radius: var(--border-radius-lg);
+    background: linear-gradient(135deg, var(--color-bg-secondary), var(--color-bg-tertiary));
+    border: 1px solid var(--color-border-primary);
+}
+
+.action-parameter-bar h3 {
+    margin: 0 0 var(--spacing-xs);
+    color: var(--color-text-primary);
+}
+
+.action-parameter-bar p,
+.action-parameter-bar__meta {
+    margin: 0;
+    color: var(--color-text-secondary);
+}
+
+.action-parameter-bar__meta {
+    display: flex;
+    gap: var(--spacing-sm);
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.action-parameter-bar__meta span {
+    padding: var(--spacing-sm) var(--spacing-base);
+    background: var(--color-bg-primary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--border-radius-full);
+    white-space: nowrap;
+}
+
+.action-configuration-grid {
+    display: grid;
+    grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+    gap: var(--spacing-lg);
+    align-items: start;
+}
+
 /* Action Group Styles */
 .action-group {
     background: linear-gradient(135deg, var(--color-bg-secondary), var(--color-bg-tertiary));
     border: 1px solid var(--color-border-primary);
     border-radius: var(--border-radius-lg);
-    padding: var(--spacing-xl);
+    padding: var(--spacing-lg);
     box-shadow: var(--shadow-base);
     backdrop-filter: blur(8px);
     transition: var(--transition-all);
     position: relative;
+}
+
+.action-group--danger {
+    border-color: var(--color-danger-border);
+    box-shadow: 0 0 0 1px var(--color-danger-light);
 }
 
 .action-group::before {
@@ -35,16 +84,20 @@
 }
 
 /* Color coding for action groups */
-.action-group:nth-child(1)::before {
+.action-group--routine::before {
     background: linear-gradient(90deg, var(--color-success), #2e7d32);
 }
 
-.action-group:nth-child(2)::before {
+.action-group--test::before {
     background: linear-gradient(90deg, var(--color-info), #1976d2);
 }
 
-.action-group:nth-child(3)::before {
+.action-group--maintenance::before {
     background: linear-gradient(90deg, var(--color-warning), #f57c00);
+}
+
+.action-group--danger::before {
+    background: linear-gradient(90deg, var(--color-danger), #c62828);
 }
 
 .action-group:hover {
@@ -54,12 +107,10 @@
 }
 
 .action-group h2 {
-    margin-bottom: var(--spacing-lg);
-    font-size: var(--font-size-xl);
+    margin: 0;
+    font-size: var(--font-size-lg);
     font-weight: var(--font-weight-bold);
     color: var(--color-text-primary);
-    border-bottom: 2px solid var(--color-border-primary);
-    padding-bottom: var(--spacing-base);
     background: linear-gradient(135deg, var(--color-primary), var(--brand-secondary));
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -68,10 +119,10 @@
 
 .action-buttons {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: var(--spacing-lg);
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: var(--spacing-base);
     align-items: stretch;
-    margin-top: var(--spacing-lg);
+    margin-top: var(--spacing-base);
 }
 
 .takeoff-section {
@@ -85,9 +136,103 @@
     flex-wrap: wrap;
 }
 
+.action-schedule {
+    background: var(--color-bg-tertiary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--border-radius-base);
+    padding: var(--spacing-base);
+}
+
+.action-schedule summary {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    cursor: pointer;
+    list-style: none;
+    font-weight: var(--font-weight-semibold);
+    color: var(--color-text-primary);
+}
+
+.action-schedule summary::-webkit-details-marker {
+    display: none;
+}
+
+.action-schedule summary small {
+    margin-left: auto;
+    color: var(--color-text-secondary);
+    font-weight: var(--font-weight-medium);
+}
+
+.action-schedule__body {
+    margin-top: var(--spacing-base);
+    display: grid;
+    gap: var(--spacing-base);
+}
+
+.action-schedule__modes,
+.action-schedule__presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-sm);
+}
+
+.action-schedule__modes button,
+.action-schedule__presets button {
+    padding: var(--spacing-sm) var(--spacing-base);
+    border-radius: var(--border-radius-full);
+    border: 1px solid var(--color-border-primary);
+    background: var(--color-bg-primary);
+    color: var(--color-text-secondary);
+    cursor: pointer;
+    transition: var(--transition-base);
+}
+
+.action-schedule__modes button.active,
+.action-schedule__presets button.active,
+.action-schedule__modes button:hover,
+.action-schedule__presets button:hover {
+    border-color: var(--color-primary-border);
+    background: var(--color-primary-light);
+    color: var(--color-text-primary);
+}
+
+.action-schedule__inputs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-base);
+    align-items: end;
+}
+
+.action-schedule__inputs label {
+    display: grid;
+    gap: var(--spacing-xs);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.action-schedule__inputs input {
+    min-width: 160px;
+    padding: var(--spacing-sm);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--border-radius-base);
+    background: var(--color-bg-quaternary);
+    color: var(--color-text-primary);
+}
+
+.action-schedule__note {
+    margin: 0;
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-sm);
+}
+
 .takeoff-section label {
     font-weight: var(--font-weight-semibold);
     color: var(--color-text-primary);
+    font-size: var(--font-size-sm);
+}
+
+.takeoff-section__hint {
+    color: var(--color-text-secondary);
     font-size: var(--font-size-sm);
 }
 
@@ -111,7 +256,7 @@
 .action-button {
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     gap: var(--spacing-sm);
     background: linear-gradient(135deg, var(--color-primary), var(--brand-secondary));
     color: var(--color-text-primary);
@@ -121,14 +266,13 @@
     cursor: pointer;
     font-size: var(--font-size-base);
     font-weight: var(--font-weight-bold);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
     transition: var(--transition-all);
     position: relative;
     overflow: hidden;
-    min-height: 56px;
+    min-height: 60px;
     box-shadow: var(--shadow-base);
     backdrop-filter: blur(4px);
+    text-align: left;
 }
 
 .action-button::before {
@@ -162,6 +306,15 @@
     text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
     filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.6)) brightness(1.1);
     transition: var(--transition-all);
+}
+
+.action-button__icon {
+    display: inline-flex;
+}
+
+.action-button__title {
+    color: var(--color-text-primary);
+    font-weight: var(--font-weight-bold);
 }
 
 
@@ -268,6 +421,12 @@
     background: linear-gradient(135deg, #1976d2, var(--color-info));
 }
 
+@media (max-width: 900px) {
+    .action-configuration-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
 .hover-test-button {
     background: linear-gradient(135deg, var(--color-primary), var(--brand-secondary));
 }
@@ -303,6 +462,10 @@
     animation: dangerPulse 2s infinite;
     position: relative;
     font-weight: var(--font-weight-bold);
+}
+
+.action-button.danger {
+    border: 1px solid rgba(255, 255, 255, 0.16);
 }
 
 .kill-button::before {
@@ -429,12 +592,16 @@
     }
 
     .action-button {
-        min-height: 52px;
+        min-height: 72px;
         padding: var(--spacing-base) var(--spacing-lg);
     }
 }
 
 @media (max-width: 768px) {
+    .action-parameter-bar {
+        flex-direction: column;
+    }
+
     .action-buttons {
         grid-template-columns: 1fr;
         gap: var(--spacing-sm);
@@ -444,7 +611,7 @@
         width: 100%;
         padding: var(--spacing-lg) var(--spacing-xl);
         font-size: var(--font-size-base);
-        min-height: 60px;
+        min-height: 84px;
     }
 
     .action-icon {

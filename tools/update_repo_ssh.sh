@@ -1,14 +1,12 @@
 #!/bin/bash
 #
-# update_repo_ssh.sh - Enhanced Git Sync for MDS Repository (FIXED VERSION)
+# update_repo_ssh.sh - SSH-based Git Sync for MDS Drone Fleet
 #
 # This script ensures that the drone's software repository (MDS) is
 # up-to-date before operations start. Enhanced for production swarm deployments.
 #
-# FIXED: Removed variable corruption issues and simplified configuration
-#
-# Author: Enhanced for Drone Swarm Project
-# Date: 2025-07-14 (Fixed logging and variable handling)
+# Author: MAVSDK Drone Show Team
+# Date: 2025-07-14
 #
 
 set -euo pipefail
@@ -16,12 +14,14 @@ set -euo pipefail
 # ----------------------------------
 # Configuration and Default Settings (Built-in Defaults)
 # ----------------------------------
-readonly SCRIPT_VERSION="2.0.1-fixed"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="git-sync"
 
 # Use dynamic variables for user and home directory
-REPO_USER="${REPO_USER:-$USER}"
-REPO_DIR="${REPO_DIR:-$HOME/mavsdk_drone_show}"
+RESOLVED_USER="${USER:-$(whoami 2>/dev/null || echo root)}"
+RESOLVED_HOME="${HOME:-/root}"
+REPO_USER="${REPO_USER:-$RESOLVED_USER}"
+REPO_DIR="${REPO_DIR:-$RESOLVED_HOME/mavsdk_drone_show}"
 
 # Default values - can be overridden by environment variables
 MAX_RETRIES="${MAX_RETRIES:-10}"
@@ -55,8 +55,10 @@ ENVIRONMENT="${ENVIRONMENT:-production}"
 
 # Paths and commands
 LED_CMD="${REPO_DIR}/venv/bin/python ${REPO_DIR}/led_indicator.py"
-LOG_FILE="$HOME/logs/drone_git_sync.log"
+LOG_FILE="$RESOLVED_HOME/logs/drone_git_sync.log"
 LOCK_FILE="/tmp/git_sync_${REPO_USER}.lock"
+LOCAL_ENV_FILE="${MDS_LOCAL_ENV_FILE:-/etc/mds/local.env}"
+USER_ENV_FILE="${MDS_USER_ENV_FILE:-$RESOLVED_HOME/.config/mds/env}"
 
 # ----------------------------------
 # Enhanced Logging System (FIXED - No variable corruption)
@@ -89,20 +91,156 @@ log_error_and_exit() {
     local component="$1"
     local message="$2"
     local exit_code="${3:-1}"
-    
+
     log_error "$component" "$message"
-    set_led_status "red"
+    set_led_status "ERROR_CRITICAL"
+    # Emit structured failure result for machine parsing (used by actions.py)
+    local error_json
+    error_json=$(echo "$message" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r')
+    echo "GIT_SYNC_RESULT={\"success\":false,\"branch\":\"${BRANCH_NAME:-unknown}\",\"error\":\"$component\",\"message\":\"$error_json\"}"
     cleanup_on_exit
     exit "$exit_code"
+}
+
+# ----------------------------------
+# Runtime Environment Loading
+# ----------------------------------
+load_runtime_env_files() {
+    local env_file=""
+    local loaded_files=()
+
+    for env_file in "$LOCAL_ENV_FILE" "$USER_ENV_FILE"; do
+        if [[ -f "$env_file" ]]; then
+            log_debug "ENV" "Loading environment overrides from $env_file"
+            set -a
+            # shellcheck source=/dev/null
+            source "$env_file"
+            set +a
+            loaded_files+=("$env_file")
+        fi
+    done
+
+    if [[ ${#loaded_files[@]} -gt 0 ]]; then
+        log_info "ENV" "Loaded environment overrides from ${loaded_files[*]}"
+    else
+        log_debug "ENV" "No runtime environment override files found"
+    fi
 }
 
 # ----------------------------------
 # Status and Notification Functions
 # ----------------------------------
 set_led_status() {
-    local color="$1"
+    local color_or_state="$1"
     if [[ "${LED_ENABLED:-true}" == "true" ]]; then
-        $LED_CMD --color "$color" 2>/dev/null || true
+        # Try --state first (for semantic states), fallback to --color
+        $LED_CMD --state "$color_or_state" 2>/dev/null || \
+        $LED_CMD --color "$color_or_state" 2>/dev/null || true
+    fi
+}
+
+# ----------------------------------
+# Service Update Detection (runs after git pull)
+# ----------------------------------
+check_service_updates() {
+    local component="SERVICE-UPDATE"
+    local changed=false
+    local services=("coordinator" "git_sync_mds" "wifi-manager" "led_indicator")
+
+    log_info "$component" "Checking for service file changes..."
+
+    for service in "${services[@]}"; do
+        local src_file repo_file
+        case $service in
+            coordinator)
+                src_file="/etc/systemd/system/coordinator.service"
+                repo_file="$REPO_DIR/tools/coordinator.service"
+                ;;
+            git_sync_mds)
+                src_file="/etc/systemd/system/git_sync_mds.service"
+                repo_file="$REPO_DIR/tools/git_sync_mds/git_sync_mds.service"
+                ;;
+            wifi-manager)
+                src_file="/etc/systemd/system/wifi-manager.service"
+                repo_file="$REPO_DIR/tools/wifi-manager/wifi-manager.service"
+                ;;
+            led_indicator)
+                src_file="/etc/systemd/system/led_indicator.service"
+                repo_file="$REPO_DIR/tools/led_indicator/led_indicator.service"
+                ;;
+        esac
+
+        # Atomic service file update (avoids TOCTOU race condition)
+        if [[ -f "$repo_file" ]]; then
+            local temp_file
+            temp_file=$(mktemp) || continue
+            cp "$repo_file" "$temp_file" 2>/dev/null || { rm -f "$temp_file"; continue; }
+
+            if ! cmp -s "$src_file" "$temp_file" 2>/dev/null; then
+                log_info "$component" "Service file changed: $service"
+                if sudo mv "$temp_file" "$src_file" 2>/dev/null; then
+                    log_info "$component" "Updated $service service file"
+                    changed=true
+                else
+                    log_warn "$component" "Failed to update $service service file (sudo may not be available)"
+                    rm -f "$temp_file"
+                fi
+            else
+                rm -f "$temp_file"
+            fi
+        fi
+    done
+
+    if $changed; then
+        log_info "$component" "Reloading systemd daemon..."
+        sudo systemctl daemon-reload 2>/dev/null || log_warn "$component" "Failed to reload systemd daemon"
+    fi
+}
+
+# ----------------------------------
+# Requirements Update Check (runs after git pull)
+# ----------------------------------
+check_requirements_update() {
+    local component="PIP-UPDATE"
+    local mds_dir="${HOME}/.mds"
+    local req_hash_file="${mds_dir}/requirements.sha256"
+
+    # Ensure .mds directory exists
+    mkdir -p "$mds_dir" 2>/dev/null || true
+
+    if [[ ! -f "$REPO_DIR/requirements.txt" ]]; then
+        log_debug "$component" "No requirements.txt found, skipping"
+        return 0
+    fi
+
+    local current_hash
+    current_hash=$(sha256sum "$REPO_DIR/requirements.txt" 2>/dev/null | cut -d' ' -f1)
+
+    if [[ -f "$req_hash_file" ]]; then
+        local stored_hash
+        stored_hash=$(cat "$req_hash_file" 2>/dev/null)
+
+        if [[ "$current_hash" != "$stored_hash" ]]; then
+            log_info "$component" "requirements.txt changed, updating venv..."
+            set_led_status "SERVICES_UPDATING"
+
+            if [[ -x "$REPO_DIR/venv/bin/pip" ]]; then
+                if "$REPO_DIR/venv/bin/pip" install -r "$REPO_DIR/requirements.txt" --quiet 2>/dev/null; then
+                    log_info "$component" "Python requirements updated successfully"
+                    echo "$current_hash" > "$req_hash_file"
+                else
+                    log_warn "$component" "Failed to update Python requirements"
+                fi
+            else
+                log_warn "$component" "venv pip not found at $REPO_DIR/venv/bin/pip"
+            fi
+        else
+            log_debug "$component" "requirements.txt unchanged"
+        fi
+    else
+        # First run - store current hash
+        log_info "$component" "Storing initial requirements hash"
+        echo "$current_hash" > "$req_hash_file"
     fi
 }
 
@@ -186,7 +324,8 @@ retry_with_backoff() {
             
             # Add jitter to prevent thundering herd in swarm operations
             if [[ "$ENABLE_JITTER" == "true" ]]; then
-                local jitter=$((RANDOM % 5))
+                # Use /dev/urandom for better randomness across 1000s of drones
+                local jitter=$(( $(od -An -N2 -tu2 /dev/urandom 2>/dev/null || echo $RANDOM) % MAX_JITTER_SECONDS ))
                 delay=$((delay + jitter))
             fi
         else
@@ -204,31 +343,54 @@ retry_with_backoff() {
 # ----------------------------------
 # Network Connectivity Check with Swarm Awareness
 # ----------------------------------
+probe_network_endpoint() {
+    local endpoint="$1"
+    local port="${2:-443}"
+
+    if command -v ping >/dev/null 2>&1; then
+        if ping -c 1 -W "$NETWORK_TIMEOUT" "$endpoint" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if command -v timeout >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then
+        if timeout "$NETWORK_TIMEOUT" bash -lc "</dev/tcp/${endpoint}/${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 check_network_connectivity() {
     local component="NETWORK"
     log_info "$component" "Checking network connectivity..."
     
     # Add jitter for swarm operations to prevent simultaneous network tests
     if [[ "$SWARM_OPERATION" == "true" && "$ENABLE_JITTER" == "true" ]]; then
-        local jitter=$((RANDOM % MAX_JITTER_SECONDS))
+        # Use /dev/urandom for better randomness across 1000s of drones
+        local jitter=$(( $(od -An -N2 -tu2 /dev/urandom 2>/dev/null || echo $RANDOM) % MAX_JITTER_SECONDS ))
         log_debug "$component" "Adding ${jitter}s jitter for swarm operation"
         sleep "$jitter"
     fi
     
-    # Test multiple endpoints for redundancy
-    local endpoints=("github.com" "8.8.8.8" "1.1.1.1")
+    # Test multiple endpoints for redundancy. This is advisory only; the
+    # subsequent git fetch is the authoritative connectivity test.
+    local endpoints=("github.com:443" "github.com:22" "8.8.8.8:443" "1.1.1.1:443")
     local success=false
     
-    for endpoint in "${endpoints[@]}"; do
-        if ping -c 1 -W "$NETWORK_TIMEOUT" "$endpoint" >/dev/null 2>&1; then
-            log_info "$component" "Network connectivity confirmed via $endpoint"
+    for endpoint_spec in "${endpoints[@]}"; do
+        local endpoint="${endpoint_spec%%:*}"
+        local port="${endpoint_spec##*:}"
+        if probe_network_endpoint "$endpoint" "$port"; then
+            log_info "$component" "Network connectivity confirmed via ${endpoint}:${port}"
             success=true
             break
         fi
     done
     
     if [[ "$success" != "true" ]]; then
-        log_error_and_exit "$component" "No network connectivity to any endpoint after testing: ${endpoints[*]}"
+        log_warn "$component" "Connectivity probe failed (${endpoints[*]}). Proceeding to git fetch for definitive verification."
     fi
 }
 
@@ -241,7 +403,8 @@ cleanup_git_locks() {
     local lock_files=(".git/index.lock" ".git/refs/heads/*.lock" ".git/packed-refs.lock")
     
     for pattern in "${lock_files[@]}"; do
-        for lock_file in $repo_dir/$pattern; do
+        # Note: glob expansion needs unquoted pattern but quoted base path
+        for lock_file in "$repo_dir"/$pattern; do
             if [[ -f "$lock_file" ]]; then
                 # Check if any git processes are running
                 if pgrep -f "git" >/dev/null 2>&1; then
@@ -287,7 +450,7 @@ check_git_integrity() {
 repair_git_repository() {
     local component="GIT-REPAIR"
     log_warn "$component" "Attempting repository repair..."
-    set_led_status "yellow"
+    set_led_status "ERROR_RECOVERABLE"
     
     # First, try to fix common issues
     if git stash clear 2>/dev/null; then
@@ -336,12 +499,18 @@ handle_repository_corruption() {
     # Apply recovery strategy
     case "$RECOVERY_STRATEGY" in
         "aggressive")
-            log_warn "$component" "Aggressive recovery: rebooting system..."
-            sudo reboot || log_error_and_exit "$component" "Reboot command failed"
-            exit 0
+            # WARNING: Aggressive strategy removed for fleet safety
+            # Rebooting 1000s of drones due to git issues could be catastrophic
+            # Instead, we log the error and continue with cached code
+            log_error "$component" "Repository corruption could not be repaired"
+            log_warn "$component" "Aggressive reboot disabled for fleet safety - continuing with cached code"
+            log_warn "$component" "Manual intervention may be required on this drone"
+            set_led_status "ERROR_RECOVERABLE"
+            return 1
             ;;
         "graceful")
             log_error "$component" "Repository corruption could not be repaired"
+            log_warn "$component" "Continuing with cached code - manual intervention may be required"
             return 1
             ;;
         *)
@@ -479,9 +648,9 @@ parse_arguments() {
         esac
     done
     
-    # Set values with precedence: CLI args > environment > defaults
-    BRANCH_NAME="${branch_name:-${DRONE_BRANCH:-$DEFAULT_BRANCH}}"
-    REPO_URL="${repo_url:-$DEFAULT_SSH_GIT_URL}"
+    # Set values with precedence: CLI args > modern env vars > legacy env vars > defaults
+    BRANCH_NAME="${branch_name:-${MDS_BRANCH:-${DRONE_BRANCH:-$DEFAULT_BRANCH}}}"
+    REPO_URL="${repo_url:-${MDS_REPO_URL:-$DEFAULT_SSH_GIT_URL}}"
     REPO_DIR="${repo_dir:-$REPO_DIR}"
     
     export BRANCH_NAME REPO_URL REPO_DIR
@@ -504,6 +673,12 @@ OPTIONS:
     -h, --help              Show this help message
 
 ENVIRONMENT VARIABLES:
+    MDS_REPO_URL           Repository URL override (preferred single source of truth)
+    MDS_BRANCH             Branch override (preferred single source of truth)
+    MDS_LOCAL_ENV_FILE     Alternate /etc/mds/local.env path for testing
+    MDS_USER_ENV_FILE      Alternate user env path for testing
+    DRONE_BRANCH           Legacy branch override (fallback)
+    DEFAULT_SSH_GIT_URL    Legacy repository URL fallback
     RECOVERY_STRATEGY       'graceful' or 'aggressive' (default: graceful)
     ENABLE_JITTER          Add random delays for swarm operations (default: true)
     MAX_RETRIES            Maximum retry attempts (default: 10)
@@ -534,6 +709,8 @@ main() {
     log_info "INIT" "User: $(whoami)"
     log_info "INIT" "PID: $$"
     log_info "INIT" "=========================================="
+
+    load_runtime_env_files
     
     # Parse arguments
     parse_arguments "$@"
@@ -547,8 +724,8 @@ main() {
     # Acquire exclusive lock
     acquire_lock 60
     
-    # Set initial status
-    set_led_status "blue"
+    # Set initial status - GIT_SYNCING (cyan)
+    set_led_status "GIT_SYNCING"
     
     # Validate repository directory
     if [[ ! -d "$REPO_DIR" ]]; then
@@ -590,7 +767,8 @@ main() {
     if ! perform_git_fetch "$git_url"; then
         if [[ "$RECOVERY_STRATEGY" == "graceful" ]]; then
             log_warn "GIT-FETCH" "Fetch failed, continuing with existing repository state"
-            set_led_status "yellow"
+            set_led_status "GIT_FAILED_CONTINUING"  # Yellow - indicates cached code being used
+            echo "GIT_SYNC_RESULT={\"success\":false,\"branch\":\"$BRANCH_NAME\",\"error\":\"fetch_failed_graceful\",\"message\":\"Fetch failed, using cached code\"}"
             exit 0
         else
             log_error_and_exit "GIT-FETCH" "Git fetch failed and recovery strategy is aggressive"
@@ -621,7 +799,12 @@ main() {
     if ! retry_with_backoff "$MAX_RETRIES" "GIT-PULL" git pull; then
         log_error_and_exit "GIT-PULL" "Failed to pull latest changes"
     fi
-    
+
+    # Post-sync checks: service files and requirements
+    set_led_status "GIT_SUCCESS"
+    check_service_updates
+    check_requirements_update
+
     # Get commit information for logging
     local commit_hash
     local commit_message
@@ -642,9 +825,16 @@ main() {
     log_info "SUCCESS" "Commit: $commit_hash - $commit_message"
     log_info "SUCCESS" "Duration: ${duration}s"
     log_info "SUCCESS" "=========================================="
-    
-    set_led_status "green"
-    
+
+    # Structured result for machine parsing (used by actions.py)
+    # Escape quotes/backslashes in commit message for valid JSON
+    local commit_message_json
+    commit_message_json=$(echo "$commit_message" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r')
+    echo "GIT_SYNC_RESULT={\"success\":true,\"branch\":\"$BRANCH_NAME\",\"commit\":\"$commit_hash\",\"message\":\"$commit_message_json\",\"duration\":$duration}"
+
+    # Final LED state: Startup complete (white flash), then coordinator will take over
+    set_led_status "STARTUP_COMPLETE"
+
     exit 0
 }
 

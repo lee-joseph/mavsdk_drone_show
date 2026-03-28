@@ -4,26 +4,39 @@ import '../styles/MissionDetails.css';
 import { DRONE_MISSION_IMAGES, DRONE_MISSION_TYPES } from '../constants/droneConstants';
 import MissionReadinessCard from './MissionReadinessCard';
 import useFetch from '../hooks/useFetch';
+import {
+  buildCommandSchedule,
+  COMMAND_SCHEDULE_MODES,
+} from '../utilities/commandScheduling';
 
 const MissionDetails = ({
   missionType,
   icon,
   label,
   description,
-  useSlider,
+  scheduleMode,
   timeDelay,
-  selectedTime,
+  selectedDateTime,
   onTimeDelayChange,
   onTimePickerChange,
-  onSliderToggle,
+  onScheduleModeChange,
   autoGlobalOrigin,
   onAutoGlobalOriginChange,
   useGlobalSetpoints,
   onUseGlobalSetpointsChange,
+  delayPresets = [],
+  referenceNowMs = Date.now(),
+  clockOffsetLabel = null,
   onSend,
   onBack,
 }) => {
   const missionImageSrc = DRONE_MISSION_IMAGES[missionType];
+  const schedulePreview = buildCommandSchedule({
+    scheduleMode,
+    timeDelay,
+    selectedDateTime,
+    referenceNowMs,
+  });
   
   // Check origin status for auto global origin correction mode
   const { data: originData } = useFetch('/get-origin');
@@ -41,6 +54,17 @@ const MissionDetails = ({
   
   // Only show hints for DRONE_SHOW_FROM_CSV mission type
   const showModeHints = missionType === DRONE_MISSION_TYPES.DRONE_SHOW_FROM_CSV;
+  const customShowHints = missionType === DRONE_MISSION_TYPES.CUSTOM_CSV_DRONE_SHOW;
+  const smartSwarmHints = missionType === DRONE_MISSION_TYPES.SMART_SWARM;
+  const { data: showInfo, error: showInfoError, loading: showInfoLoading } = useFetch(
+    showModeHints ? '/get-show-info' : null
+  );
+  const { data: customShowInfo, error: customShowError, loading: customShowLoading } = useFetch(
+    customShowHints ? '/get-custom-show-info' : null
+  );
+  const { data: smartSwarmInfo, error: smartSwarmError, loading: smartSwarmLoading } = useFetch(
+    smartSwarmHints ? '/api/swarm/leaders' : null
+  );
   
   // Extract deviation summary
   const deviationSummary = deviationData?.summary || null;
@@ -130,6 +154,110 @@ const MissionDetails = ({
   };
   
   const placementStatus = getPlacementStatus();
+  const showImported = Boolean(showInfo && showInfo.drone_count > 0);
+  const customShowReady = Boolean(customShowInfo && customShowInfo.exists);
+  const droneShowBlockers = [];
+  const droneShowWarnings = [];
+  const customShowBlockers = [];
+  const customShowWarnings = [];
+  const smartSwarmBlockers = [];
+  const smartSwarmWarnings = [];
+
+  if (showModeHints && showInfoLoading) {
+    droneShowBlockers.push('Verifying imported Drone Show package...');
+  }
+
+  if (showModeHints && !showInfoLoading) {
+    if (!showImported) {
+      droneShowBlockers.push('No processed Drone Show is loaded. Import a SkyBrush ZIP on the Show Design page first.');
+    }
+
+    if (showInfoError && !showImported) {
+      droneShowWarnings.push('Show metadata could not be verified from the backend.');
+    }
+
+    if (useGlobalSetpoints && autoGlobalOrigin && !isOriginSet) {
+      droneShowBlockers.push('Auto Global Launch Corrector requires a configured shared origin.');
+    }
+
+    if (useGlobalSetpoints && autoGlobalOrigin && isOriginSet && deviationSummary) {
+      if (deviationSummary.online === 0) {
+        droneShowBlockers.push('No live drone telemetry is available for launch-position verification.');
+      }
+      if (deviationSummary.errors > 0) {
+        droneShowBlockers.push('Critical launch-position errors must be resolved before launch.');
+      }
+      if (warningAnalysis.placementWarnings > 0) {
+        droneShowWarnings.push('Some drones still have placement warnings. Review Mission Config before launch.');
+      }
+      if (warningAnalysis.gpsWarnings > 0) {
+        droneShowWarnings.push('Some drones have GPS quality warnings. Confirm these are acceptable before launch.');
+      }
+    }
+
+    if (useGlobalSetpoints && !autoGlobalOrigin) {
+      droneShowWarnings.push('GLOBAL manual mode assumes operators placed every drone exactly on its assigned launch point.');
+    }
+  }
+
+  if (customShowHints && customShowLoading) {
+    customShowBlockers.push('Verifying active custom CSV package...');
+  }
+
+  if (customShowHints && !customShowLoading) {
+    if (!customShowReady) {
+      customShowBlockers.push('No active custom CSV is loaded. Open Custom Show and upload one ready-to-execute protocol CSV first.');
+    }
+
+    if (customShowError && !customShowReady) {
+      customShowWarnings.push('Custom CSV metadata could not be verified from the backend.');
+    }
+
+    if (customShowReady && !customShowInfo.preview_exists) {
+      customShowWarnings.push('Preview image is missing. Re-upload the custom CSV from Custom Show if operators need a visual cross-check.');
+    }
+  }
+
+  if (smartSwarmHints) {
+    const leaders = smartSwarmInfo?.leaders || [];
+    const followerDetails = smartSwarmInfo?.follower_details || {};
+    const totalFollowers = Object.values(followerDetails).reduce(
+      (count, followers) => count + (Array.isArray(followers) ? followers.length : 0),
+      0,
+    );
+
+    if (smartSwarmLoading) {
+      smartSwarmWarnings.push('Loading Smart Swarm topology snapshot...');
+    }
+
+    if (!smartSwarmLoading && leaders.length === 0) {
+      smartSwarmWarnings.push('No Smart Swarm topology is currently published from Swarm Design.');
+    }
+
+    if (smartSwarmError && leaders.length === 0) {
+      smartSwarmWarnings.push('Smart Swarm topology could not be verified from the backend.');
+    }
+
+    if (!smartSwarmLoading && leaders.length > 0 && totalFollowers === 0) {
+      smartSwarmWarnings.push('The current topology has leaders but no follower links.');
+    }
+  }
+
+  const missionBlockers = showModeHints
+    ? droneShowBlockers
+    : customShowHints
+      ? customShowBlockers
+      : smartSwarmHints
+        ? smartSwarmBlockers
+        : [];
+  const missionWarnings = showModeHints
+    ? droneShowWarnings
+    : customShowHints
+      ? customShowWarnings
+      : smartSwarmHints
+        ? smartSwarmWarnings
+        : [];
+  const canSendMission = missionBlockers.length === 0 && !schedulePreview.error;
   
   // Find drones with worst deviation (with tolerance for floating point comparison)
   const getWorstDeviationDrones = () => {
@@ -188,7 +316,7 @@ const MissionDetails = ({
               <div className="mode-content">
                 <span className="mode-icon">🧭</span>
                 <span className="mode-label">LOCAL Mode</span>
-                <span className="mode-description">NED feedforward, no GPS required</span>
+                <span className="mode-description">Local NED feedforward with precise manual launch placement</span>
               </div>
             </label>
             <label className={`mode-option ${useGlobalSetpoints ? 'active' : ''}`}>
@@ -219,10 +347,10 @@ const MissionDetails = ({
           <div className="guidance-content">
             <ul>
               <li>Uses <strong>local NED coordinates</strong> (North-East-Down) relative to launch position</li>
-              <li>Works with both <strong>GPS and non-GPS</strong> setups</li>
               <li>Operator must place drones <strong>exactly</strong> on their launch positions manually</li>
-              <li>For <strong>non-GPS operation</strong>: Configure PX4 failsafe and local estimator, disable "wait for GPS fix" parameter</li>
-              <li>Position accuracy depends entirely on manual placement precision</li>
+              <li>Current implementation still expects a valid launch/home reference at mission start before replaying the local trajectory</li>
+              <li>Use this path only after validating the PX4/local-estimator workflow for your deployment</li>
+              <li>Position accuracy depends on estimator quality and manual placement precision</li>
             </ul>
           </div>
         </div>
@@ -428,56 +556,269 @@ const MissionDetails = ({
         <MissionReadinessCard refreshTrigger={0} />
       )}
 
-      <div className="time-selection">
-        <label>
-          <input
-            type="radio"
-            checked={useSlider}
-            onChange={() => onSliderToggle(true)}
-          />
-          Set delay in seconds
-        </label>
-        <label>
-          <input
-            type="radio"
-            checked={!useSlider}
-            onChange={() => onSliderToggle(false)}
-          />
-          Set exact time
-        </label>
-      </div>
+      {smartSwarmHints && (
+        <div className={`origin-warning ${canSendMission ? '' : 'origin-missing'}`}>
+          <div className="warning-icon">{canSendMission ? '✅' : '⚠️'}</div>
+          <div className="warning-content">
+            <strong>Smart Swarm Topology Snapshot</strong>
+            <div className="origin-confirmation">
+              <div className="origin-info-row">
+                <span className="origin-label">Top leaders:</span>
+                <span className="origin-coords">
+                  {smartSwarmInfo?.leaders?.length
+                    ? smartSwarmInfo.leaders.join(', ')
+                    : 'Not published'}
+                </span>
+              </div>
+              <div className="origin-info-row">
+                <span className="origin-label">Follower links:</span>
+                <span className="origin-coords">
+                  {Object.values(smartSwarmInfo?.follower_details || {}).reduce(
+                    (count, followers) => count + (Array.isArray(followers) ? followers.length : 0),
+                    0,
+                  )}
+                </span>
+              </div>
+            </div>
 
-      {useSlider ? (
-        <div className="time-delay-slider">
-          <label htmlFor="time-delay">Time Delay (seconds): {timeDelay}</label>
-          <input
-            type="range"
-            id="time-delay"
-            min="0"
-            max="60"
-            value={timeDelay}
-            onChange={(e) => onTimeDelayChange(e.target.value)}
-          />
-        </div>
-      ) : (
-        <div className="time-picker">
-          <label htmlFor="time-picker">Select Time:</label>
-          <input
-            type="time"
-            id="time-picker"
-            value={selectedTime}
-            onChange={(e) => onTimePickerChange(e.target.value)}
-            step="1"
-          />
+            {missionWarnings.length > 0 && (
+              <ul>
+                {missionWarnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            )}
+
+            <ul>
+              <li>This mission uses the live Smart Swarm formation topology, not pre-processed leader trajectories.</li>
+              <li>Verify leader/follower roles, offsets, and frame selection in Swarm Design before launch.</li>
+              <li>Use immediate overrides like Hold, RTL, or Land to recover drones individually while the rest of the swarm stays in mode.</li>
+            </ul>
+
+            <p>
+              Review the live topology in{' '}
+              <Link to="/swarm-design" className="origin-link">
+                Swarm Design
+              </Link>{' '}
+              before scheduling this mission.
+            </p>
+          </div>
         </div>
       )}
 
-      <button onClick={onSend} className="mission-button">
-        Send Command
-      </button>
-      <button onClick={onBack} className="back-button">
-        Back
-      </button>
+      {showModeHints && (
+        <div className={`origin-warning ${canSendMission ? '' : 'origin-missing'}`}>
+          <div className="warning-icon">{canSendMission ? '✅' : '⚠️'}</div>
+          <div className="warning-content">
+            <strong>Launch Readiness Snapshot</strong>
+            <div className="origin-confirmation">
+              <div className="origin-info-row">
+                <span className="origin-label">Imported Show:</span>
+                <span className="origin-coords">
+                  {showImported
+                    ? `${showInfo.drone_count} drones • ${showInfo.duration_minutes}m ${showInfo.duration_seconds}s`
+                    : 'Not available'}
+                </span>
+              </div>
+              {showImported && (
+                <div className="origin-info-row">
+                  <span className="origin-label">Max Altitude:</span>
+                  <span className="origin-coords">{showInfo.max_altitude} m</span>
+                </div>
+              )}
+            </div>
+
+            {droneShowBlockers.length > 0 && (
+              <ul>
+                {droneShowBlockers.map((blocker) => (
+                  <li key={blocker}>{blocker}</li>
+                ))}
+              </ul>
+            )}
+
+            {droneShowWarnings.length > 0 && (
+              <ul>
+                {droneShowWarnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            )}
+
+            <p>
+              Review the imported geometry in{' '}
+              <Link to="/manage-drone-show" className="origin-link">
+                Show Design
+              </Link>{' '}
+              and the live launch setup in{' '}
+              <Link to="/mission-config" className="origin-link">
+                Mission Config
+              </Link>{' '}
+              before scheduling launch.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {customShowHints && (
+        <div className={`origin-warning ${canSendMission ? '' : 'origin-missing'}`}>
+          <div className="warning-icon">{canSendMission ? '✅' : '⚠️'}</div>
+          <div className="warning-content">
+            <strong>Custom CSV Readiness Snapshot</strong>
+            <div className="origin-confirmation">
+              <div className="origin-info-row">
+                <span className="origin-label">Execution Mode:</span>
+                <span className="origin-coords">LOCAL launch-frame only</span>
+              </div>
+              <div className="origin-info-row">
+                <span className="origin-label">Active CSV:</span>
+                <span className="origin-coords">
+                  {customShowReady
+                    ? `${customShowInfo.filename} • ${customShowInfo.duration_sec}s • ${customShowInfo.row_count} samples`
+                    : 'Not available'}
+                </span>
+              </div>
+              {customShowReady && (
+                <div className="origin-info-row">
+                  <span className="origin-label">Max Altitude:</span>
+                  <span className="origin-coords">{customShowInfo.max_altitude} m</span>
+                </div>
+              )}
+            </div>
+
+            {missionBlockers.length > 0 && (
+              <ul>
+                {missionBlockers.map((blocker) => (
+                  <li key={blocker}>{blocker}</li>
+                ))}
+              </ul>
+            )}
+
+            {missionWarnings.length > 0 && (
+              <ul>
+                {missionWarnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            )}
+
+            <ul>
+              <li>Each drone runs the same CSV relative to its own launch point.</li>
+              <li>GLOBAL origin correction and shared-origin placement checks do not apply in this mode.</li>
+              <li>Use this for advanced/manual testing, not for the normal SkyBrush multi-drone show pipeline.</li>
+              <li>The uploaded CSV must already follow the MDS custom trajectory protocol; no conversion is done here.</li>
+            </ul>
+
+            <p>
+              Review the authored path in{' '}
+              <Link to="/custom-show" className="origin-link">
+                Custom Show
+              </Link>{' '}
+              and confirm launch spacing in{' '}
+              <Link to="/mission-config" className="origin-link">
+                Mission Config
+              </Link>{' '}
+              before scheduling launch.
+            </p>
+          </div>
+        </div>
+      )}
+
+      <div className="mission-schedule">
+        <div className="mission-schedule__header">
+          <div>
+            <h3>Execution Timing</h3>
+            <p>Choose whether this mission starts now, after a short delay, or at an exact date and time.</p>
+          </div>
+          <div className="mission-schedule__clock">
+            <span>Scheduler clock</span>
+            <strong>{clockOffsetLabel ? `GCS aligned · ${clockOffsetLabel}` : 'GCS aligned'}</strong>
+          </div>
+        </div>
+
+        <div className="mission-schedule__modes">
+          <label className={`mission-schedule__mode ${scheduleMode === COMMAND_SCHEDULE_MODES.NOW ? 'active' : ''}`}>
+            <input
+              type="radio"
+              checked={scheduleMode === COMMAND_SCHEDULE_MODES.NOW}
+              onChange={() => onScheduleModeChange(COMMAND_SCHEDULE_MODES.NOW)}
+            />
+            <span>Now</span>
+            <small>Immediate after acceptance</small>
+          </label>
+          <label className={`mission-schedule__mode ${scheduleMode === COMMAND_SCHEDULE_MODES.DELAY ? 'active' : ''}`}>
+            <input
+              type="radio"
+              checked={scheduleMode === COMMAND_SCHEDULE_MODES.DELAY}
+              onChange={() => onScheduleModeChange(COMMAND_SCHEDULE_MODES.DELAY)}
+            />
+            <span>Delay</span>
+            <small>Short controlled countdown</small>
+          </label>
+          <label className={`mission-schedule__mode ${scheduleMode === COMMAND_SCHEDULE_MODES.ABSOLUTE ? 'active' : ''}`}>
+            <input
+              type="radio"
+              checked={scheduleMode === COMMAND_SCHEDULE_MODES.ABSOLUTE}
+              onChange={() => onScheduleModeChange(COMMAND_SCHEDULE_MODES.ABSOLUTE)}
+            />
+            <span>Exact Time</span>
+            <small>Absolute calendar time</small>
+          </label>
+        </div>
+
+        {scheduleMode === COMMAND_SCHEDULE_MODES.DELAY && (
+          <div className="time-delay-slider">
+            <label htmlFor="time-delay">Countdown: {timeDelay}s</label>
+            <div className="mission-schedule__presets">
+              {delayPresets.map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  className={`mission-schedule__preset ${Number(timeDelay) === preset ? 'active' : ''}`}
+                  onClick={() => onTimeDelayChange(preset)}
+                >
+                  +{preset}s
+                </button>
+              ))}
+            </div>
+            <input
+              type="range"
+              id="time-delay"
+              min="0"
+              max="120"
+              value={timeDelay}
+              onChange={(e) => onTimeDelayChange(e.target.value)}
+            />
+          </div>
+        )}
+
+        {scheduleMode === COMMAND_SCHEDULE_MODES.ABSOLUTE && (
+          <div className="time-picker">
+            <label htmlFor="time-picker">Exact execution time</label>
+            <input
+              type="datetime-local"
+              id="time-picker"
+              value={selectedDateTime}
+              onChange={(e) => onTimePickerChange(e.target.value)}
+              step="1"
+            />
+          </div>
+        )}
+
+        <div className={`mission-schedule__summary ${schedulePreview.error ? 'error' : ''}`}>
+          <strong>{schedulePreview.summary}</strong>
+          <span>{schedulePreview.detail}</span>
+          {schedulePreview.error && <small>{schedulePreview.error}</small>}
+        </div>
+      </div>
+
+      <div className="mission-actions">
+        <button onClick={onBack} className="back-button">
+          Back
+        </button>
+        <button onClick={onSend} className="mission-button" disabled={!canSendMission}>
+          Review & Send Command
+        </button>
+      </div>
     </div>
   );
 };

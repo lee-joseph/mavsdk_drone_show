@@ -1,9 +1,10 @@
-import logging
 import threading
 import requests  # Make sure requests is installed
+from mds_logging import get_logger
 from src.params import Params
+from src.led_colors import LEDColors
 
-logger = logging.getLogger(__name__)
+logger = get_logger("connectivity")
 
 class ConnectivityChecker:
     """
@@ -29,8 +30,8 @@ class ConnectivityChecker:
         self.is_running = False  # Flag to prevent multiple threads
         # Optionally, you can add a connectivity_check_endpoint in your Params; otherwise use default.
         self.endpoint = getattr(params, 'connectivity_check_endpoint', ConnectivityChecker.DEFAULT_ENDPOINT)
-        # Use a port from params if available, else fall back to flask_telem_socket_port (or a default value)
-        self.port = getattr(params, 'flask_telem_socket_port', 5000)
+        # Use a port from params if available, else fall back to gcs_api_port (or a default value)
+        self.port = getattr(params, 'gcs_api_port', 5000)
 
     def start(self):
         """
@@ -51,7 +52,7 @@ class ConnectivityChecker:
         """
         if self.is_running:
             self.stop_event.set()
-            self.thread.join()
+            self.thread.join(timeout=5.0)  # Prevent indefinite blocking
             self.is_running = False
             logger.info("ConnectivityChecker stopped.")
         else:
@@ -68,13 +69,15 @@ class ConnectivityChecker:
             try:
                 result = self.check_connectivity(ip)
                 if result:
-                    # Connection successful, set LED to green
-                    self.led_controller.set_color(0, 255, 0)  # Green
-                    logger.debug("Connectivity check successful. LED set to green.")
+                    # Connection successful, set LED to green (connected)
+                    if self.led_controller is not None:
+                        self.led_controller.set_color(*LEDColors.IDLE_CONNECTED)
+                    logger.debug("Connectivity check successful.")
                 else:
-                    # Connection failed, set LED to purple
-                    self.led_controller.set_color(255, 0, 255)  # purple
-                    logger.warning("Connectivity check failed. LED set to purple.")
+                    # Connection failed, set LED to purple (disconnected)
+                    if self.led_controller is not None:
+                        self.led_controller.set_color(*LEDColors.IDLE_DISCONNECTED)
+                    logger.warning("Connectivity check failed.")
             except Exception as e:
                 logger.error(f"Error in connectivity check: {e}")
             # Wait for the specified interval or until stop_event is set

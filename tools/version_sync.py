@@ -154,19 +154,25 @@ def generate_version_js(version):
  * 3. Rebuild the frontend: npm run build
  */
 
-const VERSION = '{version}';
-const GIT_COMMIT = '{git_hash}';
-const GIT_BRANCH = '{git_branch}';
+const DEFAULT_VERSION = '{version}';
+const DEFAULT_GIT_COMMIT = '{git_hash}';
+const DEFAULT_GIT_BRANCH = '{git_branch}';
+
+const VERSION = process.env.REACT_APP_VERSION || DEFAULT_VERSION;
+const GIT_COMMIT = process.env.REACT_APP_GIT_COMMIT || DEFAULT_GIT_COMMIT;
+const GIT_BRANCH = process.env.REACT_APP_GIT_BRANCH || DEFAULT_GIT_BRANCH;
 const VERSION_DISPLAY = `v${{VERSION}} (${{GIT_COMMIT}})`;
 
 export {{ VERSION, GIT_COMMIT, GIT_BRANCH, VERSION_DISPLAY }};
 
-export default {{
+const versionInfo = {{
   VERSION,
   GIT_COMMIT,
   GIT_BRANCH,
   VERSION_DISPLAY
 }};
+
+export default versionInfo;
 '''
 
     FRONTEND_VERSION_JS.write_text(content)

@@ -7,16 +7,291 @@ and this project uses simple two-part versioning: `X.Y` (Major.Minor).
 
 ---
 
-## [3.9] - 2025-11-28
+## [Unreleased]
+
+### Fixed
+- drone `UPDATE_CODE` commands now preserve their runtime `update_branch` payload all the way into mission execution, so dashboard-triggered repo sync actually runs instead of reporting accepted while silently failing branch resolution on the drone
+- git-sync verification now ignores generated SITL provenance metadata files, so stock containers do not stay permanently `dirty` just because they carry build/provenance markers
+- the `Sync Now` flow now verifies real branch/commit convergence before reporting success, and default all-drone sync now prefers recently active drones instead of counting stale offline config slots from the same host
+- `tools/update_repo_ssh.sh` now resolves user/home robustly even in non-interactive container execution, avoiding `USER: unbound variable` failures during scripted sync actions
+- `tools/update_repo_ssh.sh` no longer treats ICMP `ping` as a hard requirement for connectivity, so Docker/SITL sync uses TCP-aware advisory probing and lets the actual `git fetch` decide whether network access is available
+- mission and action scheduling now present GCS-aligned UTC execution times more clearly, so operator confirmations/toasts stay consistent even when the browser wall clock is off
+- browser/GCS clock-drift notes now appear only for material offsets instead of small harmless differences, reducing operator noise during normal SITL use
+- per-drone overview-card overrides now explain that they are airborne intervention controls, so disarmed or link-unavailable cards no longer look like broken action panels
+- overview preflight tiles no longer flicker back to "Checking git state" on each poll, and now use quieter state coloring plus hover diagnostics instead of text churn
+- the Actions tab is more compact, action descriptions moved to hover/confirmation context, and flight/test actions can now be scheduled without forcing maintenance or danger actions into delayed execution
+- dashboard drone cards now separate warning/unknown link states from true blocked readiness, add clearer link-state hover details, and avoid treating every non-ready state as the same red alarm
+- the Custom CSV workflow now has a real dashboard upload/validate/preview path instead of the old placeholder/CORS-broken preview behavior
+- the Drone Show dashboard now states more clearly that SkyBrush ZIP import and Custom CSV are separate operator workflows, reducing accidental mode confusion
+- **Custom Repo Workflow Validation**:
+  - documented the real GitHub behavior that public upstream forks stay public by default, so confidentiality-sensitive customer setups should use a private mirror/custom repo path instead of assuming a private fork
+  - GCS and drone SSH repo setup now pin repo-local `core.sshCommand` when SSH is used, so pre-existing host `~/.ssh/config` GitHub identities do not silently override the intended MDS deploy key
+  - GCS env configuration now rewrites `/etc/mds/gcs.env` when repo, branch, or access mode changes on a non-interactive rerun, so launcher/runtime state stays aligned with the selected customer repo instead of preserving stale official defaults
+  - SITL runtime and SITL image preparation now prefer file-backed private GitHub auth via `MDS_GIT_AUTH_TOKEN_FILE`, so private mutable SITL and private custom-image builds avoid exposing raw tokens in process arguments while keeping `MDS_GIT_AUTH_TOKEN` as a legacy fallback
+  - fresh headless GCS startup is now robust when Node.js was installed via `nvm`, because the launcher discovers the Node toolchain explicitly and uses absolute `uvicorn` / `gunicorn` / `npm` paths inside tmux panes instead of depending on inherited shell PATH state
+  - SITL image preparation and live SITL runtime no longer blank the repo URL when authenticated GitHub HTTPS is unavailable, and official/custom image builds now stop immediately if runtime filesystem preparation fails instead of flattening a partial container
+- the official public SITL archive was rebuilt from the corrected release flow, republished on MEGA, and re-linked in the SITL guide after validation on a fresh Hetzner host
+- dashboard runtime freshness now uses a server-derived telemetry clock hint instead of blindly trusting the operator browser clock, so fresh remote SITL sessions no longer show false stale-link readiness states just because the client clock is skewed
+- drone readiness cards now preserve a recent PX4 readiness snapshot as a warning-only link issue instead of immediately flipping the whole card to `Unverified`, so low-bandwidth or briefly delayed telemetry is shown more cleanly for operators
+- the Custom CSV page now uses the served image endpoint directly instead of a cross-origin `fetch()` blob path, which removes the false preview error caused by browser CORS on `:3030 -> :5000`
+- drone card position-ID comparison now normalizes numeric/string values before flagging a mismatch, so matching IDs no longer show a false warning icon
+- the Overview dashboard now normalizes live telemetry before rendering drone cards, so browser/server clock skew no longer produces false `Heartbeat only` / `Link lost` card states, and short 3-point SkyBrush imports now process correctly through the linear fallback path
+- the telemetry API now exposes a server clock header and the dashboard uses that server-derived time when evaluating freshness, so moderate browser clock drift no longer silently degrades link state; if a meaningful client/server offset exists it is surfaced in the link-status tooltip instead
 
 ### Added
-- Automated version bump (minor)
+- **Custom Repo Workflow Guide**:
+  - new `docs/guides/custom-repo-workflow.md` covering customer/private repo operation across GCS, real drones, SITL, upstream sync, and custom release images
+- **Repo-wide AI agent operating spec**:
+  - new root `AGENTS.md` as the canonical machine-oriented SITL audit/debug/release loop
+  - thin root `CLAUDE.md` and `GEMINI.md` shims that point to the shared spec instead of duplicating instructions
+  - new `docs/superpowers/specs/2026-03-26-ai-agent-sitl-audit-loop.md` for the deeper agent-only execution contract
+  - new `docs/superpowers/README.md` index so agent-only specs/plans stay organized without cluttering user-facing docs
+- **Drone Show Operator Guide**:
+  - new `docs/features/drone-show.md` covering SkyBrush import flow, GLOBAL/LOCAL modes, Custom CSV, trigger timing, and read-only demo guidance
+- **Unified Logging System (`mds_logging`)**: Shared logging contract for all components
+  - JSONL format for machine-parseable log files with ISO 8601 UTC timestamps
+  - Session-based retention with configurable limits (count + size)
+  - Colored console output with component-tagged messages
+  - Component self-registration registry for auto-discovery
+  - In-memory pub/sub watcher for SSE streaming
+  - Shared CLI flags: `--verbose`, `--debug`, `--quiet`, `--log-json`, `--log-dir`
+  - Environment variable config with `MDS_LOG_*` prefix and deprecation shims
+- **Frontend Log Viewer (Phase 3)**:
+  - Log Viewer page at `/logs` with Operations and Developer modes
+  - Operations mode: WARNING+ filter, health bar, live event feed, clean UI
+  - Developer mode: all log levels, component tree, search, session selector, export
+  - Explicit `GCS` vs `Drone #N` scope switch for live streams and historical sessions
+  - Human-readable session labels with explicit UTC note, clickable error/warning drill-down, and time-window focus controls
+  - Active filter chips, one-click `Clear All Filters`, and explanatory empty states to reduce operator confusion
+  - MUI DataGrid virtual scroll for 100K+ log rows
+  - Real-time SSE streaming via `useLogStream` hook with 200ms batching and 5000-line ring buffer
+  - Historical session browsing with filtering and client-side pagination
+  - Export sessions as JSONL or ZIP, including proxied drone sessions
+  - ErrorBoundary catches React render errors and reports to `POST /api/logs/frontend`
+  - New "System" sidebar section with Log Viewer entry
+  - `@mui/x-data-grid` dependency for virtual scroll
+- **Log Aggregation & Streaming (Phase 2)**:
+  - Drone-side log API: `GET /api/logs/sessions`, `GET /api/logs/sessions/{id}`, `GET /api/logs/stream` (SSE)
+  - GCS log API router with 10 endpoints at `/api/logs/*`
+  - Real-time SSE streaming with level/component/source/drone_id filtering
+  - GCS-to-drone log proxy (sessions, session content, SSE stream forwarding)
+  - Session export as JSONL or ZIP via `POST /api/logs/export`
+  - Frontend error reporting via `POST /api/logs/frontend`
+  - Component registry endpoint at `GET /api/logs/sources`
+  - Optional background pull of WARNING+ logs from drones (`MDS_LOG_BACKGROUND_PULL`)
+  - Runtime config toggle at `POST /api/logs/config`
+  - `read_session_lines()` helper for filtered session content retrieval
+  - `httpx` async HTTP client dependency for drone proxy
+- **SITL Image Release Tooling**:
+  - `tools/sitl_image_prepare.sh` to rebuild a clean runtime filesystem inside a temporary container
+  - `tools/release_sitl_image.sh` to flatten and retag official SITL releases without carrying old `docker commit` history
+  - `tools/run_with_log_policy.py` for bounded runtime file logs in SITL containers
+- **Smart Swarm Runtime Guide**:
+  - Dedicated operator/developer guide at `docs/features/smart-swarm.md`
+  - Explicit command-scope model for single-drone vs swarm-level runtime controls
+  - Documented leader-loss policy and extension points for future election strategies
+- **Smart Swarm Acceptance Tooling**:
+  - `tools/validate_smart_swarm_runtime.py` for branch-level 5-drone SITL validation
+  - waits for preflight readiness before takeoff so fresh-boot SITL checks do not race container startup
+  - validates full command acceptance/execution, cluster settle, live reassignment, leader-only RTL, hold, land, and final disarm
 
 ### Changed
-- See commit history for detailed changes
+- `Show Design` / `Custom Show` operator guidance, Mission Details, and the Drone Show guide now reflect the current split between the normal SkyBrush import pipeline and the expert-only Custom CSV override
+- Bootstrap installers now propagate custom repo/branch selections all the way into `mds_gcs_init.sh` / `mds_init.sh`, including explicit `--repo-url` support and correct persistence of custom branch settings in later config/state
+- Root `README.md` and `docs/README.md` now use a cleaner "start here" / role-based navigation model so testers, operators, deployers, and maintainers can reach the right guide with less duplication and less scrolling
+- Drone git sync now uses the same repo/branch source of truth in both boot-time sync and operator-triggered `UPDATE_CODE` flows by loading `/etc/mds/local.env` before resolving `MDS_REPO_URL` / `MDS_BRANCH`
+- Bootstrap and setup flows now accept `--fork OWNER` or `--fork OWNER/REPO`, so customer org/private repo paths no longer require ad hoc URL rewriting
+- README, docs index, setup guides, automation guides, and troubleshooting guides now route custom repo users to a single end-to-end workflow instead of assuming only a personal GitHub fork
+- fresh-host setup guides now include the missing `curl` prerequisite for the one-line GCS bootstrap and explicitly note the validated headless `/health` readiness check after launch
+- SITL archive docs now standardize on the official `MEGAcmd` client installed through MEGA's Ubuntu package and `apt`, so public downloads and authenticated archive replacement use one consistent toolchain
+- the official public SITL archive was refreshed again from the exact validated branch state and re-exported on MEGA with baked commit `f55a65b`
+- the SITL guide now points directly to the YouTube playlist, trims repeated Mega wording, clarifies that manual browser download of the same archive is acceptable on local systems, and adds a stronger advanced/custom/hardware caution with direct contact info
+- Drone Show now separates the tracked stock SITL demo origin (`data/origin.sitl.default.json`) from the mutable runtime origin override (`data/origin.json`), and the stock Azadi Stadium default is shared by both GCS origin fallback and `startup_sitl.sh`
+- The shipped SITL Drone Show bundle now matches the stock 5-drone SITL config end-to-end, and packaged Drone Show metrics were refreshed so stock assets no longer drift from config
+- Superseded running Drone Show missions now report a terminal execution result back to GCS instead of leaving command tracking stuck in `executing`
+- GCS HTTPS/demo installs now write `MDS_GIT_AUTO_PUSH=false` into `/etc/mds/gcs.env`, and dashboard imports/saves fail fast instead of hanging on interactive push prompts
+- Drone Show dashboard surfaces now avoid misleading empty export/visualization states before any show is imported, and the custom CSV confirmation path is explicit about its local-only execution model
+- All GCS server components migrated from `gcs_logging`/`logging_config` to `mds_logging`
+- All drone-side components migrated from `configure_logging()`/inline setup to `mds_logging`
+- CLI flags unified: `--debug` replaced with `--verbose`/`--debug`/`--quiet`
+- Backend compatibility shims and test helpers now match the current FastAPI/httpx websocket path, telemetry schema, and session ordering behavior so the full regression suite stays green on current dependencies
+- `multiple_sitl/startup_sitl.sh` now keeps runtime repo sync via `git fetch/reset`, only reinstalls Python requirements when `requirements.txt` changes, and bounds container-side file logs by default
+- Docker SITL image prep now preserves the real PX4 git/submodule metadata, records PX4 provenance in image metadata files, and makes the startup repo auto-sync behavior explicit as mutable latest-on-boot mode
+- Docker SITL launcher now persists wrapper-level startup diagnostics, strips repetitive PX4 shell prompt noise from `sitl_simulation.log`, and waits for PX4/router/coordinator readiness before reporting success
+- `tools/build_custom_image.sh` now produces flattened custom images instead of layering more state through `docker commit`
+- SITL image preparation/build docs now pin PX4 plus baked `mavsdk_server` inside the image, pass `MDS_MAVSDK_VERSION` / `MDS_MAVSDK_URL` through the image-build path, and use updated MAVSDK release asset naming for current releases
+- SITL public setup docs now separate pinned validated releases from mutable latest-on-boot development mode, add a dedicated custom release workflow guide, and refresh FastAPI startup/version guidance for current GCS deployment behavior
+- Root and docs index READMEs now reflect the current MDS 5 scope more accurately, including QuickScout SAR, trajectory planning, unified logging, and the current SITL/custom-release workflow paths
+- Smart Swarm now refreshes GCS-backed assignments before startup role selection, exposes compact swarm-runtime controls in the dashboard, and uses a safer `upstream_or_hold` leader-loss default instead of cross-cluster numeric fallback
+- Smart Swarm runtime controls now default to `Selected Drone`, with explicit `Selected Cluster` scope for formation-level actions so mixed missions stay predictable
+- Smart Swarm dashboard flow now includes a clearer `Formation Preview`, live readiness snapshot, scoped start blockers, explicit cluster-target semantics, and less redundant ready-state noise on drone cards
+- Smart Swarm follower recovery now restarts offboard cleanly on follower re-entry, waits for state lock before sending setpoints, and treats stale leader telemetry as a failover condition
+- GCS swarm updates now reject follow-chain cycles both for dashboard saves and live `/request-new-leader` changes
+- Smart Swarm predictor/control internals now use corrected grouped-state Kalman process noise, incremental prediction timing, and leader-velocity feedforward to reduce formation lag
+- Smart Swarm leader-change notifications now update only `follow` in GCS so failover or runtime reassignment does not overwrite fresher operator-edited offsets/frame values
+- GCS launcher logging is now quieter by default: duplicate raw access logs are disabled unless `MDS_GCS_ACCESS_LOGS=true`, and noisy third-party HTTP client debug output is suppressed so Smart Swarm/runtime signal stays readable
+- GCS launchers now set console logging deterministically through `MDS_GCS_CONSOLE_LOG_LEVEL` (default `INFO`), so inherited shell/debug state does not silently make the first-run tester flow noisy
+- Smart Swarm and GCS polling paths now use named transport timeout parameters instead of scattered literals, including follower leader-state fetches, GCS swarm-config refresh, leader-change notify, and GCS drone telemetry/git pulls
+- Routine successful command-status polling (`GET /command/<id>`) and internal execution-result callbacks are now treated as `DEBUG` request noise instead of `INFO`
+- Drone config lookups no longer spam routine `INFO` lines during normal runtime polling
+- SITL and Smart Swarm docs now reflect Python 3.11+ manual requirements, the optional nature of external NetBird/MAVLink routing, the stock 5-drone SITL config limit, and the validated Smart Swarm acceptance flow
+- SITL distribution docs now treat third-party `megatools` as public-download-only and standardize authenticated archive replacement on official `MEGAcmd`, including the refreshed public archive link for the current validated image
+- README and Smart Swarm docs now spell out the first dashboard-driven Smart Swarm operator path from `Overview` readiness checks through `Swarm Design` runtime control
+
+### Removed
+- `gcs-server/logging_config.py` (857 lines, DroneSwarmLogger)
+- `gcs-server/gcs_logging.py` (PYTHONPATH workaround wrapper)
+- `src/logging_config.py` (drone-side logging config)
+- `configure_logging()` function from `drone_show_src/utils.py`
+- `setup_logging()` function from `functions/file_management.py`
+- All `logging.basicConfig()` calls across the codebase
 
 ---
 
+## [5.0] - 2026-02-24
+
+### Added
+- **QuickScout SAR/Reconnaissance Module**: Multi-drone cooperative area survey
+  - New mission mode: `QUICKSCOUT = 5` with boustrophedon coverage planning
+  - Boustrophedon (lawn-mower) coverage path planner with Shapely polygon operations
+  - ENU coordinate conversion via pymap3d for accurate local planning
+  - Automatic sector partitioning and GPS-proximity drone assignment
+  - PX4 Mission Mode executor (`quickscout_mission.py`) with MAVSDK mission upload
+  - Mission lifecycle management: plan, launch, pause, resume, abort
+  - Point of Interest (POI) management with CRUD operations
+  - Terrain-following altitude adjustment
+  - Camera trigger actions at configurable intervals
+- **SAR API Endpoints**: FastAPI APIRouter at `/api/sar`
+  - Coverage planning, mission control, drone progress, POI, and elevation endpoints
+  - Thread-safe singleton managers for mission state and POI storage
+- **QuickScout Dashboard Page**: Full Plan/Monitor UI
+  - Mapbox GL polygon drawing for search area definition
+  - Coverage path preview with per-drone color coding
+  - Real-time drone progress monitoring with status cards
+  - Interactive POI marker system
+  - Survey configuration panel with advanced options
+- **SAR Test Suite**: Schema validation, coverage planner algorithm, and API endpoint tests
+- **New Dependencies**: `shapely>=2.0.0` and `pymap3d` (GCS server only), `@mapbox/mapbox-gl-draw` (frontend)
+- **Documentation**: `docs/quickscout.md` with architecture, API reference, and configuration guide
+
+---
+
+## [4.5] - 2026-02-24
+
+### Added
+- **Automated mavlink-router Integration**: Dashboard binary auto-download, systemd service setup via `mavlink_setup.sh`
+
+### Changed
+- **Config/Swarm migrated from CSV to JSON** (`v4.5.0-config-json`):
+  - `config.csv` → `config.json`, `swarm.csv` → `swarm.json` (same for SITL variants)
+  - JSON envelope format: `{"version": 1, "drones": [...]}` / `{"version": 1, "assignments": [...]}`
+  - Native types: `mavlink_port`/`baudrate` as int, `follow` as int
+  - Pydantic schemas with `extra='allow'` for user-defined custom fields (e.g. `color`, `notes`)
+  - Shell scripts use `jq` for config parsing (dependency checked at runtime)
+  - Dashboard: JSON import/export (primary), CSV import as fallback
+  - Resource templates updated (10 files)
+  - One-time migration tool: `tools/migrate_csv_to_json.py`
+  - Guide: `docs/guides/config-json-format.md`
+- **Swarm offset fields renamed** for clarity and extensibility:
+  - `offset_n/offset_e/offset_alt` → `offset_x/offset_y/offset_z`
+  - `body_coord` (bool) → `frame` (enum: `"ned"` | `"body"`)
+  - Meaning of x/y/z depends on frame (ned: North/East/Up; body: Forward/Right/Up)
+  - `offset_z` is always positive-up regardless of frame
+
+---
+
+## [4.4] - 2026-01-30
+
+### Changed
+- Version bump for enterprise services and configuration improvements
+
+---
+
+## [4.3] - 2026-01-28
+
+### Added
+- **Enhanced Repository Management**: Interactive fork vs default repository selection
+  - Clear read-only warning for default repo users
+  - SSH access detection for collaborators
+  - Fork configuration verification (matches RPi init behavior)
+- **NetBird VPN Integration**: VPN networking guidance in installation summary
+  - New guide: `docs/guides/netbird-setup.md`
+  - Network architecture diagrams
+  - Step-by-step setup instructions
+- **CLI Improvements**: New `--fork` option for `install_gcs.sh`
+  - Quick fork setup: `curl ... | sudo bash -s -- --fork username`
+  - Better error messages and guidance
+
+### Changed
+- **Repository Selection Flow**: Separated "what repo" from "how to access"
+  - Step 1: Choose official repo or your own fork
+  - Step 2: Choose HTTPS or SSH access
+  - SSH recommended for production (enables git sync)
+- **Path Resolution**: Fixed PYTHONPATH for GCS server module imports
+  - Works correctly from any execution directory
+  - Explicitly sets PROJECT_ROOT in PYTHONPATH
+- **Documentation**: Updated gcs-setup.md with repository options and VPN networking
+
+### Fixed
+- **Module Import Issues**: GCS server can now find functions module from any path
+- **Version Consistency**: All files updated to 4.3.0
+
+---
+
+## [4.2] - 2026-01-28
+
+### Added
+- **Unified MDS Branding**: Consistent ASCII art banner across all initialization scripts
+  - New shared banner file: `tools/mds_banner.sh`
+  - `print_mds_banner()` function for consistent display
+  - `get_git_info()` function for git branch/commit retrieval
+- **Version/Git Info at Startup**: All scripts now display version, branch, and commit at startup
+  - GCS bootstrap shows version and branch during installation
+  - GCS init displays version, branch, commit, and timestamp
+  - RPi init displays version, branch, commit, and timestamp
+  - Dashboard startup shows version and git info
+
+### Changed
+- **Banner Unification**: All scripts now use the same MDS ASCII art
+  - `tools/install_gcs.sh`: Replaced box-drawing banner with unified banner
+  - `tools/mds_gcs_init.sh`: Uses shared banner with git info
+  - `tools/mds_gcs_init_lib/gcs_common.sh`: Sources shared banner
+  - `tools/mds_init.sh`: Uses shared banner with git info
+  - `tools/mds_init_lib/common.sh`: Sources shared banner
+  - `app/linux_dashboard_start.sh`: Replaced wide ASCII with unified banner
+- **Version Synchronization**: All version numbers updated to 4.2.0
+  - `GCS_VERSION` in gcs_common.sh
+  - `MDS_VERSION` in common.sh
+  - `MDS_BANNER_VERSION` in mds_banner.sh
+  - Documentation updated (README.md, docs/README.md, gcs-setup.md)
+
+---
+
+## [4.1] - 2026-01-24
+
+### Added
+- **GCS Initialization System**: Enterprise-grade VPS/Ubuntu GCS setup
+  - One-line installation: `curl ... | sudo bash`
+  - Comprehensive `mds_gcs_init.sh` with 9 phases
+  - Library modules for prereqs, Python, Node.js, firewall, etc.
+- **Documentation Updates**: GCS setup guide and documentation links
+
+---
+
+## [4.0] - 2026-01-20
+
+### Added
+- **Enterprise Raspberry Pi Initialization**: Production-ready `mds_init.sh`
+  - Modular library architecture in `mds_init_lib/`
+  - 13 installation phases with state tracking
+  - Resume capability for interrupted installations
+  - SSH key management for git sync
+- **Production Dashboard Startup**: Enhanced `linux_dashboard_start.sh`
+  - FastAPI/Flask backend selection
+  - Development and production modes
+  - tmux session management
+
+---
 
 ## [3.8] - 2025-11-07
 

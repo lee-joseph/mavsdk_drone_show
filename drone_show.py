@@ -95,8 +95,8 @@ import time
 import asyncio
 import csv
 import json
-import subprocess
 import logging
+import subprocess
 import socket
 import psutil
 import requests
@@ -124,12 +124,16 @@ from src.params import Params
 from src import origin_cache  # Phase 2: Origin caching system
 
 from drone_show_src.utils import (
-    configure_logging,
     read_hw_id,
     clamp_led_value,
     global_to_local,
     get_expected_position_from_trajectory,
 )
+
+# Unified logging system
+from mds_logging.drone import init_drone_logging
+from mds_logging import get_logger, register_component
+from mds_logging.cli import add_log_arguments, apply_log_args
 
 # ----------------------------- #
 #        Data Structures        #
@@ -151,7 +155,7 @@ initial_position_drift = None  # Initial position drift in NED coordinates
 drift_delta = 0.0  # Drift delta (to adjust waypoint times)
 
 
-CONFIG_CSV_NAME = os.path.join(Params.config_csv_name)
+CONFIG_FILE_NAME = Params.config_file_name
 
 # ----------------------------- #
 #         Helper Functions      #
@@ -208,69 +212,70 @@ def blender_north_west_up_to_ned(x_b, y_b, z_b=0.0):
 
 def read_config(filename: str) -> Drone:
     """
-    Read the drone configuration from a CSV file.
+    Read the drone configuration from a JSON config file.
 
     Note: x,y positions now come from trajectory CSV files (single source of truth),
-    not from config.csv.
+    not from config.json.
 
     Args:
-        filename (str): Path to the config CSV file.
+        filename (str): Path to the config JSON file.
 
     Returns:
         Drone: Namedtuple containing drone configuration if found, else None.
     """
     logger = logging.getLogger(__name__)
     try:
-        with open(filename, newline="") as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                try:
-                    hw_id = int(row["hw_id"])
-                    if hw_id == HW_ID:
-                        pos_id = int(row["pos_id"])
-                        ip = row["ip"]
-                        mavlink_port = int(row["mavlink_port"])
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        entries = data.get('drones', data) if isinstance(data, dict) else data
+        for entry in entries:
+            try:
+                hw_id = int(entry["hw_id"])
+                if hw_id == HW_ID:
+                    pos_id = int(entry["pos_id"])
+                    ip = entry["ip"]
+                    mavlink_port = int(entry["mavlink_port"])
 
-                        # Get position from trajectory CSV (single source of truth)
-                        base_dir = 'shapes_sitl' if Params.sim_mode else 'shapes'
-                        trajectory_file = os.path.join(
-                            os.path.dirname(__file__),  # Project root
-                            base_dir,
-                            'swarm',
-                            'processed',
-                            f"Drone {pos_id}.csv"
-                        )
+                    # Get position from trajectory CSV (single source of truth)
+                    base_dir = 'shapes_sitl' if Params.sim_mode else 'shapes'
+                    trajectory_file = os.path.join(
+                        os.path.dirname(__file__),  # Project root
+                        base_dir,
+                        'swarm',
+                        'processed',
+                        f"Drone {pos_id}.csv"
+                    )
 
-                        initial_x, initial_y = 0.0, 0.0  # Default values
-                        try:
-                            if os.path.exists(trajectory_file):
-                                with open(trajectory_file, 'r') as traj_f:
-                                    traj_reader = csv.DictReader(traj_f)
-                                    first_waypoint = next(traj_reader, None)
-                                    if first_waypoint:
-                                        initial_x = float(first_waypoint.get('px', 0))  # North
-                                        initial_y = float(first_waypoint.get('py', 0))  # East
-                                    else:
-                                        logger.warning(f"Trajectory file empty for pos_id={pos_id}")
-                            else:
-                                logger.warning(f"Trajectory file not found for pos_id={pos_id}: {trajectory_file}")
-                        except Exception as e:
-                            logger.error(f"Error reading trajectory for pos_id={pos_id}: {e}")
+                    initial_x, initial_y = 0.0, 0.0  # Default values
+                    try:
+                        if os.path.exists(trajectory_file):
+                            with open(trajectory_file, 'r') as traj_f:
+                                traj_reader = csv.DictReader(traj_f)
+                                first_waypoint = next(traj_reader, None)
+                                if first_waypoint:
+                                    initial_x = float(first_waypoint.get('px', 0))  # North
+                                    initial_y = float(first_waypoint.get('py', 0))  # East
+                                else:
+                                    logger.warning(f"Trajectory file empty for pos_id={pos_id}")
+                        else:
+                            logger.warning(f"Trajectory file not found for pos_id={pos_id}: {trajectory_file}")
+                    except Exception as e:
+                        logger.error(f"Error reading trajectory for pos_id={pos_id}: {e}")
 
-                        drone = Drone(
-                            hw_id,
-                            pos_id,
-                            initial_x,
-                            initial_y,
-                            ip,
-                            mavlink_port,
-                        )
-                        logger.info(f"Drone configuration found: {drone}")
-                        return drone
-                except ValueError as ve:
-                    logger.error(f"Invalid data type in config file row: {row}. Error: {ve}")
-            logger.error(f"No configuration found for HW_ID {HW_ID}.")
-            return None
+                    drone = Drone(
+                        hw_id,
+                        pos_id,
+                        initial_x,
+                        initial_y,
+                        ip,
+                        mavlink_port,
+                    )
+                    logger.info(f"Drone configuration found: {drone}")
+                    return drone
+            except ValueError as ve:
+                logger.error(f"Invalid data type in config file entry: {entry}. Error: {ve}")
+        logger.error(f"No configuration found for HW_ID {HW_ID}.")
+        return None
     except FileNotFoundError:
         logger.exception("Config file not found.")
         return None
@@ -391,9 +396,10 @@ async def get_current_ned_position(drone: System) -> PositionNedYaw:
     try:
         # Method 2: Fallback to local API
         logger.debug("Attempting to get current NED position via local API")
-        response = requests.get(
-            f"http://localhost:{Params.drones_flask_port}/get-local-position-ned",
-            timeout=1
+        response = await asyncio.to_thread(
+            requests.get,
+            f"http://localhost:{Params.drone_api_port}/get-local-position-ned",
+            timeout=1,
         )
         if response.status_code == 200:
             ned_data = response.json()
@@ -937,7 +943,7 @@ async def perform_trajectory(
                 # --- (5) Progress & Landing Trigger ---
                 time_to_end = waypoints[-1][0] - t_wp
                 prog = (waypoint_index + 1) / total_waypoints
-                logger.info(
+                logger.debug(
                     f"WP {waypoint_index+1}/{total_waypoints}, "
                     f"progress {prog:.2%}, ETA {time_to_end:.2f}s, "
                     f"drift {drift_delta:.2f}s"
@@ -1019,7 +1025,7 @@ async def controlled_landing(drone: System):
                     logger.info("Landing detected during controlled landing.")
                     break
                 break
-            if (time.time() - landing_start_time) > Params.LANDING_TIMEOUT:
+            if (time.time() - landing_start_time) > Params.CONTROLLED_LANDING_TIMEOUT:
                 logger.warning("Controlled landing timed out. Initiating PX4 native landing.")
                 await stop_offboard_mode(drone)
                 await perform_landing(drone)
@@ -1185,11 +1191,11 @@ async def fetch_origin_with_fallback(drone: System):
     # Attempt 2: Fetch from GCS server
     try:
         logger.info("🌍 Fetching drone show origin from GCS...")
-        gcs_url = f"http://{Params.GCS_IP}:5000/get-origin-for-drone"
-
-        response = requests.get(
+        gcs_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/get-origin-for-drone"
+        response = await asyncio.to_thread(
+            requests.get,
             gcs_url,
-            timeout=Params.ORIGIN_FETCH_TIMEOUT_SEC
+            timeout=Params.ORIGIN_FETCH_TIMEOUT_SEC,
         )
 
         if response.status_code == 200:
@@ -1217,7 +1223,7 @@ async def fetch_origin_with_fallback(drone: System):
     except requests.exceptions.Timeout:
         logger.warning(f"❌ GCS origin fetch timeout after {Params.ORIGIN_FETCH_TIMEOUT_SEC}s")
     except requests.exceptions.ConnectionError:
-        logger.warning(f"❌ Cannot connect to GCS at {Params.GCS_IP}:5000")
+        logger.warning(f"❌ Cannot connect to GCS at {Params.GCS_IP}:{Params.gcs_api_port}")
     except Exception as e:
         logger.warning(f"❌ GCS origin fetch failed: {e}")
 
@@ -1287,7 +1293,7 @@ async def validate_drone_position(drone: System, origin: dict, config: dict):
     Validate that drone's current position is within acceptable range of expected position.
 
     This safety check prevents flight if the drone is placed too far from where it should be
-    according to config.csv offsets from the shared origin.
+    according to config offsets from the shared origin.
 
     Args:
         drone: MAVSDK System instance
@@ -1362,7 +1368,7 @@ async def validate_drone_position(drone: System, origin: dict, config: dict):
         raise ValueError(f"Position validation failed: {e}")
 
 
-async def pre_flight_checks(drone: System):
+async def pre_flight_checks(drone: System, require_global_position: bool):
     """
     Perform pre-flight checks to ensure the drone is ready for flight, including:
     - Checking the health of the global and home position via MAVSDK
@@ -1386,7 +1392,7 @@ async def pre_flight_checks(drone: System):
     health_checks_passed = False
 
     try:
-        if Params.REQUIRE_GLOBAL_POSITION:
+        if require_global_position:
             # Phase 1: Wait for health checks to pass with timeout
             logger.info("Waiting for health checks...")
             async for health in drone.telemetry.health():
@@ -1444,8 +1450,7 @@ async def pre_flight_checks(drone: System):
             return gps_origin
 
         else:
-            logger.info("Skipping GPS health checks (REQUIRE_GLOBAL_POSITION=False)")
-            logger.info("This is normal for LOCAL mode or non-GPS operations")
+            logger.info("Skipping GPS health checks for LOCAL mode / non-GPS execution")
             led_controller.set_color(0, 255, 0)
             return None
 
@@ -1536,9 +1541,10 @@ async def compute_position_drift():
 
     try:
         # Request NED data from local API endpoint
-        response = requests.get(
-            f"http://localhost:{Params.drones_flask_port}/get-local-position-ned",
-            timeout=2
+        response = await asyncio.to_thread(
+            requests.get,
+            f"http://localhost:{Params.drone_api_port}/get-local-position-ned",
+            timeout=2,
         )
 
         if response.status_code == 200:
@@ -1645,10 +1651,8 @@ def get_mavsdk_server_path():
     Returns:
         str: Path to mavsdk_server.
     """
-    home_dir = os.path.expanduser("~")
-    mavsdk_drone_show_dir = os.path.join(home_dir, "mavsdk_drone_show")
-    mavsdk_server_path = os.path.join(mavsdk_drone_show_dir, "mavsdk_server")
-    return mavsdk_server_path
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(project_root, "mavsdk_server")
 
 
 def start_mavsdk_server(udp_port: int):
@@ -1859,10 +1863,7 @@ async def run_drone(synchronized_start_time, custom_csv=None, auto_launch_positi
         # Step 2: Initial Setup and Connection
         drone = await initial_setup_and_connection()
 
-        # Step 3: Pre-flight Checks
-        home_position = await pre_flight_checks(drone)
-
-        # Step 3.5: PHASE 2 - Determine effective modes
+        # Step 3: Determine effective modes before pre-flight checks.
         # Priority: CLI/UI argument > Params defaults
 
         # Determine effective USE_GLOBAL_SETPOINTS (LOCAL vs GLOBAL mode)
@@ -1886,6 +1887,12 @@ async def run_drone(synchronized_start_time, custom_csv=None, auto_launch_positi
         else:
             effective_auto_origin_mode = False
             logger.warning("AUTO_GLOBAL_ORIGIN_MODE not defined in params.py, defaulting to False")
+
+        # Step 4: Pre-flight Checks
+        home_position = await pre_flight_checks(
+            drone,
+            require_global_position=effective_use_global_setpoints,
+        )
 
         # Mission type logging
         if mission_type is not None:
@@ -1923,14 +1930,14 @@ async def run_drone(synchronized_start_time, custom_csv=None, auto_launch_positi
                 logger.error("Failed to read HW ID; cannot validate position.")
                 sys.exit(1)
 
-            drone_config = read_config(CONFIG_CSV_NAME)
+            drone_config = read_config(CONFIG_FILE_NAME)
             if drone_config is None:
                 logger.error("Drone config not found; cannot validate position.")
                 sys.exit(1)
 
             logger.info(f"Drone HW_ID={HW_ID}, Position ID={drone_config.pos_id}")
 
-            # CRITICAL FIX: Get expected position from trajectory CSV, not config.csv
+            # CRITICAL FIX: Get expected position from trajectory CSV, not config
             # When hw_id ≠ pos_id, config x,y represents hw_id's physical position,
             # but we need pos_id's trajectory starting position for validation
             expected_north, expected_east = get_expected_position_from_trajectory(
@@ -2068,7 +2075,7 @@ async def run_drone(synchronized_start_time, custom_csv=None, auto_launch_positi
                 if HW_ID is None:
                     logger.error("Failed to read HW ID; exiting.")
                     sys.exit(1)
-                drone_config = read_config(CONFIG_CSV_NAME)
+                drone_config = read_config(CONFIG_FILE_NAME)
                 if drone_config is None:
                     logger.error("Drone config not found; exiting.")
                     sys.exit(1)
@@ -2153,10 +2160,6 @@ def main():
     """
     Main function to run the drone.
     """
-    # Configure logging
-    configure_logging("drone_show")
-    logger = logging.getLogger(__name__)
-
     parser = argparse.ArgumentParser(description='Drone Show Script')
     parser.add_argument('--start_time', type=float, help='Synchronized start UNIX time')
     parser.add_argument('--custom_csv', type=str, help='Name of the custom trajectory CSV file, e.g., active.csv')
@@ -2190,20 +2193,14 @@ def main():
         default=None,
         help='Mission type: 1=DRONE_SHOW_FROM_CSV, 3=CUSTOM_CSV, 106=HOVER_TEST. Required for Phase 2 filtering.',
     )
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug mode for verbose logging.',
-    )
+    add_log_arguments(parser)
     args = parser.parse_args()
 
-    # Adjust logging level based on debug flag
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug mode ENABLED: Verbose logging is active.")
-    else:
-        logging.getLogger().setLevel(logging.INFO)
-        logger.info("Debug mode DISABLED: Standard logging level set to INFO.")
+    # Initialize unified logging
+    apply_log_args(args)
+    register_component("drone_show", "drone", "Offline trajectory execution")
+    init_drone_logging()
+    logger = get_logger("drone_show")
 
     # Get the synchronized start time
     if args.start_time:

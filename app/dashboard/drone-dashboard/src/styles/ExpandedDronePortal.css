@@ -111,9 +111,19 @@
     box-shadow: 0 0 8px var(--color-success-light);
 }
 
-.expanded-drone-header .status-indicator.stale {
+.expanded-drone-header .status-indicator.degraded {
     background: var(--color-warning);
     box-shadow: 0 0 8px var(--color-warning-light);
+}
+
+.expanded-drone-header .status-indicator.offline {
+    background: var(--color-danger);
+    box-shadow: 0 0 8px var(--color-danger-light);
+}
+
+.expanded-drone-header .status-indicator.unknown {
+    background: var(--color-text-tertiary);
+    box-shadow: 0 0 8px rgba(107, 114, 128, 0.2);
 }
 
 /* Critical Status */
@@ -153,10 +163,22 @@
     border-color: var(--color-success-border);
 }
 
-.status-badge.not-ready {
+.status-badge.blocked {
+    background: var(--color-danger);
+    color: white;
+    border-color: var(--color-danger-border);
+}
+
+.status-badge.warning {
     background: var(--color-warning);
     color: var(--color-text-primary);
     border-color: var(--color-warning-border);
+}
+
+.status-badge.unknown {
+    background: var(--color-text-tertiary);
+    color: white;
+    border-color: var(--color-border-primary);
 }
 
 /* Main Content Grid */

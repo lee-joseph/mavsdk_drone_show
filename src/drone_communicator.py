@@ -1,17 +1,20 @@
 #src/drone_communicator.py
 import socket
 import threading
-import csv
 import struct
-import logging
 import select
 import time
+import re
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 from functions.data_utils import safe_float, safe_get, safe_int
+from mds_logging import get_logger
 from src.enums import Mission, State
+
+logger = get_logger("drone_comm")
 from src.drone_config import DroneConfig
 from src.params import Params
+from src.swarm_runtime_state import read_runtime_swarm_assignment
 from src.telemetry_subscription_manager import TelemetrySubscriptionManager
 
 class DroneCommunicator:
@@ -45,12 +48,35 @@ class DroneCommunicator:
         if params.enable_default_subscriptions:
             self.subscription_manager.subscribe_to_all()
 
-        # Initialize flask_handler as None; it will be injected later
-        self.flask_handler = None
+        # Initialize api_server as None; it will be injected later
+        self.api_server = None
 
-    def set_flask_handler(self, flask_handler):
-        """Setter for injecting FlaskHandler dependency after initialization."""
-        self.flask_handler = flask_handler
+    def set_api_server(self, api_server):
+        """Setter for injecting DroneAPIServer dependency after initialization."""
+        self.api_server = api_server
+
+    def _get_live_swarm_assignment(self) -> Dict[str, Any]:
+        """Return the freshest known swarm assignment for this drone."""
+        current_swarm = getattr(self.drone_config, "swarm", {}) or {}
+        runtime_swarm = read_runtime_swarm_assignment()
+
+        if isinstance(runtime_swarm, dict) and runtime_swarm:
+            return runtime_swarm
+
+        try:
+            latest_swarm = self.drone_config.read_swarm()
+        except Exception as exc:
+            logger.debug(
+                "Falling back to cached swarm assignment for hw_id=%s: %s",
+                safe_int(self.drone_config.hw_id),
+                exc,
+            )
+            latest_swarm = None
+
+        if isinstance(latest_swarm, dict) and latest_swarm:
+            return latest_swarm
+
+        return current_swarm
 
     def _initialize_socket(self) -> socket.socket:
         """Initialize and return a UDP socket for telemetry."""
@@ -74,19 +100,21 @@ class DroneCommunicator:
             try:
                 self.sock.sendto(packet, (ip, port))
             except OSError as e:
-                logging.error(f"Failed to send telemetry: {e}")
+                logger.error(f"Failed to send telemetry: {e}")
 
     def get_nodes(self) -> List[Dict[str, Any]]:
-        """Retrieve node information from config.csv file."""
+        """Retrieve node information from config file."""
         if self.nodes is None:
             try:
-                with open(Params.config_csv_name, "r") as file:
-                    self.nodes = list(csv.DictReader(file))
+                import json
+                with open(Params.config_file_name, "r") as f:
+                    data = json.load(f)
+                self.nodes = data.get('drones', data) if isinstance(data, dict) else data
             except FileNotFoundError:
-                logging.error("config file not found")
+                logger.error("Config file not found")
                 self.nodes = []
-            except csv.Error as e:
-                logging.error(f"Error reading config: {e}")
+            except Exception as e:
+                logger.error(f"Error reading config: {e}")
                 self.nodes = []
         return self.nodes
 
@@ -104,7 +132,7 @@ class DroneCommunicator:
                 setattr(drone, key, value)
             self.drones[hw_id] = drone
         else:
-            logging.warning(f"Attempted to update non-existent drone: {hw_id}")
+            logger.warning(f"Attempted to update non-existent drone: {hw_id}")
 
     def process_command(self, command_data: Dict[str, Any]) -> None:
         """
@@ -124,14 +152,14 @@ class DroneCommunicator:
             - origin (dict): Phase 2 origin data (lat, lon, alt)
             - auto_global_origin (bool): Phase 2 mode flag
         """
-        logging.info(f"Received command data: {command_data}")
+        logger.info(f"Received command data: {command_data}")
 
         try:
             mission = int(command_data["missionType"])
             trigger_time = command_data["triggerTime"]
 
         except KeyError as e:
-            logging.error(f"Missing required field in command data: {e}")
+            logger.error(f"Missing required field in command data: {e}")
             return
 
         # Phase 2: Save origin from command if present
@@ -148,55 +176,63 @@ class DroneCommunicator:
                 with open(origin_file, 'w') as f:
                     json.dump(origin_data, f, indent=2)
 
-                logging.info(f"🌍 Phase 2: Saved origin from command to {origin_file}")
-                logging.info(f"   Origin: lat={origin_data.get('lat', 'N/A'):.6f}, "
+                logger.info(f"🌍 Phase 2: Saved origin from command to {origin_file}")
+                logger.info(f"   Origin: lat={origin_data.get('lat', 'N/A'):.6f}, "
                            f"lon={origin_data.get('lon', 'N/A'):.6f}, "
                            f"alt={origin_data.get('alt', 'N/A'):.1f}m")
             except Exception as e:
-                logging.error(f"Failed to save command origin: {e}")
+                logger.error(f"Failed to save command origin: {e}")
 
-        hw_id = command_data.get("hw_id", self.drone_config.hw_id)
-        pos_id = command_data.get("pos_id", self.drone_config.pos_id)
-        state = command_data.get("state", self.drone_config.state)
-        state = 1 #for now hardcoded to armed (received command)
-        self._update_drone_config(hw_id, pos_id, state, trigger_time)
+        # hw_id and pos_id are immutable - use the drone's configured values
+        hw_id = self.drone_config.hw_id
 
-        # Phase 2: Store flags in drone_config (None means use Params defaults later)
+        # Phase 2: Store flags in drone_config (safe - just storing references)
         self.drone_config.auto_global_origin = command_data.get('auto_global_origin', None)
         self.drone_config.use_global_setpoints = command_data.get('use_global_setpoints', None)
 
         if self.drone_config.auto_global_origin is not None:
-            logging.info(f"🌍 Phase 2: auto_global_origin={self.drone_config.auto_global_origin}")
+            logger.info(f"🌍 Phase 2: auto_global_origin={self.drone_config.auto_global_origin}")
         if self.drone_config.use_global_setpoints is not None:
-            logging.info(f"🌍 Phase 2: use_global_setpoints={self.drone_config.use_global_setpoints}")
+            logger.info(f"🌍 Phase 2: use_global_setpoints={self.drone_config.use_global_setpoints}")
 
+        # ATOMIC: Process mission-specific data FIRST (may fail)
+        # State is only updated if mission processing succeeds
         try:
             self._process_mission_command(mission, command_data)
-        except ValueError as e:
-            logging.warning(f"Invalid mission command: {e}")
+        except Exception as e:
+            logger.error(f"Mission processing failed: {e}. State unchanged.")
+            return  # State NOT changed - drone remains in previous state
+
+        # Only update state AFTER successful mission processing
+        self._update_drone_state(State.MISSION_READY.value, trigger_time)
 
         self._log_updated_configuration()
         self.drones[hw_id] = self.drone_config
 
-    def _update_drone_config(self, hw_id: str, pos_id: str, state: int, trigger_time: int) -> None:
-        """Update drone configuration with new values."""
-        self.drone_config.hw_id = hw_id
-        self.drone_config.pos_id = pos_id
+    def _update_drone_state(self, state: int, trigger_time: int) -> None:
+        """Update mutable drone state values.
+
+        Note: hw_id and pos_id are immutable configuration values loaded from
+        the drone's .hwID file and config. They cannot be changed at runtime.
+        Only state and trigger_time are mutable runtime values.
+        """
         self.drone_config.state = state
         self.drone_config.trigger_time = trigger_time
 
     def _process_mission_command(self, mission: int, command_data: Dict[str, Any]) -> None:
         """Process the mission command based on its type."""
         # Log the incoming mission command and data
-        logging.info(f"Processing mission command: {mission}, with data: {command_data}")
+        logger.info(f"Processing mission command: {mission}, with data: {command_data}")
 
         if mission == Mission.TAKE_OFF.value:
             self._handle_takeoff_command(command_data)
+        elif mission == Mission.QUICKSCOUT.value:
+            self._handle_quickscout_command(command_data)
         elif mission in Mission._value2member_map_:
-            self._handle_standard_mission(mission)
+            self._handle_standard_mission(mission, command_data)
         else:
             # Log the error before raising an exception
-            logging.error(f"Unknown mission command: {mission}")
+            logger.error(f"Unknown mission command: {mission}")
             raise ValueError(f"Unknown mission command: {mission}")
     
 
@@ -205,20 +241,55 @@ class DroneCommunicator:
         default_altitude = self.params.default_takeoff_alt
         assigned_altitude = command_data.get("takeoff_altitude", default_altitude)
         self.drone_config.takeoff_altitude = min(float(assigned_altitude), self.params.max_takeoff_alt)
-        logging.info(f"Takeoff command received. Assigned altitude: {self.drone_config.takeoff_altitude}m")
+        logger.info(f"Takeoff command received. Assigned altitude: {self.drone_config.takeoff_altitude}m")
         self.drone_config.mission = Mission.TAKE_OFF.value
         self.drone_config.state = State.MISSION_READY.value  # Mission loaded, waiting for trigger
 
-    def _handle_standard_mission(self, mission: int) -> None:
+    def _handle_standard_mission(self, mission: int, command_data: Dict[str, Any]) -> None:
         """Handle standard (non-takeoff) mission commands."""
         mission_enum = Mission(mission)
-        logging.info(f"{mission_enum.name.replace('_', ' ').title()} command received.")
+        logger.info(f"{mission_enum.name.replace('_', ' ').title()} command received.")
+
+        if mission == Mission.UPDATE_CODE.value:
+            self.drone_config.update_branch = command_data.get('update_branch')
+        elif mission == Mission.APPLY_COMMON_PARAMS.value:
+            self.drone_config.reboot_after_params = bool(
+                command_data.get('reboot_after_params', getattr(self.params, 'reboot_after_params', False))
+            )
+
         self.drone_config.mission = mission
         self.drone_config.state = State.MISSION_READY.value  # Mission loaded, waiting for trigger
 
+    def _handle_quickscout_command(self, command_data: Dict[str, Any]) -> None:
+        """Handle QuickScout SAR mission command - extract waypoints and store."""
+        import json
+
+        waypoints = command_data.get('waypoints', [])
+        mission_id = command_data.get('mission_id', 'unknown')
+        return_behavior = command_data.get('return_behavior', 'return_home')
+        hw_id = self.drone_config.hw_id
+
+        if not waypoints:
+            raise ValueError("QuickScout command missing waypoints")
+
+        # Sanitize identifiers to prevent path traversal
+        safe_hw_id = re.sub(r'[^a-zA-Z0-9_-]', '', str(hw_id))
+        safe_mission_id = re.sub(r'[^a-zA-Z0-9_-]', '', str(mission_id))
+        waypoints_file = f"/tmp/quickscout_{safe_hw_id}_{safe_mission_id}.json"
+        with open(waypoints_file, 'w') as f:
+            json.dump(waypoints, f)
+        logger.info(f"QuickScout waypoints written to {waypoints_file} ({len(waypoints)} waypoints)")
+
+        # Store mission parameters on drone_config
+        self.drone_config.quickscout_mission_id = mission_id
+        self.drone_config.quickscout_waypoints_file = waypoints_file
+        self.drone_config.quickscout_return_behavior = return_behavior
+        self.drone_config.mission = Mission.QUICKSCOUT.value
+        self.drone_config.state = State.MISSION_READY.value
+
     def _log_updated_configuration(self) -> None:
         """Log the updated drone configuration."""
-        logging.info(
+        logger.info(
             f"Updated drone configuration: "
             f"hw_id={self.drone_config.hw_id}, "
             f"pos_id={self.drone_config.pos_id}, "
@@ -240,26 +311,25 @@ class DroneCommunicator:
                 telemetry_data = struct.unpack(Params.telem_struct_fmt, data)
                 hw_id = telemetry_data[1]
                 if hw_id not in self.drones:
-                    logging.info(f"Receiving Telemetry from NEW Drone ID= {hw_id}")
+                    logger.info(f"Receiving Telemetry from NEW Drone ID= {hw_id}")
                     self.drones[hw_id] = DroneConfig(self.drones, hw_id)
                 self._update_drone_config_from_telemetry(hw_id, telemetry_data)
             else:
-                logging.error(f"Received packet of incorrect size or header. Got {len(data)} bytes.")
+                logger.error(f"Received packet of incorrect size or header. Got {len(data)} bytes.")
         except struct.error as e:
-            logging.error(f"Failed to unpack telemetry data: {e}")
+            logger.error(f"Failed to unpack telemetry data: {e}")
 
-    def _update_drone_config_from_telemetry(self, hw_id: str, telemetry_data: tuple) -> None:
+    def _update_drone_config_from_telemetry(self, hw_id: int, telemetry_data: tuple) -> None:
         """
         Update drone configuration based on received telemetry data.
 
         Args:
-            hw_id (str): Hardware ID of the drone.
+            hw_id (int): Hardware ID of the drone.
             telemetry_data (tuple): Unpacked telemetry data.
         """
         position = {'lat': telemetry_data[6], 'long': telemetry_data[7], 'alt': telemetry_data[8]}
         velocity = {'north': telemetry_data[9], 'east': telemetry_data[10], 'down': telemetry_data[11]}
         self.drones[hw_id].update(
-            pos_id=telemetry_data[2],
             state=telemetry_data[3],
             mission=telemetry_data[4],
             trigger_time=telemetry_data[5],
@@ -285,8 +355,10 @@ class DroneCommunicator:
 
         # Debug logging for flight mode issues
         if self.drone_config.custom_mode == 0 and self.drone_config.is_armed:
-            logging.warning(f"[DRONE {self.drone_config.hw_id}] ⚠️ custom_mode=0 while armed! "
+            logger.warning(f"[DRONE {self.drone_config.hw_id}] ⚠️ custom_mode=0 while armed! "
                           f"base_mode={self.drone_config.base_mode}, system_status={self.drone_config.system_status}")
+
+        live_swarm = self._get_live_swarm_assignment()
 
         self.drone_state = {
             "hw_id": safe_int(self.drone_config.hw_id),  # Hardware ID of the drone
@@ -304,13 +376,21 @@ class DroneCommunicator:
             "velocity_down": safe_float(safe_get(self.drone_config.velocity, 'down')),  # Velocity downwards
             "yaw": safe_float(self.drone_config.yaw),  # Yaw angle of the drone
             "battery_voltage": safe_float(self.drone_config.battery),  # Current battery voltage
-            "follow_mode": safe_int(safe_get(self.drone_config.swarm, 'follow')),  # Follow mode in swarm operation
+            "follow_mode": safe_int(safe_get(live_swarm, 'follow')),  # Follow mode in swarm operation
             "update_time": safe_int(self.drone_config.last_update_timestamp),  # Timestamp of the last telemetry update
             "flight_mode": safe_int(self.drone_config.custom_mode),  # PX4 flight mode (from HEARTBEAT.custom_mode)
             "base_mode": safe_int(self.drone_config.base_mode),  # MAVLink base mode flags
             "system_status": safe_int(self.drone_config.system_status),  # MAVLink system status (e.g., STANDBY, ACTIVE)
             "is_armed": bool(self.drone_config.is_armed),  # Armed status from base_mode flags
             "is_ready_to_arm": bool(self.drone_config.is_ready_to_arm),  # Pre-arm checks status
+            "home_position_set": bool(getattr(self.drone_config, 'home_position', None)),
+            "readiness_status": str(getattr(self.drone_config, 'readiness_status', 'unknown')),
+            "readiness_summary": str(getattr(self.drone_config, 'readiness_summary', 'Readiness unavailable')),
+            "readiness_checks": list(getattr(self.drone_config, 'readiness_checks', []) or []),
+            "preflight_blockers": list(getattr(self.drone_config, 'preflight_blockers', []) or []),
+            "preflight_warnings": list(getattr(self.drone_config, 'preflight_warnings', []) or []),
+            "status_messages": list(getattr(self.drone_config, 'status_messages', []) or []),
+            "preflight_last_update": safe_int(getattr(self.drone_config, 'preflight_last_update', 0)),
             "hdop": safe_float(self.drone_config.hdop),  # Horizontal dilution of precision
             "vdop": safe_float(self.drone_config.vdop),  # Vertical dilution of precision
             "gps_fix_type": safe_int(getattr(self.drone_config, 'gps_fix_type', 0)),  # GPS fix status
@@ -324,7 +404,7 @@ class DroneCommunicator:
     def send_drone_state(self) -> None:
         """Continuously send drone state as telemetry."""
         udp_ip = Params.GCS_IP  # Use centralized GCS IP from Params
-        udp_port = Params.flask_telem_socket_port  # Default port for UDP telemetry
+        udp_port = Params.gcs_api_port  # Default port for UDP telemetry
 
         while not self.stop_flag.is_set():
             drone_state = self.get_drone_state()
@@ -375,7 +455,7 @@ class DroneCommunicator:
                         data, addr = self.sock.recvfrom(1024)
                         self.process_packet(data)
                     except OSError as e:
-                        logging.error(f"Error receiving packet: {e}")
+                        logger.error(f"Error receiving packet: {e}")
             
             # Handle swarm mission if active
             if self.drone_config.mission == Mission.SMART_SWARM.value and self.drone_config.state != 0 and int(self.drone_config.swarm.get('follow', 0)) != 0:
@@ -389,9 +469,8 @@ class DroneCommunicator:
             self.telemetry_thread.start()
             self.command_thread.start()
 
-        # Start the Flask server for HTTP commands
-        self.flask_handler_thread = threading.Thread(target=self.flask_handler.run)
-        self.flask_handler_thread.start()
+        # Note: API server is now started in coordinator.py, not here
+        # This keeps the separation of concerns clean
 
     def stop_communication(self) -> None:
         """Stop all communication threads and clean up resources."""
@@ -399,7 +478,7 @@ class DroneCommunicator:
         if Params.enable_udp_telemetry:
             self.telemetry_thread.join()
             self.command_thread.join()
-        self.flask_handler_thread.join()
+        # API server is managed separately in coordinator.py
         self.executor.shutdown()
 
         if self.sock:

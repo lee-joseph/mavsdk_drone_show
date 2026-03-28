@@ -5,34 +5,80 @@ import axios from 'axios';
 import CommandSender from '../components/CommandSender';
 import DroneWidget from '../components/DroneWidget';
 import ExpandedDronePortal from '../components/ExpandedDronePortal';
-import { getTelemetryURL } from '../utilities/utilities';
+import {
+  attachDroneRuntimeClock,
+  extractServerNowMs,
+  normalizeTelemetryResponse,
+} from '../constants/fieldMappings';
+import { normalizeComparableId } from '../utilities/missionIdentityUtils';
+import { getBackendURL, getTelemetryURL } from '../utilities/utilities';
 import '../styles/Overview.css';
 
 const Overview = ({ setSelectedDrone }) => {
   const [drones, setDrones] = useState([]);
+  const [configByHwId, setConfigByHwId] = useState({});
   const [expandedDrone, setExpandedDrone] = useState(null);
   const [originRect, setOriginRect] = useState(null);
   const [error, setError] = useState(null);
   const [notification, setNotification] = useState(null);
-  const [incompleteDrones, setIncompleteDrones] = useState([]);
   const droneRefs = useRef({});
+
+  useEffect(() => {
+    const backendURL = getBackendURL();
+    let active = true;
+
+    const loadConfig = async () => {
+      try {
+        const response = await axios.get(`${backendURL}/get-config-data`);
+        if (!active || !Array.isArray(response.data)) {
+          return;
+        }
+
+        const nextConfigByHwId = response.data.reduce((accumulator, entry) => {
+          const hwId = normalizeComparableId(entry?.hw_id);
+          if (hwId) {
+            accumulator[hwId] = entry;
+          }
+          return accumulator;
+        }, {});
+
+        setConfigByHwId(nextConfigByHwId);
+      } catch (loadError) {
+        console.warn('Failed to load config metadata for overview cards:', loadError);
+      }
+    };
+
+    loadConfig();
+    const interval = setInterval(loadConfig, 30000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const url = getTelemetryURL();
     const fetchData = async () => {
       try {
         const response = await axios.get(url);
-        const dronesArray = Object.keys(response.data).map((hw_ID) => ({
+        const clockMeta = {
+          receivedAtMs: Date.now(),
+          serverNowMs: extractServerNowMs(response.headers),
+        };
+        const normalizedTelemetry = normalizeTelemetryResponse(response.data || {}, clockMeta);
+        const dronesArray = Object.keys(normalizedTelemetry).map((hw_ID) => attachDroneRuntimeClock({
+          ...(configByHwId[normalizeComparableId(hw_ID)] || {}),
           hw_ID,
-          ...response.data[hw_ID],
-        }));
+          ...normalizedTelemetry[hw_ID],
+        }, clockMeta));
 
         const validDrones = dronesArray.filter(
           (drone) =>
-            drone.Position_Lat !== undefined &&
-            drone.Position_Long !== undefined &&
-            drone.Position_Alt !== undefined &&
-            drone.Battery_Voltage !== undefined
+            drone.position_lat !== undefined &&
+            drone.position_long !== undefined &&
+            drone.position_alt !== undefined &&
+            drone.battery_voltage !== undefined
         );
 
         const invalidDrones = dronesArray.filter(
@@ -40,7 +86,6 @@ const Overview = ({ setSelectedDrone }) => {
         );
 
         setDrones(validDrones);
-        setIncompleteDrones(invalidDrones);
         setError(null);
         setNotification(null);
 
@@ -59,7 +104,7 @@ const Overview = ({ setSelectedDrone }) => {
     return () => {
       clearInterval(pollingInterval);
     };
-  }, []);
+  }, [configByHwId]);
 
   const toggleDroneDetails = (drone) => {
     if (expandedDrone && expandedDrone.hw_ID === drone.hw_ID) {

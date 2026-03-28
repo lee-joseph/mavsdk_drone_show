@@ -1,268 +1,810 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import Papa from 'papaparse';
-import '../styles/SwarmDesign.css';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  FaCloudUploadAlt,
+  FaDownload,
+  FaExclamationTriangle,
+  FaLayerGroup,
+  FaProjectDiagram,
+  FaSave,
+  FaSearch,
+  FaSyncAlt,
+  FaUndo,
+  FaUpload,
+} from 'react-icons/fa';
+import { toast } from 'react-toastify';
+import DroneCard from '../components/DroneCard';
 import DroneGraph from '../components/DroneGraph';
 import SwarmPlots from '../components/SwarmPlots';
-import DroneCard from '../components/DroneCard';
+import SwarmRuntimeControls from '../components/SwarmRuntimeControls';
+import useNormalizedTelemetry from '../hooks/useNormalizedTelemetry';
+import '../styles/SwarmDesign.css';
 import { getBackendURL } from '../utilities/utilities';
-import { FaSyncAlt, FaCloudUploadAlt } from 'react-icons/fa';  // For icons
-import { toast } from 'react-toastify';  // For toast notifications
+import {
+  buildSwarmViewModel,
+  buildWorkingSwarmAssignments,
+  getDirtyAssignmentIds,
+  normalizeConfigDrone,
+  normalizeSwarmAssignment,
+  toSwarmApiPayload,
+} from '../utilities/swarmDesignUtils';
+import { formatDroneLabel } from '../utilities/missionIdentityUtils';
 
-const categorizeDrones = (swarmData) => {
-    const topLeaders = swarmData.filter(drone => drone.follow === '0');
-    const topLeaderIdsSet = new Set(topLeaders.map(leader => leader.hw_id));
+const CSV_HEADERS = ['hw_id', 'follow', 'offset_x', 'offset_y', 'offset_z', 'frame'];
 
-    const followerCounts = {};
-    swarmData.forEach(drone => {
-        if (!followerCounts[drone.follow]) {
-            followerCounts[drone.follow] = 0;
+function hasIncompleteNumericValue(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  return ['', '-', '.', '-.'].includes(value.trim());
+}
+
+function getSelectedSearchFields(drone) {
+  return [
+    drone.hw_id,
+    drone.pos_id,
+    drone.roleLabel,
+    drone.ip,
+    drone.follow,
+    drone.title,
+    drone.subtitle,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
+function SwarmDesign() {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const backendURL = getBackendURL();
+  const cardRefs = useRef({});
+  const handledRouteDroneRef = useRef('');
+
+  const [configData, setConfigData] = useState([]);
+  const [serverSwarmData, setServerSwarmData] = useState([]);
+  const [baselineAssignments, setBaselineAssignments] = useState([]);
+  const [workingAssignments, setWorkingAssignments] = useState([]);
+  const [selectedDroneId, setSelectedDroneId] = useState(null);
+  const [selectedClusterId, setSelectedClusterId] = useState(null);
+  const [expandedDroneId, setExpandedDroneId] = useState(null);
+  const [pendingCardFocusId, setPendingCardFocusId] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [saving, setSaving] = useState(false);
+  const requestedDroneId = String(searchParams.get('drone') || '').trim();
+  const { data: telemetryById = {} } = useNormalizedTelemetry('/telemetry', 2000);
+
+  const viewModel = useMemo(
+    () => buildSwarmViewModel(workingAssignments, configData),
+    [configData, workingAssignments]
+  );
+  const dirtyIds = useMemo(
+    () => getDirtyAssignmentIds(workingAssignments, baselineAssignments),
+    [baselineAssignments, workingAssignments]
+  );
+  const dirtyIdSet = useMemo(() => new Set(dirtyIds), [dirtyIds]);
+  const syncChanges = useMemo(
+    () => buildWorkingSwarmAssignments(configData, serverSwarmData).syncChanges,
+    [configData, serverSwarmData]
+  );
+  const selectedDrone = selectedDroneId ? viewModel.dronesById[selectedDroneId] : null;
+  const hasPendingSync = syncChanges.addedIds.length > 0 || syncChanges.removedIds.length > 0;
+  const hasStagedChanges = dirtyIds.length > 0;
+  const hasBlockingIssues = viewModel.summary.blockingIssueCount > 0;
+  const hasIncompleteInputs = workingAssignments.some((assignment) =>
+    ['offset_x', 'offset_y', 'offset_z'].some((field) => hasIncompleteNumericValue(assignment[field]))
+  );
+  const pendingSyncIds = useMemo(
+    () => [...new Set([...syncChanges.addedIds, ...syncChanges.removedIds].map((value) => String(value)))],
+    [syncChanges.addedIds, syncChanges.removedIds]
+  );
+
+  const searchValue = searchTerm.trim().toLowerCase();
+  const filteredClusters = useMemo(
+    () => viewModel.clusters
+      .map((cluster) => ({
+        ...cluster,
+        drones: cluster.drones.filter((drone) => (
+          searchValue.length === 0 || getSelectedSearchFields(drone).includes(searchValue)
+        )),
+      }))
+      .filter((cluster) => cluster.drones.length > 0),
+    [searchValue, viewModel.clusters]
+  );
+
+  const filteredDroneIds = useMemo(
+    () => new Set(filteredClusters.flatMap((cluster) => cluster.drones.map((drone) => drone.hw_id))),
+    [filteredClusters]
+  );
+  const visibleDroneCount = useMemo(
+    () => filteredClusters.reduce((count, cluster) => count + cluster.drones.length, 0),
+    [filteredClusters]
+  );
+
+  useEffect(() => {
+    let isActive = true;
+
+    async function loadSwarmDesignData() {
+      try {
+        const [swarmResponse, configResponse] = await Promise.all([
+          axios.get(`${backendURL}/get-swarm-data`),
+          axios.get(`${backendURL}/get-config-data`),
+        ]);
+
+        if (!isActive) {
+          return;
         }
-        followerCounts[drone.follow]++;
+
+        const normalizedConfig = configResponse.data
+          .map((entry) => normalizeConfigDrone(entry))
+          .filter(Boolean);
+        const normalizedSwarm = swarmResponse.data
+          .map((entry) => normalizeSwarmAssignment(entry))
+          .filter(Boolean);
+        const { assignments } = buildWorkingSwarmAssignments(normalizedConfig, normalizedSwarm);
+        const firstDroneId = assignments[0]?.hw_id || null;
+
+        setConfigData(normalizedConfig);
+        setServerSwarmData(normalizedSwarm);
+        setBaselineAssignments(assignments);
+        setWorkingAssignments(assignments);
+        setSelectedDroneId((currentId) => assignments.some((assignment) => assignment.hw_id === currentId) ? currentId : firstDroneId);
+        setExpandedDroneId((currentId) => assignments.some((assignment) => assignment.hw_id === currentId) ? currentId : firstDroneId);
+      } catch (error) {
+        console.error('Error fetching Smart Swarm data:', error);
+        toast.error('Failed to load Smart Swarm configuration.');
+      }
+    }
+
+    loadSwarmDesignData();
+
+    return () => {
+      isActive = false;
+    };
+  }, [backendURL]);
+
+  useEffect(() => {
+    if (viewModel.drones.length === 0) {
+      if (selectedDroneId !== null) {
+        setSelectedDroneId(null);
+      }
+      if (expandedDroneId !== null) {
+        setExpandedDroneId(null);
+      }
+      return;
+    }
+
+    if (!selectedDroneId || !viewModel.dronesById[selectedDroneId]) {
+      const nextDroneId = viewModel.drones[0].hw_id;
+      setSelectedDroneId(nextDroneId);
+      setExpandedDroneId(nextDroneId);
+    }
+    if (expandedDroneId && !viewModel.dronesById[expandedDroneId]) {
+      setExpandedDroneId(selectedDroneId || viewModel.drones[0].hw_id);
+    }
+  }, [expandedDroneId, selectedDroneId, viewModel.drones, viewModel.dronesById]);
+
+  useEffect(() => {
+    const executableClusterIds = new Set(
+      viewModel.clusters
+        .filter((cluster) => cluster.type === 'cluster')
+        .map((cluster) => cluster.id)
+    );
+
+    if (executableClusterIds.size === 0) {
+      if (selectedClusterId !== null) {
+        setSelectedClusterId(null);
+      }
+      return;
+    }
+
+    if (selectedClusterId === 'all' || executableClusterIds.has(selectedClusterId)) {
+      return;
+    }
+
+    const fallbackClusterId = selectedDrone?.clusterRootId
+      || viewModel.clusters.find((cluster) => cluster.type === 'cluster')?.id
+      || null;
+
+    if (fallbackClusterId && fallbackClusterId !== selectedClusterId) {
+      setSelectedClusterId(fallbackClusterId);
+    }
+  }, [selectedClusterId, selectedDrone?.clusterRootId, viewModel.clusters]);
+
+  useEffect(() => {
+    if (!pendingCardFocusId) {
+      return;
+    }
+
+    const targetNode = cardRefs.current[pendingCardFocusId];
+    if (!targetNode) {
+      return;
+    }
+
+    targetNode.scrollIntoView({
+      behavior: 'smooth',
+      block: 'center',
     });
+    targetNode.focus({ preventScroll: true });
+    setPendingCardFocusId(null);
+  }, [filteredClusters, pendingCardFocusId]);
 
-    const intermediateLeaders = swarmData.filter(drone =>
-        !topLeaderIdsSet.has(drone.hw_id) && followerCounts[drone.hw_id]
-    );
+  useEffect(() => {
+    if (!requestedDroneId) {
+      handledRouteDroneRef.current = '';
+      return;
+    }
 
-    return {
-        topLeaders,
-        intermediateLeaders
-    };
-};
+    if (!viewModel.dronesById[requestedDroneId] || handledRouteDroneRef.current === requestedDroneId) {
+      return;
+    }
 
-const isEqual = (arr1, arr2) => JSON.stringify(arr1) === JSON.stringify(arr2);
+    if (searchValue && !filteredDroneIds.has(requestedDroneId)) {
+      setSearchTerm('');
+    }
 
-const SwarmDesign = () => {
-    const [swarmData, setSwarmData] = useState([]);
-    const [configData, setConfigData] = useState([]);
-    const [selectedDroneId, setSelectedDroneId] = useState(null);
-    const [changes, setChanges] = useState({ added: [], removed: [] });
-    const [saving, setSaving] = useState(false);
+    handledRouteDroneRef.current = requestedDroneId;
+    setSelectedDroneId(requestedDroneId);
+    setExpandedDroneId(requestedDroneId);
+    setPendingCardFocusId(requestedDroneId);
+  }, [filteredDroneIds, requestedDroneId, searchValue, viewModel.dronesById]);
 
-    const backendURL = getBackendURL(process.env.REACT_APP_FLASK_PORT || '5000');
+  const refreshFromServer = async () => {
+    const [swarmResponse, configResponse] = await Promise.all([
+      axios.get(`${backendURL}/get-swarm-data`),
+      axios.get(`${backendURL}/get-config-data`),
+    ]);
 
-    // Initial fetch of both datasets
-    useEffect(() => {
-        const fetchSwarmData = axios.get(`${backendURL}/get-swarm-data`);
-        const fetchConfigData = axios.get(`${backendURL}/get-config-data`);
-        Promise.all([fetchSwarmData, fetchConfigData])
-            .then(([swarmRes, configRes]) => {
-                setSwarmData(swarmRes.data);
-                setConfigData(configRes.data);
-            })
-            .catch(err => {
-                console.error('Error fetching data:', err);
-                toast.error('Failed to fetch swarm or config data.');
-            });
-    }, []);
+    const normalizedConfig = configResponse.data
+      .map((entry) => normalizeConfigDrone(entry))
+      .filter(Boolean);
+    const normalizedSwarm = swarmResponse.data
+      .map((entry) => normalizeSwarmAssignment(entry))
+      .filter(Boolean);
+    const { assignments } = buildWorkingSwarmAssignments(normalizedConfig, normalizedSwarm);
 
-    // Merge config + swarm, detect adds/removes
-    useEffect(() => {
-        if (swarmData.length === 0 || configData.length === 0) return;
+    setConfigData(normalizedConfig);
+    setServerSwarmData(normalizedSwarm);
+    setBaselineAssignments(assignments);
+    setWorkingAssignments(assignments);
+  };
 
-        let merged = [...swarmData];
-
-        const added = configData
-            .filter(c => !swarmData.some(s => s.hw_id === c.hw_id))
-            .map(c => c.hw_id);
-        const removed = swarmData
-            .filter(s => !configData.some(c => c.hw_id === s.hw_id))
-            .map(s => s.hw_id);
-        setChanges({ added, removed });
-
-        configData.forEach(c => {
-            if (!swarmData.some(s => s.hw_id === c.hw_id)) {
-                merged.push({
-                    hw_id: c.hw_id,
-                    follow: '0',
-                    offset_n: '0',
-                    offset_e: '0',
-                    offset_alt: '0',
-                    body_coord: '0'
-                });
+  const handleAssignmentChange = (hwId, patch) => {
+    setWorkingAssignments((currentAssignments) => (
+      currentAssignments.map((assignment) => (
+        assignment.hw_id === hwId
+          ? {
+              ...assignment,
+              ...patch,
             }
+          : assignment
+      ))
+    ));
+  };
+
+  const handleSelectDrone = (droneId, { fromGraph = false } = {}) => {
+    if (fromGraph && searchValue && !filteredDroneIds.has(droneId)) {
+      setSearchTerm('');
+    }
+
+    const nextDrone = viewModel.dronesById[droneId];
+    setSelectedDroneId(droneId);
+    setExpandedDroneId(droneId);
+    setPendingCardFocusId(droneId);
+    if (nextDrone?.clusterRootId) {
+      setSelectedClusterId(nextDrone.clusterRootId);
+    }
+  };
+
+  const handleToggleExpand = (droneId) => {
+    setExpandedDroneId((currentId) => currentId === droneId ? null : droneId);
+  };
+
+  const handleImport = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+
+    if (!file) {
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (loadEvent) => {
+      const fileText = loadEvent.target?.result;
+      if (typeof fileText !== 'string') {
+        toast.error('Unable to read the selected file.');
+        return;
+      }
+
+      const applyImportedAssignments = (rawAssignments) => {
+        const importedAssignments = rawAssignments
+          .map((assignment) => normalizeSwarmAssignment(assignment))
+          .filter(Boolean);
+        const importedResult = buildWorkingSwarmAssignments(configData, importedAssignments);
+
+        setWorkingAssignments(importedResult.assignments);
+
+        const importedCount = importedAssignments.length;
+        const defaultedCount = importedResult.syncChanges.addedIds.length;
+        const ignoredCount = importedResult.syncChanges.removedIds.length;
+
+        toast.success(
+          `Imported ${importedCount} assignment${importedCount === 1 ? '' : 's'}`
+          + `${defaultedCount > 0 ? `, added ${defaultedCount} default fleet entr${defaultedCount === 1 ? 'y' : 'ies'}` : ''}`
+          + `${ignoredCount > 0 ? `, ignored ${ignoredCount} non-fleet entr${ignoredCount === 1 ? 'y' : 'ies'}` : ''}.`
+        );
+      };
+
+      try {
+        const parsedJson = JSON.parse(fileText);
+        const rawAssignments = Array.isArray(parsedJson)
+          ? parsedJson
+          : parsedJson.assignments || [];
+
+        if (rawAssignments.length === 0) {
+          toast.error('No swarm assignments found in the JSON file.');
+          return;
+        }
+
+        applyImportedAssignments(rawAssignments);
+        return;
+      } catch {
+        Papa.parse(fileText, {
+          header: false,
+          skipEmptyLines: true,
+          complete: ({ data }) => {
+            if (!Array.isArray(data) || data.length < 2) {
+              toast.error('The CSV file is empty or incomplete.');
+              return;
+            }
+
+            const header = data[0].map((cell) => String(cell).trim());
+            if (header.join(',') !== CSV_HEADERS.join(',')) {
+              toast.error(`CSV header mismatch. Expected: ${CSV_HEADERS.join(', ')}`);
+              return;
+            }
+
+            const rows = data.slice(1).map((row) => ({
+              hw_id: row[0],
+              follow: row[1],
+              offset_x: row[2],
+              offset_y: row[3],
+              offset_z: row[4],
+              frame: row[5],
+            }));
+
+            applyImportedAssignments(rows);
+          },
+          error: () => {
+            toast.error('Failed to parse the imported CSV file.');
+          },
         });
-
-        merged = merged.filter(s => configData.some(c => c.hw_id === s.hw_id));
-
-        if (!isEqual(merged, swarmData)) {
-            setSwarmData(merged);
-        }
-    }, [configData, swarmData]);
-
-    const handleSaveChanges = (hw_id, updated) => {
-        setSwarmData(prev => prev.map(d => d.hw_id === hw_id ? updated : d));
+      }
     };
 
-    const dronesFollowing = leaderId =>
-        swarmData.filter(d => d.follow === leaderId).map(d => d.hw_id);
+    reader.readAsText(file);
+  };
 
-    const confirmAndSave = withCommit => {
-        const summary = swarmData.map(d => {
-            const role = d.follow === '0'
-                ? 'Top Leader'
-                : dronesFollowing(d.hw_id).length
-                ? 'Intermediate Leader'
-                : 'Follower';
-            return `Drone ${d.hw_id}: ${role}${role !== 'Top Leader' ? ` (→${d.follow})` : ''}`;
-        }).join('\n');
-
-        if (window.confirm(`Proceed to ${withCommit ? 'commit' : 'update'} swarm?\n\n${summary}`)) {
-            saveSwarmData(withCommit);
-        }
+  const handleJsonExport = () => {
+    const payload = {
+      version: 1,
+      assignments: toSwarmApiPayload(workingAssignments),
     };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'swarm.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
-    const saveSwarmData = async withCommit => {
-        setSaving(true);
-        try {
-            const url = `${backendURL}/save-swarm-data${withCommit ? '?commit=true' : '?commit=false'}`;
-            const res = await axios.post(url, swarmData);
-            toast.success(res.data.message || 'Saved successfully.');
-            // re-fetch
-            const [swRes, cfgRes] = await Promise.all([
-                axios.get(`${backendURL}/get-swarm-data`),
-                axios.get(`${backendURL}/get-config-data`)
-            ]);
-            setSwarmData(swRes.data);
-            setConfigData(cfgRes.data);
-        } catch (err) {
-            console.error('Save failed:', err);
-            toast.error('Save failed.');
-        } finally {
-            setSaving(false);
-        }
-    };
+  const handleCsvExport = () => {
+    const payload = toSwarmApiPayload(workingAssignments);
+    const csv = Papa.unparse(payload, { columns: CSV_HEADERS });
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'swarm_assignments.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
-    const handleCSVImport = e => {
-        const file = e.target.files[0];
-        if (!file) return;
-        Papa.parse(file, {
-            complete: ({ data }) => {
-                const header = data[0].map(h => h.trim());
-                const expected = ["hw_id", "follow", "offset_n", "offset_e", "offset_alt", "body_coord"];
-                if (header.toString() !== expected.toString()) {
-                    return toast.error('CSV header mismatch.');
-                }
-                const parsed = data.slice(1)
-                    .map(r => ({
-                        hw_id: r[0], follow: r[1],
-                        offset_n: r[2], offset_e: r[3],
-                        offset_alt: r[4], body_coord: r[5]
-                    }))
-                    .filter(d => d.hw_id);
-                setSwarmData(parsed);
-            },
-            header: false
-        });
-    };
+  const handleRevert = () => {
+    if (!hasStagedChanges) {
+      return;
+    }
 
-    const handleCSVExport = () => {
-        const csv = Papa.unparse(swarmData);
-        const blob = new Blob([csv], { type: 'text/csv' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'swarm_export.csv';
-        link.click();
-    };
+    if (!window.confirm('Revert all staged Smart Swarm changes back to the last loaded configuration?')) {
+      return;
+    }
 
-    const handleRevert = () => {
-        if (window.confirm('Revert all changes?')) {
-            window.location.reload();
-        }
-    };
+    setWorkingAssignments(baselineAssignments);
+    toast.info('Reverted local Smart Swarm changes.');
+  };
 
-    return (
-        <div className="swarm-design-container">
-            {/* Clean Full-Width Button Bar */}
-            <div className="top-button-bar">
-                <button
-                    className="top-btn update"
-                    onClick={() => confirmAndSave(false)}
-                    disabled={saving}
-                >
-                    <FaSyncAlt /> Update Swarm
-                </button>
-                <button
-                    className="top-btn commit"
-                    onClick={() => confirmAndSave(true)}
-                    disabled={saving}
-                >
-                    <FaCloudUploadAlt /> Commit Changes
-                </button>
-                <label className="top-btn import">
-                    Import CSV
-                    <input
-                        type="file"
-                        accept=".csv"
-                        onChange={handleCSVImport}
-                    />
-                </label>
-                <button
-                    className="top-btn export"
-                    onClick={handleCSVExport}
-                    disabled={saving}
-                >
-                    Export CSV
-                </button>
-                <button
-                    className="top-btn revert"
-                    onClick={handleRevert}
-                    disabled={saving}
-                >
-                    Revert
-                </button>
-            </div>
+  const saveSwarmData = async (withCommit) => {
+    setSaving(true);
 
-            
+    try {
+      const response = await axios.post(
+        `${backendURL}/save-swarm-data?commit=${withCommit ? 'true' : 'false'}`,
+        toSwarmApiPayload(workingAssignments)
+      );
 
-            {/* Two-Column Layout */}
-            <div className="two-column-layout">
-                {/* Left Column: Drone List and Fields */}
-                <div className="left-column">
-                    <h3>Drone Configuration ({swarmData.length} drones)</h3>
-                    <div className="drone-list">
-                        {swarmData.length ? swarmData.map(drone => (
-                            <DroneCard
-                                key={drone.hw_id}
-                                drone={drone}
-                                allDrones={swarmData}
-                                onSaveChanges={handleSaveChanges}
-                                isSelected={selectedDroneId === drone.hw_id}
-                            />
-                        )) : (
-                            <div className="empty-state">
-                                <p>No data available for swarm configuration.</p>
-                            </div>
-                        )}
-                    </div>
-                </div>
+      toast.success(response.data.message || 'Smart Swarm configuration saved successfully.');
+      await refreshFromServer();
+    } catch (error) {
+      console.error('Failed to save Smart Swarm configuration:', error);
+      toast.error('Failed to save Smart Swarm configuration.');
+    } finally {
+      setSaving(false);
+    }
+  };
 
-                {/* Right Column: Graph View */}
-                <div className="right-column">
-                    <h3>Formation Preview</h3>
-                    <div className="graph-view">
-                        <DroneGraph
-                            swarmData={swarmData}
-                            onSelectDrone={setSelectedDroneId}
-                        />
-                    </div>
-                </div>
-            </div>
+  const confirmAndSave = (withCommit) => {
+    if (hasBlockingIssues) {
+      toast.error('Resolve blocking follow-chain issues before saving Smart Swarm assignments.');
+      return;
+    }
 
-            {/* Separate Bottom Section: Clustered Plots */}
-            <div className="plots-section">
-                <h3>Formation Analysis & Plots</h3>
-                <SwarmPlots swarmData={swarmData} />
-            </div>
-            {(changes.added.length || changes.removed.length) && (
-                <div className="notification-container">
-                    {changes.added.length > 0 && <span>Added: {changes.added.join(', ')}</span>}
-                    {changes.removed.length > 0 && <span>Removed: {changes.removed.join(', ')}</span>}
-                </div>
-            )}
+    if (hasIncompleteInputs) {
+      toast.error('Complete or clear all offset fields before saving.');
+      return;
+    }
+
+    if (!hasStagedChanges && !hasPendingSync) {
+      toast.info('No Smart Swarm changes are staged for update.');
+      return;
+    }
+
+    const summaryLines = [
+      `${viewModel.summary.totalDrones} drones across ${viewModel.summary.clusterCount} cluster${viewModel.summary.clusterCount === 1 ? '' : 's'}`,
+      `${viewModel.summary.topLeaderCount} top leaders, ${viewModel.summary.relayLeaderCount} relay leaders, ${viewModel.summary.followerCount} followers`,
+      `${dirtyIds.length} staged assignment change${dirtyIds.length === 1 ? '' : 's'}`,
+      `${syncChanges.addedIds.length + syncChanges.removedIds.length} fleet sync update${syncChanges.addedIds.length + syncChanges.removedIds.length === 1 ? '' : 's'}`,
+      `${viewModel.summary.attentionCount} drone${viewModel.summary.attentionCount === 1 ? '' : 's'} flagged for operator attention`,
+    ];
+
+    if (!window.confirm(
+      `${withCommit ? 'Commit' : 'Update'} Smart Swarm assignments?\n\n${summaryLines.map((line) => `- ${line}`).join('\n')}`
+    )) {
+      return;
+    }
+
+    saveSwarmData(withCommit);
+  };
+
+  const summaryCards = [
+    {
+      icon: <FaLayerGroup />,
+      label: 'Drones',
+      value: viewModel.summary.totalDrones,
+      tone: 'neutral',
+    },
+    {
+      icon: <FaProjectDiagram />,
+      label: 'Clusters',
+      value: viewModel.summary.clusterCount,
+      tone: 'neutral',
+    },
+    {
+      icon: <FaSyncAlt />,
+      label: 'Relay Leaders',
+      value: viewModel.summary.relayLeaderCount,
+      tone: 'warning',
+    },
+    {
+      icon: <FaSave />,
+      label: 'Staged Changes',
+      value: dirtyIds.length,
+      tone: dirtyIds.length > 0 ? 'info' : 'neutral',
+    },
+    {
+      icon: <FaExclamationTriangle />,
+      label: 'Attention',
+      value: viewModel.summary.attentionCount,
+      tone: viewModel.summary.attentionCount > 0 ? 'danger' : 'success',
+    },
+  ];
+
+  return (
+    <div className="swarm-design-page">
+      <header className="swarm-design-hero">
+        <div className="swarm-design-hero__copy">
+          <span className="swarm-design-hero__eyebrow">Smart Swarm Control Surface</span>
+          <h1>Operational Swarm Design</h1>
+          <p>
+            Hardware ID tracks the physical drone. Position ID tracks the assigned show slot.
+            Follow chains always target the drone hardware ID, even when a slot swap is active.
+          </p>
         </div>
-    );
-};
+
+        <div className="swarm-design-hero__actions">
+          <button
+            type="button"
+            className="swarm-action-button update"
+            onClick={() => confirmAndSave(false)}
+            disabled={saving || hasBlockingIssues || hasIncompleteInputs || (!hasStagedChanges && !hasPendingSync)}
+          >
+            <FaSyncAlt />
+            Update Swarm
+          </button>
+          <button
+            type="button"
+            className="swarm-action-button commit"
+            onClick={() => confirmAndSave(true)}
+            disabled={saving || hasBlockingIssues || hasIncompleteInputs || (!hasStagedChanges && !hasPendingSync)}
+          >
+            <FaCloudUploadAlt />
+            Commit Changes
+          </button>
+          <label className="swarm-action-button import">
+            <FaUpload />
+            Import JSON / CSV
+            <input type="file" accept=".json,.csv" onChange={handleImport} />
+          </label>
+          <button type="button" className="swarm-action-button secondary" onClick={handleJsonExport} disabled={workingAssignments.length === 0}>
+            <FaDownload />
+            Export JSON
+          </button>
+          <button type="button" className="swarm-action-button secondary" onClick={handleCsvExport} disabled={workingAssignments.length === 0}>
+            <FaDownload />
+            Export CSV
+          </button>
+          <button type="button" className="swarm-action-button ghost" onClick={handleRevert} disabled={!hasStagedChanges}>
+            <FaUndo />
+            Revert Local
+          </button>
+        </div>
+      </header>
+
+      <section className="swarm-summary-grid">
+        {summaryCards.map((card) => (
+          <div key={card.label} className={`swarm-summary-card ${card.tone}`}>
+            <span className="swarm-summary-card__icon">{card.icon}</span>
+            <span className="swarm-summary-card__value">{card.value}</span>
+            <span className="swarm-summary-card__label">{card.label}</span>
+          </div>
+        ))}
+      </section>
+
+      <section className="swarm-status-strip">
+        <div className="swarm-status-card identity">
+          <strong>Identity model</strong>
+          <span>Slot swaps change show-slot assignment, not follow-chain targeting. Validate role swaps before flight.</span>
+        </div>
+
+        {hasPendingSync && (
+          <div className="swarm-status-card sync">
+            <strong>Fleet sync pending</strong>
+            <span>
+              {syncChanges.addedIds.length > 0 && `Add default assignments for drones ${syncChanges.addedIds.join(', ')}. `}
+              {syncChanges.removedIds.length > 0 && `Prune legacy assignments for drones ${syncChanges.removedIds.join(', ')}.`}
+            </span>
+          </div>
+        )}
+
+        {viewModel.summary.roleSwapCount > 0 && (
+          <div className="swarm-status-card note">
+            <strong>Role swaps active</strong>
+            <span>{viewModel.summary.roleSwapCount} drone{viewModel.summary.roleSwapCount === 1 ? '' : 's'} are flying a different show slot than their hardware ID.</span>
+          </div>
+        )}
+
+        {(hasBlockingIssues || hasIncompleteInputs) && (
+          <div className="swarm-status-card attention">
+            <strong>Save blocked</strong>
+            <span>
+              {hasBlockingIssues ? 'Resolve self-follow, missing leader, or cycle issues.' : ''}
+              {hasBlockingIssues && hasIncompleteInputs ? ' ' : ''}
+              {hasIncompleteInputs ? 'Complete partial offset values before update or commit.' : ''}
+            </span>
+          </div>
+        )}
+      </section>
+
+      <SwarmRuntimeControls
+        viewModel={viewModel}
+        selectedDroneId={selectedDroneId}
+        selectedClusterId={selectedClusterId}
+        dirtyIds={dirtyIds}
+        pendingSyncIds={pendingSyncIds}
+        telemetryById={telemetryById}
+        onReviewSelection={(droneId) => handleSelectDrone(droneId)}
+        onOpenMissionConfig={(droneId) => navigate(`/mission-config?drone=${droneId}&edit=1`)}
+      />
+
+      <div className="swarm-operations-layout">
+        <section className="swarm-panel swarm-panel--assignments">
+          <div className="swarm-panel__header">
+            <div>
+              <h2>Assignment Cards</h2>
+              <p>Grouped by top leader so operators can audit follow chains cluster by cluster.</p>
+            </div>
+
+            <label className="swarm-search-field">
+              <FaSearch />
+              <input
+                type="search"
+                placeholder="Search drone, show slot, leader, or IP"
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="swarm-panel__subheader">
+            <span>{visibleDroneCount} of {viewModel.summary.totalDrones} drones visible</span>
+            <span>{dirtyIds.length} staged</span>
+          </div>
+
+          <div className="swarm-cluster-stack">
+            {filteredClusters.length === 0 && (
+              <div className="swarm-empty-state">
+                <strong>No matching drones</strong>
+                <span>Try a different search term or clear the filter.</span>
+              </div>
+            )}
+
+            {filteredClusters.map((cluster) => (
+              <section
+                key={cluster.id}
+                className={`swarm-cluster-section ${cluster.type === 'attention' ? 'attention' : ''}`}
+              >
+                <header className="swarm-cluster-section__header">
+                  <div>
+                    <h3>{cluster.title}</h3>
+                    <p>{cluster.subtitle}</p>
+                  </div>
+
+                  <div className="swarm-cluster-section__stats">
+                    <span>{cluster.counts.total} drones</span>
+                    <span>{cluster.counts.relayLeaders} relay</span>
+                    <span>{cluster.counts.followers} followers</span>
+                    {cluster.warningCount > 0 && <span>{cluster.warningCount} attention</span>}
+                  </div>
+                </header>
+
+                <div className="swarm-card-list">
+                  {cluster.drones.map((drone) => {
+                    const rawAssignment = workingAssignments.find((assignment) => String(assignment.hw_id) === drone.hw_id) || drone;
+
+                    return (
+                      <DroneCard
+                        key={drone.hw_id}
+                        ref={(node) => {
+                          if (node) {
+                            cardRefs.current[drone.hw_id] = node;
+                          } else {
+                            delete cardRefs.current[drone.hw_id];
+                          }
+                        }}
+                        drone={drone}
+                        draftAssignment={rawAssignment}
+                        followOptions={viewModel.followOptions}
+                        onSelect={(droneId) => handleSelectDrone(droneId)}
+                        onToggleExpand={handleToggleExpand}
+                        onAssignmentChange={handleAssignmentChange}
+                        isSelected={selectedDroneId === drone.hw_id}
+                        isExpanded={expandedDroneId === drone.hw_id}
+                        isDirty={dirtyIdSet.has(drone.hw_id)}
+                      />
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
+        </section>
+
+        <section className="swarm-panel swarm-panel--graph">
+          <div className="swarm-panel__header">
+            <div>
+              <h2>Follow Chain Graph</h2>
+              <p>Click any node to select the matching assignment card and inspect its upstream and downstream chain.</p>
+            </div>
+          </div>
+
+          <div className="swarm-graph-panel">
+            <div className="swarm-graph-stage">
+              <DroneGraph
+                swarmData={viewModel.drones}
+                selectedDroneId={selectedDroneId}
+                onSelectDrone={(droneId) => handleSelectDrone(droneId, { fromGraph: true })}
+              />
+            </div>
+
+            <div className="swarm-graph-legend">
+              <span className="legend-item leader">Top leader</span>
+              <span className="legend-item relay">Relay leader</span>
+              <span className="legend-item follower">Follower</span>
+              <span className="legend-item line-solid">Geographic offset</span>
+              <span className="legend-item line-dashed">Body-relative offset</span>
+            </div>
+
+            <div className="swarm-selection-panel">
+              {selectedDrone ? (
+                <>
+                  <div className="swarm-selection-panel__header">
+                    <div>
+                      <span className="swarm-selection-panel__eyebrow">Selected Drone</span>
+                      <h3>{selectedDrone.title}</h3>
+                      {selectedDrone.alias && <p className="swarm-selection-panel__alias">{selectedDrone.aliasLabel || 'Alias'}: {selectedDrone.alias}</p>}
+                    </div>
+                    <span className={`swarm-role-badge ${selectedDrone.role}`}>{selectedDrone.roleLabel}</span>
+                  </div>
+
+                  <dl className="swarm-selection-panel__details">
+                    <div>
+                      <dt>Show Slot</dt>
+                      <dd>{selectedDrone.pos_id}</dd>
+                    </div>
+                    <div>
+                      <dt>Follow Target</dt>
+                      <dd>{selectedDrone.follow === '0' ? 'Independent leader' : formatDroneLabel(selectedDrone.follow)}</dd>
+                    </div>
+                    <div>
+                      <dt>Offset Frame</dt>
+                      <dd>{selectedDrone.frameLabel}</dd>
+                    </div>
+                    <div>
+                      <dt>Relative Offset</dt>
+                      <dd>{selectedDrone.offsetSummary}</dd>
+                    </div>
+                    <div>
+                      <dt>Direct Followers</dt>
+                      <dd>{selectedDrone.directFollowerCount}</dd>
+                    </div>
+                  </dl>
+
+                  {selectedDrone.warnings.length > 0 && (
+                    <div className="swarm-selection-panel__warnings">
+                      {selectedDrone.warnings.map((warning) => (
+                        <div key={`${selectedDrone.hw_id}-${warning.code}`} className={`selection-warning ${warning.severity}`}>
+                          <FaExclamationTriangle />
+                          <span>{warning.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="swarm-empty-state compact">
+                  <strong>No drone selected</strong>
+                  <span>Select a graph node or assignment card to inspect its details.</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section className="swarm-panel swarm-panel--plots">
+        <div className="swarm-panel__header">
+          <div>
+            <h2>Formation Analysis</h2>
+            <p>
+              Cluster plots are relative previews for design review. They are not live telemetry views. Selecting a
+              specific cluster here also sets the cluster-scoped runtime target. &quot;All executable clusters&quot; remains
+              analysis-only.
+            </p>
+          </div>
+        </div>
+
+        <SwarmPlots
+          swarmData={workingAssignments}
+          configData={configData}
+          selectedClusterId={selectedClusterId}
+          onSelectedClusterChange={setSelectedClusterId}
+        />
+      </section>
+    </div>
+  );
+}
 
 export default SwarmDesign;

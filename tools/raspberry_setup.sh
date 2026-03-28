@@ -1,8 +1,35 @@
 #!/bin/bash
 
 # =============================================================================
-# raspberry_setup.sh
+# raspberry_setup.sh - DEPRECATED
+# =============================================================================
 #
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !                            DEPRECATION NOTICE                             !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !                                                                           !
+# !  This script is DEPRECATED as of MDS v4.0.0                               !
+# !                                                                           !
+# !  Please use the new initialization system instead:                        !
+# !                                                                           !
+# !      sudo ./tools/mds_init.sh [OPTIONS]                                   !
+# !                                                                           !
+# !  The new script provides:                                                 !
+# !    - Modular, maintainable architecture                                   !
+# !    - State tracking and resume capability                                 !
+# !    - Better error handling and recovery                                   !
+# !    - Firewall configuration                                               !
+# !    - NTP time synchronization                                             !
+# !    - Static IP configuration                                              !
+# !    - Professional terminal output                                         !
+# !    - Dry-run mode for testing                                             !
+# !                                                                           !
+# !  This script is kept for backward compatibility only.                     !
+# !  It will be removed in a future release.                                  !
+# !                                                                           !
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
+# Original description:
 # A script to set up a drone within a Drone Swarm System.
 # Supports both interactive and non-interactive modes, allowing users to provide
 # inputs via command-line arguments or interactively through prompts.
@@ -478,7 +505,7 @@ check_download_mavsdk() {
         echo "MAVSDK server binary not found, downloading..."
         if [[ -f "$REPO_DIR/tools/download_mavsdk_server.sh" ]]; then
             sudo bash "$REPO_DIR/tools/download_mavsdk_server.sh"
-            echo "Note: You might need to manually update the download URL in the 'download_mavsdk_server.sh' script to match the latest MAVSDK server version."
+            echo "Note: The downloader auto-detects the latest MAVSDK release by default. Use MDS_MAVSDK_VERSION or MDS_MAVSDK_URL only when you intentionally want to pin a specific binary."
         else
             echo "Error: MAVSDK server download script not found."
             exit 1

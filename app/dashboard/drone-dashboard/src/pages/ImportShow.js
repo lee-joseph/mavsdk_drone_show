@@ -26,14 +26,14 @@ const ImportShow = () => {
   const [uploadTime, setUploadTime] = useState('N/A');
   const [uploadCount, setUploadCount] = useState(0);
   const [dronesMismatchWarning, setDronesMismatchWarning] = useState(null);
-  // Note: coordinateWarnings removed - x,y no longer in config.csv
+  // Note: coordinateWarnings removed - x,y no longer in config.json
   const [returnWarnings, setReturnWarnings] = useState([]);
   const [openConfirmDialog, setOpenConfirmDialog] = useState(false);
   const [loading, setLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [showDuration, setShowDuration] = useState(null);
 
-  const backendURL = getBackendURL(process.env.REACT_APP_FLASK_PORT || '5000');
+  const backendURL = getBackendURL(); // Uses REACT_APP_GCS_PORT
 
   // Fetch plot list from backend
   useEffect(() => {
@@ -79,7 +79,7 @@ const ImportShow = () => {
         if (!configResponse.ok) throw new Error(`HTTP error! Status: ${configResponse.status}`);
         const configData = await configResponse.json();
 
-        // Note: x,y positions now come from trajectory CSV files only, not config.csv
+        // Note: x,y positions come from trajectory CSV files only, not config.json
         const returnWarnings = [];
         let droneCountWarning = null;
 
@@ -189,7 +189,7 @@ const ImportShow = () => {
       {dronesMismatchWarning && (
         <p className="warning-message">{dronesMismatchWarning}</p>
       )}
-      {/* Note: Coordinate warnings removed - x,y no longer in config.csv */}
+      {/* Note: Coordinate warnings removed - x,y no longer in config.json */}
       {returnWarnings.map((warning, index) => (
         <p key={index} className="soft-warning-message">
           {warning}

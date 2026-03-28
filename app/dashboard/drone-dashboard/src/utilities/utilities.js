@@ -1,13 +1,10 @@
 // utilities.js
 
-// Get the base server URL from environment variables
-const baseServerURL = process.env.REACT_APP_SERVER_URL || 'http://localhost';
+// Import centralized API config with auto-detection
+import { getBackendURL } from '../config/apiConfig';
 
-// Function to get the backend URL, always including the specified or default port
-export function getBackendURL(servicePort = process.env.REACT_APP_FLASK_PORT || '5000') {
-    // Ensure that the port is always appended to the URL
-    return `${baseServerURL}:${servicePort}`;
-}
+// Re-export for backward compatibility
+export { getBackendURL };
 
 // Usage-specific functions to return complete URLs for specific services
 export function getTelemetryURL() {
@@ -18,17 +15,20 @@ export function getElevationURL(lat, lon) {
     return `${getBackendURL()}/elevation?lat=${lat}&lon=${lon}`;
 }
 
-// New function to get the GCS Git status URL
+// DEPRECATED: Use getUnifiedGitStatusURL() instead — /git-status includes gcs_status field
 export function getGitStatusURL() {
     return `${getBackendURL()}/get-gcs-git-status`;
 }
 
-export const getUnifiedGitStatusURL = () => `${process.env.REACT_APP_API_BASE_URL}/git-status`;
+export const getUnifiedGitStatusURL = () => `${getBackendURL()}/git-status`;
+
+export const getSyncReposURL = () => `${getBackendURL()}/sync-repos`;
 
 
 export function getCustomShowImageURL() {
     return `${getBackendURL()}/get-custom-show-image`;
 }
+// DEPRECATED: Use getUnifiedGitStatusURL() instead — /git-status includes all drone statuses
 export function getDroneGitStatusURLById(droneID) {
     return `${getBackendURL()}/get-drone-git-status/${droneID}`;
 }
@@ -43,20 +43,60 @@ export const TEXTURE_REPEAT = 10;
 export const POLLING_RATE_HZ = 1;
 export const STALE_DATA_THRESHOLD_SECONDS = 5;
 
-// Fetch the elevation based on latitude and longitude
+// In-memory elevation cache — grid-snap to ~20 m to deduplicate nearby points
+const _elevationCache = new Map();
+const _ELEV_CACHE_MAX = 200;
+const _ELEV_GRID = 0.0002; // ~20 m
+
+function _snapElev(v) { return Math.round(v / _ELEV_GRID) * _ELEV_GRID; }
+function _elevKey(lat, lon) { return `${_snapElev(lat).toFixed(4)},${_snapElev(lon).toFixed(4)}`; }
+
+// In-flight request deduplication — prevents parallel fetches for the same point
+const _elevInflight = new Map();
+
+// Fetch the elevation based on latitude and longitude (cached + deduped)
 export const getElevation = async (lat, lon) => {
-  try {
-      const url = getElevationURL(lat, lon);  // Use the updated function to get the elevation URL
-      console.log(`Fetching elevation data from URL: ${url}`);  // Log the URL
+  if (lat === null || lat === undefined || lon === null || lon === undefined) {
+    return null;
+  }
+
+  const key = _elevKey(lat, lon);
+
+  // Return cached result
+  if (_elevationCache.has(key)) {
+    return _elevationCache.get(key);
+  }
+
+  // Return in-flight promise if already fetching this point
+  if (_elevInflight.has(key)) {
+    return _elevInflight.get(key);
+  }
+
+  const fetchPromise = (async () => {
+    try {
+      const url = getElevationURL(lat, lon);
       const response = await fetch(url);
       if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
       const data = await response.json();
-      
-      return data.results[0]?.elevation || null;
-  } catch (error) {
+      const elevation = data.results[0]?.elevation || null;
+
+      // Store in cache (evict oldest if full)
+      if (_elevationCache.size >= _ELEV_CACHE_MAX) {
+        const first = _elevationCache.keys().next().value;
+        _elevationCache.delete(first);
+      }
+      _elevationCache.set(key, elevation);
+      return elevation;
+    } catch (error) {
       console.error(`Failed to fetch elevation data: ${error}`);
       return null;
-  }
+    } finally {
+      _elevInflight.delete(key);
+    }
+  })();
+
+  _elevInflight.set(key, fetchPromise);
+  return fetchPromise;
 };
 
 // Convert Latitude, Longitude, Altitude to local coordinates
@@ -74,9 +114,6 @@ export const llaToLocal = (lat, lon, alt, reference) => {
     // Optional scaling
     // const SCALE_FACTOR = 1000;
     // return [north * SCALE_FACTOR, up * SCALE_FACTOR, east * SCALE_FACTOR];
-  
-    // Log the converted position for debugging
-    console.log(`LLA to Local - HW_ID: [Lat: ${lat}, Lon: ${lon}, Alt: ${alt}] => [North: ${north}, Up: ${up}, East: ${east}]`);
   
     return [north, up, east];
   };

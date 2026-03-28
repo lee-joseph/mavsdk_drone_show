@@ -4,7 +4,7 @@
 
 This document explains the **single source of truth** architecture for drone position management in the MAVSDK Drone Show system.
 
-**KEY PRINCIPLE**: Drone positions (x, y coordinates) are ALWAYS read from trajectory CSV files, never stored in config.csv.
+**KEY PRINCIPLE**: Drone positions (x, y coordinates) are ALWAYS read from trajectory CSV files, never stored in config.json.
 
 ---
 
@@ -13,7 +13,7 @@ This document explains the **single source of truth** architecture for drone pos
 ### Before (❌ Deprecated - Old System)
 
 ```
-config.csv:
+config.csv (legacy):
 hw_id, pos_id, x, y, ip, ...
 1,     1,      -5.0, 2.5, 100.96.240.11, ...
 
@@ -26,9 +26,14 @@ Problem: Two sources of truth caused:
 ### After (✅ Current System)
 
 ```
-config.csv:
-hw_id, pos_id, ip, mavlink_port, serial_port, baudrate
-1,     1,      100.96.240.11, 14551, /dev/ttyS0, 57600
+config.json:
+{
+  "version": 1,
+  "drones": [
+    {"hw_id": 1, "pos_id": 1, "ip": "100.96.240.11", "mavlink_port": 14551,
+     "serial_port": "/dev/ttyS0", "baudrate": 57600}
+  ]
+}
 
 Positions come from:
 shapes/swarm/processed/Drone 1.csv (first row: px, py)
@@ -42,13 +47,17 @@ shapes/swarm/processed/Drone 1.csv (first row: px, py)
 
 ### 1. Configuration Storage
 
-**config.csv** contains:
+**config.json** contains (per drone):
 - `hw_id`: Physical hardware identifier
 - `pos_id`: Which trajectory/show to fly (points to "Drone {pos_id}.csv")
 - `ip`: Drone network address
 - `mavlink_port`: MAVLink communication port
-- `serial_port`: Serial connection (e.g., /dev/ttyS0)
-- `baudrate`: Serial baud rate (e.g., 57600)
+- `serial_port`: Serial connection (e.g., /dev/ttyS0) (optional)
+- `baudrate`: Serial baud rate (e.g., 57600) (optional)
+- Additional custom fields are preserved (e.g., `callsign`, `notes`, `maintenance_tag`)
+
+**Operator rule:** Additional fields are secondary metadata only. They must never replace
+`hw_id` (physical drone identity) or `pos_id` (show slot / trajectory identity).
 
 **Trajectory Files** (`shapes/swarm/processed/Drone {pos_id}.csv`):
 - First row contains: `px` (North), `py` (East), `pz` (Down)
@@ -63,14 +72,14 @@ Returns: [{"hw_id": 1, "pos_id": 1, "x": -5.0, "y": 2.5}, ...]
 ```
 
 **How it works**:
-1. Read config.csv to get hw_id → pos_id mapping
+1. Read config.json to get hw_id → pos_id mapping
 2. For each pos_id, read `Drone {pos_id}.csv` first row
 3. Extract px (x/North) and py (y/East) coordinates
 4. Return combined data with hw_id, pos_id, x, y
 
 **Helper Functions**:
 - `get_all_drone_positions()` in `gcs-server/config.py`
-- `_get_expected_position_from_trajectory()` in `gcs-server/origin.py`
+- `get_expected_position_from_trajectory()` in `src/coordinate_utils.py`
 
 ### 3. Role Swaps
 
@@ -95,12 +104,12 @@ Returns drone configuration (NO x,y fields).
 ```json
 [
   {
-    "hw_id": "1",
-    "pos_id": "1",
+    "hw_id": 1,
+    "pos_id": 1,
     "ip": "100.96.240.11",
-    "mavlink_port": "14551",
+    "mavlink_port": 14551,
     "serial_port": "/dev/ttyS0",
-    "baudrate": "57600"
+    "baudrate": 57600
   }
 ]
 ```
@@ -126,12 +135,12 @@ Saves configuration (x,y automatically stripped if present).
 ```json
 [
   {
-    "hw_id": "1",
-    "pos_id": "1",
+    "hw_id": 1,
+    "pos_id": 1,
     "ip": "100.96.240.11",
-    "mavlink_port": "14551",
+    "mavlink_port": 14551,
     "serial_port": "/dev/ttyS0",
-    "baudrate": "57600"
+    "baudrate": 57600
   }
 ]
 ```
@@ -170,6 +179,8 @@ Gets position for single pos_id (used for individual updates).
 - DroneConfigCard shows hw_id, pos_id, ip, etc.
 - NO x,y input fields (removed)
 - Positions displayed as read-only info (if needed)
+- Additional JSON fields are shown in a dedicated **Additional Fields** section
+- `callsign` is promoted as a secondary alias when present
 
 **Saving Changes**:
 1. User clicks "Save & Commit to Git"
@@ -201,17 +212,16 @@ Gets position for single pos_id (used for individual updates).
 
 ### Backend (Python)
 - `gcs-server/config.py`:
-  - `CONFIG_COLUMNS` (x,y removed)
   - `get_all_drone_positions()`
   - `validate_and_process_config()`
 
-- `gcs-server/routes.py`:
+- `gcs-server/app_fastapi.py`:
   - `/get-drone-positions` endpoint
   - `/save-config-data` endpoint
   - `/validate-config` endpoint
 
-- `gcs-server/origin.py`:
-  - `_get_expected_position_from_trajectory()`
+- `src/coordinate_utils.py`:
+  - `get_expected_position_from_trajectory()`
 
 - `drone_show.py`:
   - Uses trajectory CSV first row (calls `read_trajectory_file()`)
@@ -240,19 +250,18 @@ Gets position for single pos_id (used for individual updates).
 ### For Existing Deployments
 
 **Before updating**:
-1. Backup `config.csv`
+1. Backup `config.json`
 2. Ensure all trajectory CSV files exist in `shapes/swarm/processed/`
 
 **After updating**:
-1. Old `config.csv` with x,y columns will work (backend strips x,y on save)
-2. First save will migrate to new format automatically
+1. Old CSV configs are auto-migrated to JSON format on first load
+2. Use the Mission Config UI to re-save, which will write the new format automatically
 3. Hard refresh browser (Ctrl+Shift+R) to clear cached UI
 
 **Verification**:
 ```bash
-# Check config.csv header
-head -1 config.csv
-# Should show: hw_id,pos_id,ip,mavlink_port,serial_port,baudrate
+# Check config.json exists and is valid
+python3 -c "import json; print(json.load(open('config.json'))['drones'][0])"
 
 # Test API
 curl http://localhost:5002/get-drone-positions
@@ -264,7 +273,7 @@ curl http://localhost:5002/get-drone-positions
 ## Best Practices
 
 ### Adding New Drones
-1. Add row to config.csv with hw_id, pos_id, ip, etc.
+1. Add entry to config.json with hw_id, pos_id, ip, etc.
 2. Ensure trajectory file exists: `shapes/swarm/processed/Drone {pos_id}.csv`
 3. Position comes automatically from trajectory file
 
@@ -303,7 +312,7 @@ curl http://localhost:5002/get-drone-positions
 **Q: Where are drone positions stored?**
 A: In trajectory CSV files (`shapes/swarm/processed/Drone {pos_id}.csv` first row).
 
-**Q: Why remove x,y from config.csv?**
+**Q: Why remove x,y from config?**
 A: They were redundant, caused sync bugs, and confused users about source of truth.
 
 **Q: How do I change a drone's position?**
@@ -320,5 +329,5 @@ A: Not recommended. The old x,y fields caused bugs. Use trajectory CSV as source
 
 ---
 
-**Last Updated**: 2025-11-20
-**Version**: 2.0 (Single Source of Truth Architecture)
+**Last Updated**: 2026-03-05
+**Version**: 4.0 (JSON config format, positions from trajectory CSV only, hw_id is int)

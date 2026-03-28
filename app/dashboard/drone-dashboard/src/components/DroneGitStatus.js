@@ -9,6 +9,7 @@ import {
   faChevronUp,
   faCopy,
 } from '@fortawesome/free-solid-svg-icons';
+import { areGitRevisionsEquivalent } from '../utilities/missionIdentityUtils';
 
 const DroneGitStatus = ({ gitStatus, gcsGitStatus, droneName }) => {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -31,9 +32,11 @@ const DroneGitStatus = ({ gitStatus, gcsGitStatus, droneName }) => {
     );
   }
 
-  const isInSync = gcsGitStatus && gitStatus.commit && gcsGitStatus.commit
-    ? gitStatus.commit === gcsGitStatus.commit
-    : false;
+  const isInSync = typeof gitStatus.in_sync_with_gcs === 'boolean'
+    ? gitStatus.in_sync_with_gcs
+    : (gcsGitStatus && gitStatus.commit && gcsGitStatus.commit
+        ? areGitRevisionsEquivalent(gitStatus.commit, gcsGitStatus.commit)
+        : false);
 
   const handleCopyCommit = async () => {
     if (!gitStatus.commit) {
@@ -44,7 +47,6 @@ const DroneGitStatus = ({ gitStatus, gcsGitStatus, droneName }) => {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(gitStatus.commit);
-        console.log('Copied to clipboard:', gitStatus.commit);
         setCopySuccess(true);
       } else {
         // Fallback for unsupported browsers
@@ -54,7 +56,6 @@ const DroneGitStatus = ({ gitStatus, gcsGitStatus, droneName }) => {
         textarea.select();
         document.execCommand('copy');
         document.body.removeChild(textarea);
-        console.log('Copied to clipboard using fallback:', gitStatus.commit);
         setCopySuccess(true);
       }
       setTimeout(() => setCopySuccess(false), 2000);
@@ -147,24 +148,34 @@ const DroneGitStatus = ({ gitStatus, gcsGitStatus, droneName }) => {
           )}
         </div>
       )}
-      {!isInSync && <div className="git-warning">Git status is not in sync with GCS.</div>}
+      {!isInSync && (
+        <div className="git-warning">
+          Not in sync with GCS
+          {gcsGitStatus?.commit && gitStatus.commit && (
+            <span className="git-warning-detail">
+              {' '}(drone: {gitStatus.commit.slice(0, 7)}, GCS: {gcsGitStatus.commit.slice(0, 7)})
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 };
 
 DroneGitStatus.propTypes = {
   gitStatus: PropTypes.shape({
-    branch: PropTypes.string.isRequired,
-    commit: PropTypes.string.isRequired,
-    status: PropTypes.string.isRequired,
-    commit_date: PropTypes.string.isRequired,
-    commit_message: PropTypes.string.isRequired,
-    author_name: PropTypes.string.isRequired,
-    author_email: PropTypes.string.isRequired,
+    branch: PropTypes.string,
+    commit: PropTypes.string,
+    status: PropTypes.string,
+    in_sync_with_gcs: PropTypes.bool,
+    commit_date: PropTypes.string,
+    commit_message: PropTypes.string,
+    author_name: PropTypes.string,
+    author_email: PropTypes.string,
     uncommitted_changes: PropTypes.arrayOf(PropTypes.string),
   }),
   gcsGitStatus: PropTypes.shape({
-    commit: PropTypes.string.isRequired,
+    commit: PropTypes.string,
   }),
   droneName: PropTypes.string.isRequired,
 };
