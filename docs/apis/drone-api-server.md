@@ -11,6 +11,12 @@
 
 The Drone API Server is a high-performance FastAPI-based server that runs on each drone, providing both HTTP REST endpoints and WebSocket streaming for real-time telemetry. It handles communication with the Ground Control Station (GCS) and serves drone state information, commands, and configuration data.
 
+## API Evolution Note
+
+As of the 2026-04-04 drone-contract cleanup, the supported HTTP contract is the canonical `/api/v1/...` surface. The old verb-style drone routes were retired instead of being kept as misleading compatibility aliases.
+
+Use [api-modernization-blueprint.md](./api-modernization-blueprint.md) as the planning and migration source of truth.
+
 ### Key Features
 
 - ✅ **HTTP REST API** - 10 endpoints for standard operations
@@ -19,7 +25,7 @@ The Drone API Server is a high-performance FastAPI-based server that runs on eac
 - ✅ **Type Validation** - Pydantic models ensure data integrity
 - ✅ **Async/Await** - Non-blocking I/O for better performance
 - ✅ **CORS Enabled** - Accessible from web dashboards
-- ✅ **Backward Compatible** - 100% compatible with previous Flask version
+- ✅ **Canonical Contract** - One current route per domain for UI, runtime tooling, and future MCP layers
 
 ### Performance Metrics
 
@@ -72,7 +78,7 @@ http://drone-ip:7070/openapi.json
 
 ### 1. Get Drone State
 
-**Endpoint:** `GET /get_drone_state`
+**Endpoint:** `GET /api/v1/drone/state`
 
 **Description:** Retrieve current drone state (snapshot)
 
@@ -124,7 +130,7 @@ http://drone-ip:7070/openapi.json
 
 **Use Case:** Get current drone state for polling-based GCS
 
-**Recommended For:** Legacy systems, periodic status checks
+**Recommended For:** GCS polling, validator tooling, and direct operator diagnostics
 
 Readiness fields:
 - `is_ready_to_arm` remains the simple compatibility boolean.
@@ -135,15 +141,15 @@ Readiness fields:
 
 ### 2. Send Command
 
-**Endpoint:** `POST /api/send-command`
+**Endpoint:** `POST /api/v1/drone/commands`
 
 **Description:** Receive command from GCS
 
 **Request Body:**
 ```json
 {
-  "missionType": "10",
-  "triggerTime": "1732270300",
+  "mission_type": 10,
+  "trigger_time": 1732270300,
   "command_id": "5c6c136a-0ea2-41ba-a00f-0e632c3c4418",
   "takeoff_altitude": 10
 }
@@ -170,14 +176,15 @@ Readiness fields:
 The drone API returns structured ACKs for both accepted and rejected commands. A rejected command still uses HTTP 200 and places the reason in `status`, `error_code`, and `error_detail`.
 
 Preferred mission encoding:
-- `missionType` should be the numeric mission code as a string when called by the GCS.
-- The GCS accepts some legacy aliases, but drone-to-GCS traffic should stay on the numeric mission codes for consistency.
+- canonical request fields are `mission_type` and `trigger_time`.
+- legacy aliases (`missionType`, `triggerTime`) are still accepted at the HTTP edge, but first-party GCS callers now send the canonical snake_case contract.
+- GCS-to-drone traffic should stay on numeric mission codes for consistency.
 
 ---
 
 ### 3. Get Home Position
 
-**Endpoint:** `GET /get-home-pos`
+**Endpoint:** `GET /api/v1/navigation/home`
 
 **Description:** Get drone home position
 
@@ -195,7 +202,7 @@ Preferred mission encoding:
 
 ### 4. Get GPS Global Origin
 
-**Endpoint:** `GET /get-gps-global-origin`
+**Endpoint:** `GET /api/v1/navigation/global-origin`
 
 **Description:** Get GPS global origin from autopilot
 
@@ -214,7 +221,7 @@ Preferred mission encoding:
 
 ### 5. Get Git Status
 
-**Endpoint:** `GET /get-git-status`
+**Endpoint:** `GET /api/v1/git/status`
 
 **Description:** Get current git status of drone repository
 
@@ -236,16 +243,20 @@ Preferred mission encoding:
 
 ---
 
-### 6. Ping
+### 6. Health
 
-**Endpoint:** `GET /ping`
+**Primary Endpoint:** `GET /api/v1/system/health`
+
+**Operational Alias:** `GET /ping`
 
 **Description:** Health check endpoint
 
 **Response:**
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "timestamp": 1732270245000,
+  "version": "5.0.31"
 }
 ```
 
@@ -253,7 +264,7 @@ Preferred mission encoding:
 
 ### 7. Get Position Deviation
 
-**Endpoint:** `GET /get-position-deviation`
+**Endpoint:** `GET /api/v1/navigation/position-deviation`
 
 **Description:** Calculate deviation from expected position
 
@@ -273,7 +284,7 @@ Preferred mission encoding:
 
 ### 8. Get Network Status
 
-**Endpoint:** `GET /get-network-status`
+**Endpoint:** `GET /api/v1/network/status`
 
 **Description:** Get current network connectivity information
 
@@ -296,7 +307,7 @@ Preferred mission encoding:
 
 ### 9. Get Swarm Data
 
-**Endpoint:** `GET /get-swarm-data`
+**Endpoint:** `GET /api/v1/swarm/config`
 
 **Description:** Get swarm configuration (leader/follower relationships)
 
@@ -326,7 +337,7 @@ Preferred mission encoding:
 
 ### 10. Get Local Position NED
 
-**Endpoint:** `GET /get-local-position-ned`
+**Endpoint:** `GET /api/v1/telemetry/local-position`
 
 **Description:** Get LOCAL_POSITION_NED data from MAVLink
 
@@ -359,7 +370,7 @@ Preferred mission encoding:
 **Advantages over HTTP polling:**
 - ✅ **95% less network overhead** (no HTTP headers)
 - ✅ **Real-time push** (no polling delay)
-- ✅ **Bi-directional** (can send commands through same connection)
+- ✅ **One-way monitoring stream** (commands stay on `POST /api/v1/drone/commands`)
 - ✅ **More efficient** for GCS monitoring multiple drones
 - ✅ **Lower latency** (~5ms vs 20ms with HTTP)
 
@@ -378,11 +389,20 @@ ws://drone-ip:7070/ws/drone-state
 - Medium frequency: 1 Hz (1s interval) - Recommended default
 - Low frequency: 0.5 Hz (2s interval) - For bandwidth-constrained networks
 
+### Current Contract
+
+- When state is available, each WebSocket message uses the same canonical
+  payload shape as `GET /api/v1/drone/state`.
+- When state is temporarily unavailable, the server sends the sentinel payload
+  `{"error": "Drone state not available", "timestamp": ...}`.
+- This endpoint is currently a one-way monitoring stream. Command submission
+  remains the HTTP route `POST /api/v1/drone/commands`.
+
 To change frequency, modify `asyncio.sleep()` value in endpoint code.
 
 ### Data Format
 
-Same as HTTP `/get_drone_state` endpoint - JSON format with all telemetry fields.
+Same as HTTP `/api/v1/drone/state` endpoint - JSON format with all telemetry fields.
 
 ### Usage Examples
 
@@ -550,12 +570,12 @@ If drone state is unavailable:
 curl http://192.168.1.100:7070/ping
 
 # Get drone state
-curl http://192.168.1.100:7070/get_drone_state
+curl http://192.168.1.100:7070/api/v1/drone/state
 
 # Send command
-curl -X POST http://192.168.1.100:7070/api/send-command \
+curl -X POST http://192.168.1.100:7070/api/v1/drone/commands \
   -H "Content-Type: application/json" \
-  -d '{"missionType": "ARM", "triggerTime": "0"}'
+  -d '{"mission_type": 10, "trigger_time": 0}'
 ```
 
 #### 2. Test WebSocket (websocat tool)
@@ -593,11 +613,10 @@ Visit `http://drone-ip:7070/docs` in browser:
 
 ### What Stayed the Same
 
-- ✅ All endpoint URLs unchanged
-- ✅ Request/response formats identical
 - ✅ Port number (7070)
+- ✅ WebSocket route (`/ws/drone-state`)
 - ✅ CORS configuration
-- ✅ Functionality 100% preserved
+- ✅ Core request/response payload shapes preserved while routes were canonicalized
 
 ### Backward Compatibility
 
@@ -661,7 +680,7 @@ FastAPI can handle 1,000+ concurrent WebSocket connections per drone. For GCS mo
 
 #### 3. State Data Not Updating
 
-**Symptom:** `/get_drone_state` returns stale data
+**Symptom:** `/api/v1/drone/state` returns stale data
 
 **Solutions:**
 - Verify DroneCommunicator is running
@@ -674,7 +693,7 @@ FastAPI can handle 1,000+ concurrent WebSocket connections per drone. For GCS mo
 
 ### Internal Docs
 - [Backend Analysis Report](../../BACKEND_ANALYSIS_REPORT.md) - Complete backend architecture
-- [GCS Server API](./gcs-server-api.md) - Ground Control Station API (TODO: Create)
+- [GCS Server API](./gcs-api-server.md) - Ground Control Station API
 - [Swarm Trajectory](../features/swarm-trajectory.md) - Swarm mission coordination
 
 ### Auto-Generated Docs
@@ -723,6 +742,6 @@ FastAPI can handle 1,000+ concurrent WebSocket connections per drone. For GCS mo
 
 ---
 
-**Last Updated:** 2025-11-22
+**Last Updated:** 2026-04-04
 **Maintainer:** MAVSDK Drone Show Team
 **License:** Same as main project

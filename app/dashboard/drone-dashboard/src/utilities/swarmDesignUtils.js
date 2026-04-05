@@ -1,5 +1,5 @@
 import { getPromotedMissionConfigField } from './missionConfigFields';
-import { formatDroneLabel, formatShowSlotLabel } from './missionIdentityUtils';
+import { formatCompactDroneIdentity, formatDroneLabel, formatShowSlotLabel } from './missionIdentityUtils';
 
 export const TOP_LEADER_FOLLOW_VALUE = '0';
 
@@ -337,7 +337,7 @@ function buildFollowOptions(drones) {
     .sort(compareDrones)
     .map((drone) => ({
       value: drone.hw_id,
-      label: `${formatDroneLabel(drone.hw_id)} · ${formatShowSlotLabel(drone.pos_id)} · ${drone.roleLabel}`,
+      label: `${formatCompactDroneIdentity(drone.pos_id, drone.hw_id)} · ${drone.roleLabel}`,
     }));
 }
 
@@ -521,15 +521,22 @@ export function buildSwarmViewModel(assignments = [], configData = []) {
         relayLeaders: sortedDrones.filter((drone) => drone.role === 'relayLeader').length,
         followers: sortedDrones.filter((drone) => drone.role === 'follower').length,
       };
+      const leaderIdentity = leaderDrone
+        ? formatCompactDroneIdentity(
+            leaderDrone.pos_id,
+            leaderDrone.hw_id,
+            formatDroneLabel(leaderDrone?.hw_id || cluster.leaderId, 'Leader')
+          )
+        : formatDroneLabel(cluster.leaderId, 'Leader');
 
       return {
         ...cluster,
         drones: sortedDrones,
         title: cluster.type === 'cluster'
-          ? `Leader ${formatDroneLabel(leaderDrone?.hw_id || cluster.leaderId, 'Drone')}`
-          : 'Attention Required',
+          ? `${leaderIdentity} cluster`
+          : 'Needs review',
         subtitle: cluster.type === 'cluster'
-          ? `${formatShowSlotLabel(leaderDrone?.pos_id || cluster.leaderId, 'Show Slot')} cluster`
+          ? `Top-leader cluster · ${counts.total} drone${counts.total === 1 ? '' : 's'}`
           : 'Assignments that cannot be executed safely until corrected',
         counts,
       };
@@ -675,6 +682,61 @@ export function calculateClusterPlotData(assignments = [], configData = [], clus
     title: cluster.title,
     description: cluster.subtitle,
   };
+}
+
+export function buildClusterScopeOptions(clusters = [], fallbackTotal = 0) {
+  const executableClusters = clusters.filter((cluster) => cluster.type === 'cluster');
+  const attentionCluster = clusters.find((cluster) => cluster.type === 'attention') || null;
+  const totalDrones = fallbackTotal || clusters.reduce((sum, cluster) => sum + (cluster.counts?.total || cluster.drones?.length || 0), 0);
+
+  const options = [
+    {
+      id: 'all',
+      label: 'All drones',
+      description: executableClusters.length > 0
+        ? `${executableClusters.length} detected cluster${executableClusters.length === 1 ? '' : 's'}`
+        : 'Entire fleet scope',
+      count: totalDrones,
+    },
+  ];
+
+  executableClusters.forEach((cluster) => {
+    const leaderDrone = cluster.drones.find((drone) => drone.role === 'topLeader') || cluster.drones[0] || null;
+    const leaderIdentity = leaderDrone
+      ? formatCompactDroneIdentity(leaderDrone.pos_id, leaderDrone.hw_id, cluster.title)
+      : cluster.title;
+    options.push({
+      id: String(cluster.id),
+      label: leaderDrone ? `${leaderIdentity} cluster` : cluster.title,
+      description: leaderDrone
+        ? `Top-leader cluster rooted at ${leaderIdentity}. ${cluster.subtitle}`
+        : cluster.subtitle,
+      count: cluster.counts?.total || cluster.drones.length,
+    });
+  });
+
+  if (attentionCluster) {
+    options.push({
+      id: 'attention',
+      label: 'Needs review',
+      description: attentionCluster.subtitle,
+      count: attentionCluster.counts?.total || attentionCluster.drones.length,
+    });
+  }
+
+  return options;
+}
+
+export function filterClustersByScope(clusters = [], scopeId = 'all') {
+  if (!scopeId || scopeId === 'all') {
+    return clusters;
+  }
+
+  if (scopeId === 'attention') {
+    return clusters.filter((cluster) => cluster.type === 'attention');
+  }
+
+  return clusters.filter((cluster) => String(cluster.id) === String(scopeId));
 }
 
 export function toSwarmApiPayload(assignments = []) {

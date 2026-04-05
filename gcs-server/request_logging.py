@@ -4,16 +4,17 @@ from __future__ import annotations
 
 _ROUTINE_SUCCESS_PATHS = {
     "/api/logs/sources",
-    "/api/telemetry",
-    "/commands/recent",
-    "/drone-heartbeat",
-    "/get-config-data",
-    "/get-heartbeats",
-    "/get-origin",
-    "/git-status",
+    "/api/v1/git/status",
+    "/api/v1/fleet/telemetry",
+    "/api/v1/origin",
+    "/api/v1/commands/active",
+    "/api/v1/commands/recent",
+    "/api/v1/command-reports/execution-result",
+    "/api/v1/command-reports/execution-start",
+    "/api/v1/fleet/heartbeats",
+    "/api/v1/config/fleet",
     "/health",
     "/ping",
-    "/telemetry",
 }
 
 
@@ -22,10 +23,7 @@ def is_routine_success_path(path: str) -> bool:
     if path in _ROUTINE_SUCCESS_PATHS:
         return True
 
-    if path == "/command/execution-result":
-        return True
-
-    if path.startswith("/command/"):
+    if path.startswith("/api/v1/commands/") and path != "/api/v1/commands/statistics":
         return True
 
     if path == "/api/logs/stream":

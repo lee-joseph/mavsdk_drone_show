@@ -1,12 +1,13 @@
 import React, { useEffect, useRef } from 'react';
 import CytoscapeComponent from 'react-cytoscapejs';
+import { formatCompactDroneIdentity } from '../utilities/missionIdentityUtils';
 import '../styles/DroneGraph.css';
 
 function buildGraphElements(drones) {
   const nodes = drones.map((drone) => ({
     data: {
       id: drone.hw_id,
-      label: `D${drone.hw_id}\nS${drone.pos_id}`,
+      label: formatCompactDroneIdentity(drone.pos_id, drone.hw_id, `H${drone.hw_id}`),
       role: drone.role,
       warningState: drone.hasWarnings ? 'attention' : 'clear',
       roleSwapState: drone.isRoleSwap ? 'swap' : 'native',
@@ -49,19 +50,15 @@ function DroneGraph({ swarmData, selectedDroneId, onSelectDrone }) {
   const cyRef = useRef(null);
 
   const graphElements = buildGraphElements(swarmData);
-  const graphDataKey = swarmData
-    .map((drone) => `${drone.hw_id}:${drone.pos_id}:${drone.follow}:${drone.frame}:${drone.role}:${drone.hasWarnings ? 1 : 0}`)
-    .join('|');
-  const topLeaderIds = swarmData
-    .filter((drone) => drone.role === 'topLeader')
-    .map((drone) => drone.hw_id);
-  const topLeaderKey = topLeaderIds.join('|');
 
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) {
       return undefined;
     }
+    const topLeaderIds = swarmData
+      .filter((drone) => drone.role === 'topLeader')
+      .map((drone) => drone.hw_id);
 
     cy.batch(() => {
       cy.elements().remove();
@@ -81,7 +78,7 @@ function DroneGraph({ swarmData, selectedDroneId, onSelectDrone }) {
     cy.fit(undefined, 36);
 
     return undefined;
-  }, [graphDataKey, topLeaderKey]);
+  }, [graphElements, swarmData]);
 
   useEffect(() => {
     const cy = cyRef.current;
@@ -121,12 +118,12 @@ function DroneGraph({ swarmData, selectedDroneId, onSelectDrone }) {
         'border-width': 2,
         'border-color': '#8abfff',
         'label': 'data(label)',
-        'font-size': 12,
+        'font-size': 11,
         'font-weight': 700,
         'text-valign': 'center',
         'text-halign': 'center',
         'text-wrap': 'wrap',
-        'text-max-width': 64,
+        'text-max-width': 66,
         'color': '#f7fbff',
         'transition-property': 'background-color, border-color, border-width, width, height',
         'transition-duration': '150ms',

@@ -16,9 +16,15 @@ This document defines the official field naming convention for all drone telemet
 
 ### Identity
 - `hw_id` - Hardware ID (string)
-- `pos_id` - Position ID (integer, 0-based)
+- `pos_id` - Position ID (integer, 1-based)
 - `detected_pos_id` - Auto-detected position ID
 - `ip` - Drone IP address
+
+### Operator Shorthand
+- `Pn|Hm` - Compact operator identity used on dense control surfaces.
+- Example: `P3|H7` means Position ID `3` and Hardware ID `7`.
+- Use compact notation for cards, clusters, selectors, and plots where both slot ownership and physical airframe identity matter at a glance.
+- Keep edit forms and deep technical views explicit with full labels `Position ID` and `Hardware ID`.
 
 ### Position & Navigation
 - `position_lat` - Latitude (degrees)
@@ -127,7 +133,7 @@ const DroneComponent = ({ drone }) => {
 import useNormalizedTelemetry from '../hooks/useNormalizedTelemetry';
 
 const DroneList = () => {
-  const { data, error, loading } = useNormalizedTelemetry('/telemetry', 1000);
+  const { data, error, loading } = useNormalizedTelemetry('/api/v1/fleet/telemetry', 1000);
 
   if (loading) return <div>Loading...</div>;
 
@@ -164,9 +170,9 @@ All endpoints return snake_case field names:
 
 | Endpoint | Returns | Format |
 |----------|---------|--------|
-| `/telemetry` | All drone telemetry | `{ "1": {...}, "2": {...} }` |
-| `/get-heartbeats` | Heartbeat status | `{ heartbeats: [...] }` |
-| `/git-status` | Git sync status | `{ git_status: {...} }` |
+| `/api/v1/fleet/telemetry` | All drone telemetry | `{ telemetry: {"1": {...}}, total_drones, online_drones }` |
+| `/api/v1/fleet/heartbeats` | Heartbeat status | `{ heartbeats: [...] }` |
+| `/api/v1/git/status` | Git sync status | `{ git_status: {...}, gcs_status: {...} }` |
 
 ---
 

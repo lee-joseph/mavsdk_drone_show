@@ -1,7 +1,12 @@
 // src/utilities/TrajectoryStorage.js
-// PHASE 2: Professional save/load functionality with validation and backup
 
-import { validateWaypointSequence, calculateTrajectoryStats } from './SpeedCalculator';
+import {
+  ALTITUDE_REFERENCE,
+  TIMING_MODES,
+  validateWaypointSequence,
+  calculateTrajectoryStats,
+} from './SpeedCalculator';
+import { TRAJECTORY_ALTITUDE_POLICY } from '../constants/trajectoryMissionPolicy';
 
 /**
  * TrajectoryStorage - Professional trajectory persistence
@@ -25,9 +30,15 @@ export class TrajectoryStorage {
    */
   async saveTrajectory(name, waypoints, metadata = {}) {
     try {
+      const normalizedName = String(name || '').trim();
+
+      if (!normalizedName) {
+        throw new Error('Trajectory name is required');
+      }
+
       const trajectoryData = {
         id: this.generateId(),
-        name: name.trim(),
+        name: normalizedName,
         waypoints: this.sanitizeWaypoints(waypoints),
         metadata: {
           ...metadata,
@@ -49,7 +60,7 @@ export class TrajectoryStorage {
       const existingTrajectories = this.getAllTrajectories();
       
       // Check if name already exists
-      const existingIndex = existingTrajectories.findIndex(t => t.name === name);
+      const existingIndex = existingTrajectories.findIndex(t => t.name === normalizedName);
       
       if (existingIndex >= 0) {
         // Update existing
@@ -77,7 +88,6 @@ export class TrajectoryStorage {
       };
 
     } catch (error) {
-      console.error('Save trajectory error:', error);
       return {
         success: false,
         error: error.message
@@ -103,7 +113,10 @@ export class TrajectoryStorage {
       // Validate loaded trajectory
       const validation = this.validateTrajectoryData(trajectory);
       if (!validation.valid) {
-        console.warn('Loaded trajectory has validation issues:', validation.issues);
+        trajectory.metadata = {
+          ...trajectory.metadata,
+          validationIssues: validation.issues,
+        };
       }
 
       // Update last accessed
@@ -116,7 +129,6 @@ export class TrajectoryStorage {
       };
 
     } catch (error) {
-      console.error('Load trajectory error:', error);
       return {
         success: false,
         error: error.message
@@ -132,7 +144,6 @@ export class TrajectoryStorage {
       const data = this.getStorageData(this.storageKey);
       return data?.trajectories || [];
     } catch (error) {
-      console.error('Get trajectories error:', error);
       return [];
     }
   }
@@ -164,7 +175,6 @@ export class TrajectoryStorage {
       };
 
     } catch (error) {
-      console.error('Delete trajectory error:', error);
       return {
         success: false,
         error: error.message
@@ -182,31 +192,7 @@ export class TrajectoryStorage {
         throw new Error(result.error);
       }
 
-      const trajectory = result.trajectory;
-      let content, filename, mimeType;
-
-      switch (format.toLowerCase()) {
-        case 'json':
-          content = JSON.stringify(trajectory, null, 2);
-          filename = `${trajectory.name.replace(/[^a-z0-9]/gi, '_')}.json`;
-          mimeType = 'application/json';
-          break;
-
-        case 'csv':
-          content = this.convertToCSV(trajectory.waypoints);
-          filename = `${trajectory.name.replace(/[^a-z0-9]/gi, '_')}.csv`;
-          mimeType = 'text/csv';
-          break;
-
-        case 'kml':
-          content = this.convertToKML(trajectory);
-          filename = `${trajectory.name.replace(/[^a-z0-9]/gi, '_')}.kml`;
-          mimeType = 'application/vnd.google-earth.kml+xml';
-          break;
-
-        default:
-          throw new Error(`Unsupported export format: ${format}`);
-      }
+      const { content, filename, mimeType } = this.buildExportFile(result.trajectory, format);
 
       // Create download
       this.downloadFile(content, filename, mimeType);
@@ -217,12 +203,52 @@ export class TrajectoryStorage {
       };
 
     } catch (error) {
-      console.error('Export trajectory error:', error);
       return {
         success: false,
         error: error.message
       };
     }
+  }
+
+  /**
+   * Export the current in-memory planner trajectory without requiring a prior save.
+   */
+  async exportCurrentTrajectory(name, waypoints, format = 'json', metadata = {}) {
+    try {
+      const normalizedName = String(name || '').trim() || 'trajectory';
+      const trajectory = {
+        id: this.generateId(),
+        name: normalizedName,
+        waypoints: this.sanitizeWaypoints(waypoints),
+        metadata: {
+          exportedAt: Date.now(),
+          version: this.version,
+          ...metadata,
+        },
+      };
+
+      const { content, filename, mimeType } = this.buildExportFile(trajectory, format);
+      this.downloadFile(content, filename, mimeType);
+
+      return {
+        success: true,
+        message: `Trajectory exported as ${format.toUpperCase()}`
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
+  }
+
+  buildPersistenceSignature(name, waypoints = []) {
+    const normalizedName = String(name || '').trim();
+
+    return JSON.stringify({
+      name: normalizedName,
+      waypoints: this.sanitizeWaypoints(waypoints),
+    });
   }
 
   /**
@@ -262,18 +288,19 @@ export class TrajectoryStorage {
         modifiedAt: Date.now(),
         version: this.version
       };
-
-      // Save imported trajectory
-      const saveResult = await this.saveTrajectory(trajectoryData.name, trajectoryData.waypoints, trajectoryData.metadata);
+      const existingTrajectory = this.getAllTrajectories().find(
+        (trajectory) => trajectory.name === trajectoryData.name
+      );
       
       return {
-        success: saveResult.success,
+        success: true,
         trajectory: trajectoryData,
-        message: saveResult.success ? 'Trajectory imported successfully' : saveResult.error
+        nameConflict: Boolean(existingTrajectory),
+        existingTrajectoryId: existingTrajectory?.id || '',
+        message: 'Trajectory imported into planner draft'
       };
 
     } catch (error) {
-      console.error('Import trajectory error:', error);
       return {
         success: false,
         error: error.message
@@ -298,7 +325,6 @@ export class TrajectoryStorage {
       
       return { success: true };
     } catch (error) {
-      console.warn('Auto-save failed:', error);
       return { success: false, error: error.message };
     }
   }
@@ -321,7 +347,6 @@ export class TrajectoryStorage {
       
       return { success: true };
     } catch (error) {
-      console.warn('Backup creation failed:', error);
       return { success: false, error: error.message };
     }
   }
@@ -337,8 +362,7 @@ export class TrajectoryStorage {
     try {
       const data = JSON.stringify(this.getStorageData(this.storageKey) || {});
       storageUsed = new Blob([data]).size;
-    } catch (error) {
-      console.warn('Storage size calculation failed:', error);
+    } catch {
     }
 
     return {
@@ -386,7 +410,7 @@ export class TrajectoryStorage {
    * CORE FLIGHT DATA:
    * - heading: 0-360° aviation standard (000° = North)
    * - headingMode: 'auto' or 'manual' (single source of truth)
-   * - calculatedHeading: what auto heading would be (for UI display)
+   * - calculatedHeading: auto heading for the arrival leg (for UI display)
    * 
    * BACKWARDS COMPATIBILITY:
    * - Automatically converts old 'yaw'/'yawMode' fields
@@ -400,9 +424,15 @@ export class TrajectoryStorage {
       latitude: Number(wp.latitude),
       longitude: Number(wp.longitude),
       altitude: Number(wp.altitude),
+      altitudeReference: wp.altitudeReference || ALTITUDE_REFERENCE.MSL,
+      targetAgl: Number(wp.targetAgl || 0),
       timeFromStart: Number(wp.timeFromStart || wp.time || 0),
+      timingMode: wp.timingMode || TIMING_MODES.MANUAL_TIME,
+      preferredSpeed: Number(wp.preferredSpeed || 0),
       estimatedSpeed: Number(wp.estimatedSpeed || 0),
       speedFeasible: Boolean(wp.speedFeasible),
+      groundElevation: Number(wp.groundElevation || 0),
+      terrainAccurate: wp.terrainAccurate !== false,
       
       // AVIATION STANDARD HEADING DATA (clean, single source of truth)
       heading: wp.heading !== undefined ? Number(wp.heading) : (wp.yaw !== undefined ? Number(wp.yaw) : 0),
@@ -424,7 +454,14 @@ export class TrajectoryStorage {
       'TimeFromStart_s', 
       'EstimatedSpeed_ms', 
       'Heading_deg',        // Aviation standard: 0-360°
-      'HeadingMode'         // 'auto' or 'manual' - single source of truth
+      'HeadingMode',        // 'auto' or 'manual' - single source of truth
+      'AltitudeReference',
+      'TargetAgl_m',
+      'GroundElevation_m',
+      'TerrainAccurate',
+      'TimingMode',
+      'PreferredSpeed_ms',
+      'CalculatedHeading_deg'
     ];
     
     const rows = waypoints.map(wp => [
@@ -435,7 +472,14 @@ export class TrajectoryStorage {
       (wp.timeFromStart || 0).toFixed(1),
       (wp.estimatedSpeed || 0).toFixed(1),
       (wp.heading || wp.yaw || 0).toFixed(1), // Backwards compatibility with old 'yaw' field
-      wp.headingMode || wp.yawMode || 'auto'  // Backwards compatibility with old 'yawMode' field
+      wp.headingMode || wp.yawMode || 'auto', // Backwards compatibility with old 'yawMode' field
+      wp.altitudeReference || ALTITUDE_REFERENCE.MSL,
+      Number(wp.targetAgl || 0).toFixed(1),
+      Number(wp.groundElevation || 0).toFixed(1),
+      wp.terrainAccurate !== false ? 'true' : 'false',
+      wp.timingMode || TIMING_MODES.MANUAL_TIME,
+      Number(wp.preferredSpeed || 0).toFixed(1),
+      Number(wp.calculatedHeading || 0).toFixed(1),
     ]);
 
     return [headers, ...rows].map(row => row.join(',')).join('\n');
@@ -472,28 +516,86 @@ export class TrajectoryStorage {
 </kml>`;
   }
 
+  buildExportFile(trajectory, format = 'json') {
+    const safeName = (trajectory.name || 'trajectory').replace(/[^a-z0-9]/gi, '_');
+
+    switch (format.toLowerCase()) {
+      case 'json':
+        return {
+          content: JSON.stringify(trajectory, null, 2),
+          filename: `${safeName}.json`,
+          mimeType: 'application/json',
+        };
+      case 'csv':
+        return {
+          content: this.convertToCSV(trajectory.waypoints),
+          filename: `${safeName}.csv`,
+          mimeType: 'text/csv',
+        };
+      case 'kml':
+        return {
+          content: this.convertToKML(trajectory),
+          filename: `${safeName}.kml`,
+          mimeType: 'application/vnd.google-earth.kml+xml',
+        };
+      default:
+        throw new Error(`Unsupported export format: ${format}`);
+    }
+  }
+
   /**
    * Parse CSV content to trajectory data
    */
   parseCSV(content, filename) {
-    const lines = content.trim().split('\n');
-    const headers = lines[0].split(',').map(h => h.trim());
+    const lines = content.trim().split('\n').filter((line) => line.trim().length > 0);
+    const headers = (lines[0] || '').split(',').map((value) => value.trim());
+    const headerIndex = new Map(headers.map((header, index) => [header, index]));
+    const readValue = (values, headerName, fallbackIndex, fallbackValue = '') => {
+      const index = headerIndex.get(headerName);
+
+      if (index !== undefined) {
+        return values[index] ?? fallbackValue;
+      }
+
+      return values[fallbackIndex] ?? fallbackValue;
+    };
+    const normalizeAltitudeReference = (value) =>
+      String(value || '').toLowerCase() === ALTITUDE_REFERENCE.AGL ? ALTITUDE_REFERENCE.AGL : ALTITUDE_REFERENCE.MSL;
+    const normalizeTimingMode = (value) =>
+      String(value || '').toLowerCase() === TIMING_MODES.AUTO_SPEED ? TIMING_MODES.AUTO_SPEED : TIMING_MODES.MANUAL_TIME;
+    const normalizeHeadingMode = (value) =>
+      String(value || '').toLowerCase() === 'manual' ? 'manual' : 'auto';
     
     const waypoints = lines.slice(1).map((line, index) => {
       const values = line.split(',').map(v => v.trim());
+      const altitudeReference = normalizeAltitudeReference(readValue(values, 'AltitudeReference', 8, ALTITUDE_REFERENCE.MSL));
+      const targetAgl = parseFloat(readValue(values, 'TargetAgl_m', 9, '0')) || 0;
+      const groundElevation = parseFloat(readValue(values, 'GroundElevation_m', 10, '0')) || 0;
+      const terrainAccurateRaw = readValue(values, 'TerrainAccurate', 11, 'true');
+      const terrainAccurate = String(terrainAccurateRaw).toLowerCase() !== 'false';
+      const timingMode = normalizeTimingMode(readValue(values, 'TimingMode', 12, TIMING_MODES.MANUAL_TIME));
+      const preferredSpeed = parseFloat(readValue(values, 'PreferredSpeed_ms', 13, '0')) || 0;
+      const calculatedHeading = parseFloat(readValue(values, 'CalculatedHeading_deg', 14, '0')) || 0;
+
       return {
         id: `waypoint-${Date.now()}-${index}`,
-        name: values[0] || `Waypoint ${index + 1}`,
-        latitude: parseFloat(values[1]) || 0,
-        longitude: parseFloat(values[2]) || 0,
-        altitude: parseFloat(values[3]) || 100,
-        timeFromStart: parseFloat(values[4]) || 0,
-        estimatedSpeed: parseFloat(values[5]) || 0,
+        name: readValue(values, 'Name', 0, `Waypoint ${index + 1}`) || `Waypoint ${index + 1}`,
+        latitude: parseFloat(readValue(values, 'Latitude', 1, '0')) || 0,
+        longitude: parseFloat(readValue(values, 'Longitude', 2, '0')) || 0,
+        altitude: parseFloat(readValue(values, 'Altitude_MSL_m', 3, String(TRAJECTORY_ALTITUDE_POLICY.DEFAULT_MSL))) || TRAJECTORY_ALTITUDE_POLICY.DEFAULT_MSL,
+        altitudeReference,
+        targetAgl,
+        groundElevation,
+        terrainAccurate,
+        timeFromStart: parseFloat(readValue(values, 'TimeFromStart_s', 4, '0')) || 0,
+        timingMode,
+        preferredSpeed,
+        estimatedSpeed: parseFloat(readValue(values, 'EstimatedSpeed_ms', 5, '0')) || 0,
         speedFeasible: true,
         // Aviation standard heading data with backwards compatibility
-        heading: values[6] !== undefined ? parseFloat(values[6]) || 0 : 0,
-        headingMode: values[7] || 'auto',
-        calculatedHeading: 0 // Will be recalculated
+        heading: parseFloat(readValue(values, 'Heading_deg', 6, '0')) || 0,
+        headingMode: normalizeHeadingMode(readValue(values, 'HeadingMode', 7, 'auto')),
+        calculatedHeading,
       };
     });
 
@@ -514,8 +616,7 @@ export class TrajectoryStorage {
     try {
       const data = localStorage.getItem(key);
       return data ? JSON.parse(data) : null;
-    } catch (error) {
-      console.warn('Storage read error:', error);
+    } catch {
       return null;
     }
   }
@@ -542,7 +643,6 @@ export class TrajectoryStorage {
     // Remove old autosaves
     this.cleanupAutoSaves();
     
-    console.warn('Storage quota exceeded - cleaned up old data');
   }
 
   /**

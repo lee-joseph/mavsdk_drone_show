@@ -127,6 +127,8 @@ This does all of the following:
 - preserves PX4 provenance metadata
 - tags the image as `latest`, the release tag, and the baked commit tag
 - exports a stable archive basename
+- streams `docker save` directly into `7z` by default when the raw tar is not
+  meant to be retained, so packaging stays viable on disk-constrained VPS hosts
 - verifies the resulting `.7z`
 - writes checksum and manifest files
 
@@ -204,6 +206,27 @@ Typical release flow:
 3. update or replace the public shared link
 4. remove obsolete release artifacts you no longer want to keep
 5. update the public docs link only after the new upload is confirmed
+
+The repo now includes a helper for the publish step:
+
+```bash
+bash tools/publish_sitl_release_to_mega.sh \
+  --artifact-dir /path/to/release-dir \
+  --mega-target /Root/mavsdk-drone-show-sitl \
+  --replace-existing \
+  --json
+```
+
+Recommended auth order:
+
+1. reuse an existing MEGAcmd session
+2. or log in with a reusable session string via `mega-session`
+3. only use raw email/password stdin fallback when session reuse is unavailable
+
+Why:
+- the official `mega-login` command accepts `email password` or `session`
+- session reuse avoids putting raw account credentials into the scripted workflow
+- the helper keeps release metadata configurable (`repo`, `branch`, `version`, `commit`, target folder, archive basename) so both operators and AI agents can run the same flow without hardcoded account-specific values
 
 If you maintain your own customer distribution, document:
 - which tag is the approved release

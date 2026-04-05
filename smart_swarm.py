@@ -103,6 +103,7 @@ import navpy
 import numpy as np  # Added for numerical computations
 
 from src.drone_config import ConfigLoader
+from src.drone_api_routes import DRONE_STATE_ROUTE
 from src.led_controller import LEDController
 from src.params import Params
 import aiohttp 
@@ -539,7 +540,7 @@ async def refresh_swarm_config_from_gcs(logger, source_label: str, session: Opti
     Returns True when the GCS snapshot was fetched and applied, False when the
     local swarm file remains in effect.
     """
-    state_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/get-swarm-data"
+    state_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/api/v1/config/swarm"
     owns_session = session is None
     active_session = session
 
@@ -551,6 +552,9 @@ async def refresh_swarm_config_from_gcs(logger, source_label: str, session: Opti
         async with active_session.get(state_url) as resp:
             resp.raise_for_status()
             api_data = await resp.json()
+
+        if isinstance(api_data, dict) and isinstance(api_data.get("assignments"), list):
+            api_data = api_data["assignments"]
 
         replace_swarm_config(
             api_data,
@@ -873,7 +877,7 @@ async def update_leader_state():
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
-                state_url = f"http://{LEADER_IP}:{Params.drone_api_port}/{Params.get_drone_state_URI}"
+                state_url = f"http://{LEADER_IP}:{Params.drone_api_port}{DRONE_STATE_ROUTE}"
                 async with session.get(state_url) as response:
                     if response.status != 200:
                         raise aiohttp.ClientResponseError(
@@ -1032,17 +1036,16 @@ async def notify_gcs_of_leader_change(new_leader_hw_id) -> bool:
     logger = logging.getLogger(__name__)
 
     gcs_ip = Params.GCS_IP
-    notify_url = f"http://{gcs_ip}:{Params.gcs_api_port}/request-new-leader"
+    notify_url = f"http://{gcs_ip}:{Params.gcs_api_port}/api/v1/config/swarm/assignments/{int(HW_ID)}"
 
     payload = {
-        'hw_id':       int(HW_ID),
         'follow':      int(new_leader_hw_id),
     }
 
     try:
         timeout = aiohttp.ClientTimeout(total=Params.SMART_SWARM_GCS_NOTIFY_TIMEOUT_SEC)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(notify_url, json=payload) as resp:
+            async with session.patch(notify_url, json=payload) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
                 if data.get('status') == 'success':

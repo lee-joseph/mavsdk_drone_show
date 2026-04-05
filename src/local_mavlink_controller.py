@@ -36,8 +36,13 @@ class LocalMavlinkController:
             'STATUSTEXT'
         ]
         
-        # Create a Mavlink connection using the provided local Mavlink port
-        self.mav = mavutil.mavlink_connection(f"udp:localhost:{params.local_mavlink_port}")
+        self.local_mavlink_port = int(getattr(params, 'local_mavlink_port', 12550))
+        self.local_mavlink_timeout_sec = max(1, int(getattr(params, 'LOCAL_MAVLINK_TIMEOUT_SEC', 5)))
+        self.local_mavlink_reconnect_after_timeouts = max(
+            1,
+            int(getattr(params, 'LOCAL_MAVLINK_RECONNECT_AFTER_TIMEOUTS', 3)),
+        )
+        self.mav = self._open_mavlink_connection()
         self.drone_config = drone_config
         self.local_mavlink_refresh_interval = params.local_mavlink_refresh_interval
         self.require_global_position = bool(getattr(params, 'REQUIRE_GLOBAL_POSITION', False))
@@ -50,6 +55,26 @@ class LocalMavlinkController:
         self.home_position_logged = False
         self._status_text_buffers: Dict[int, Dict[str, Any]] = {}
         self._status_messages: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+
+    def _open_mavlink_connection(self):
+        """Open a fresh UDP listener for the locally routed MAVLink stream."""
+        connection_string = f"udpin:127.0.0.1:{self.local_mavlink_port}"
+        self.log_debug(f"Opening LocalMavlinkController on {connection_string}")
+        return mavutil.mavlink_connection(connection_string)
+
+    def _reset_mavlink_connection(self, reason: str) -> None:
+        """Close and reopen the local MAVLink listener after repeated silence/errors."""
+        try:
+            self.mav.close()
+        except Exception:
+            pass
+
+        self.mav = self._open_mavlink_connection()
+        logging.warning(
+            "Reinitialized local MAVLink listener on port %s after %s.",
+            self.local_mavlink_port,
+            reason,
+        )
 
     def log_debug(self, message):
         """Logs a debug message if debugging is enabled."""
@@ -70,13 +95,41 @@ class LocalMavlinkController:
         """
         Continuously monitor for incoming Mavlink messages and process them.
         """
+        consecutive_timeouts = 0
+
         while self.run_telemetry_thread.is_set():
-            msg = self.mav.recv_match(type=self.message_filter, blocking=True, timeout=5)  # 5-second timeout
+            try:
+                msg = self.mav.recv_match(
+                    type=self.message_filter,
+                    blocking=True,
+                    timeout=self.local_mavlink_timeout_sec,
+                )
+            except Exception as exc:
+                logging.warning("Local MAVLink receive error: %s", exc)
+                consecutive_timeouts = 0
+                self._reset_mavlink_connection(f"receive error ({type(exc).__name__})")
+                continue
+
             if msg is not None:
+                if consecutive_timeouts > 0:
+                    logging.info(
+                        "Local MAVLink telemetry restored after %s timeout(s).",
+                        consecutive_timeouts,
+                    )
+                    consecutive_timeouts = 0
                 self.process_message(msg)
                 self.latest_messages[msg.get_type()] = msg
-            else:
+                continue
+
+            consecutive_timeouts += 1
+            if consecutive_timeouts == 1:
                 logging.warning('No MAVLink message received within timeout period')
+
+            if consecutive_timeouts >= self.local_mavlink_reconnect_after_timeouts:
+                self._reset_mavlink_connection(
+                    f"{consecutive_timeouts} consecutive timeouts",
+                )
+                consecutive_timeouts = 0
 
     def process_message(self, msg):
         """
@@ -383,6 +436,17 @@ class LocalMavlinkController:
             self.drone_config.preflight_last_update = now_ms
             return
 
+        px4_blockers = [
+            self._build_message('px4', message['severity'], message['message'], message['timestamp'])
+            for message in recent_status_messages
+            if message.get('category') == 'preflight' and message.get('blocks_readiness')
+        ]
+        px4_warnings = [
+            self._build_message('px4', message['severity'], message['message'], message['timestamp'])
+            for message in recent_status_messages
+            if message.get('category') == 'preflight' and not message.get('blocks_readiness')
+        ]
+
         system_ready = self.drone_config.system_status >= mavutil.mavlink.MAV_STATE_STANDBY
         imu_sensors_ready = (
             self.drone_config.is_gyrometer_calibration_ok and
@@ -402,7 +466,7 @@ class LocalMavlinkController:
         mode_requires_gps = self.drone_config.custom_mode in gps_dependent_modes
         takeoff_requires_gps = not bool(getattr(self.drone_config, 'is_armed', False))
         gps_required = bool(getattr(self, 'require_global_position', False)) or takeoff_requires_gps or mode_requires_gps
-        home_ready = bool(getattr(self.drone_config, 'home_position', None))
+        home_ready = bool(getattr(self.drone_config, 'px4_home_position_set', False))
 
         if gps_required:
             gps_ready = gps_fix_ok and self.drone_config.hdop > 0 and self.drone_config.hdop < 2.0
@@ -410,23 +474,39 @@ class LocalMavlinkController:
             gps_ready = True
 
         sensors_ready = imu_sensors_ready and mag_ready
-        px4_blockers = [
-            self._build_message('px4', message['severity'], message['message'], message['timestamp'])
-            for message in recent_status_messages
-            if message.get('category') == 'preflight' and message.get('blocks_readiness')
-        ]
-        px4_warnings = [
-            self._build_message('px4', message['severity'], message['message'], message['timestamp'])
-            for message in recent_status_messages
-            if message.get('category') == 'preflight' and not message.get('blocks_readiness')
-        ]
+
+        has_strong_live_signal = any([
+            bool(getattr(self.drone_config, 'base_mode', 0)),
+            bool(getattr(self.drone_config, 'custom_mode', 0)),
+            bool(getattr(self.drone_config, 'px4_home_position_set', False)),
+            getattr(self.drone_config, 'gps_fix_type', 0) >= 3,
+        ])
+        system_state_name = self._get_system_status_name(self.drone_config.system_status)
+        system_state_advisory = None
+        system_ready_effective = system_ready
+        if (
+            not system_ready
+            and self.drone_config.system_status == mavutil.mavlink.MAV_STATE_UNINIT
+            and has_strong_live_signal
+            and len(px4_blockers) == 0
+        ):
+            system_ready_effective = True
+            system_state_advisory = self._build_message(
+                'telemetry',
+                'warning',
+                (
+                    f"Vehicle system state reports {system_state_name}, but PX4 preflight is healthy and "
+                    "live telemetry is present. Treating the MAVLink system-state field as advisory."
+                ),
+                now_ms,
+            )
 
         heuristic_blockers: List[Dict[str, Any]] = []
-        if not system_ready:
+        if not system_ready and not system_state_advisory:
             heuristic_blockers.append(self._build_message(
                 'telemetry',
                 'error',
-                f"Vehicle system state is {self._get_system_status_name(self.drone_config.system_status)}; not yet ready for arming.",
+                f"Vehicle system state is {system_state_name}; not yet ready for arming.",
                 now_ms,
             ))
         if not imu_sensors_ready:
@@ -460,6 +540,8 @@ class LocalMavlinkController:
             ))
 
         heuristic_warnings: List[Dict[str, Any]] = []
+        if system_state_advisory:
+            heuristic_warnings.append(system_state_advisory)
         if not gps_required and getattr(self.drone_config, 'gps_fix_type', 0) < 3:
             heuristic_warnings.append(self._build_message(
                 'telemetry',
@@ -474,8 +556,13 @@ class LocalMavlinkController:
             {
                 'id': 'system',
                 'label': 'Vehicle status',
-                'ready': system_ready,
-                'detail': f"PX4 system state: {self._get_system_status_name(self.drone_config.system_status)}",
+                'ready': system_ready_effective,
+                'detail': (
+                    f"PX4 system state: {system_state_name} "
+                    "(treated as advisory because live PX4 preflight is healthy)"
+                    if system_state_advisory else
+                    f"PX4 system state: {system_state_name}"
+                ),
             },
             {
                 'id': 'imu',
@@ -520,16 +607,26 @@ class LocalMavlinkController:
             },
         ]
 
-        self.drone_config.is_ready_to_arm = system_ready and sensors_ready and gps_ready and ((not gps_required) or home_ready) and not blockers
+        self.drone_config.is_ready_to_arm = (
+            system_ready_effective
+            and sensors_ready
+            and gps_ready
+            and ((not gps_required) or home_ready)
+            and not blockers
+        )
         if blockers:
             readiness_status = "blocked"
             readiness_summary = blockers[0]['message']
-        elif warnings:
+        elif warnings and not system_state_advisory:
             readiness_status = "warning"
             readiness_summary = warnings[0]['message']
         else:
             readiness_status = "ready"
-            readiness_summary = "Ready to fly"
+            readiness_summary = (
+                "Ready to fly with telemetry advisory"
+                if system_state_advisory else
+                "Ready to fly"
+            )
 
         self.drone_config.readiness_status = readiness_status
         self.drone_config.readiness_summary = readiness_summary
@@ -541,7 +638,7 @@ class LocalMavlinkController:
 
         self.log_debug(
             "Pre-arm checks: "
-            f"system={system_ready}, imu={imu_sensors_ready}, mag={mag_ready}, "
+            f"system={system_ready_effective} (raw={system_state_name}), imu={imu_sensors_ready}, mag={mag_ready}, "
             f"gps_required={gps_required}, gps_ready={gps_ready}, home_ready={home_ready} "
             f"(fix={getattr(self.drone_config, 'gps_fix_type', 0)}, hdop={self.drone_config.hdop}) "
             f"px4_blockers={len(px4_blockers)} -> ready={self.drone_config.is_ready_to_arm}"
@@ -670,6 +767,8 @@ class LocalMavlinkController:
                 'long': msg.longitude / 1E7,
                 'alt': msg.altitude / 1E3
             }
+            self.drone_config.px4_home_position_set = True
+            self.drone_config.home_position_source = 'px4'
 
             if not self.home_position_logged:
                 logging.info(f"Home position for drone {self.drone_config.hw_id} is set: {self.drone_config.home_position}")
@@ -725,7 +824,12 @@ class LocalMavlinkController:
 
             if self.drone_config.home_position is None:
                 self.drone_config.home_position = self.drone_config.position.copy()
-                logging.info(f"Home position for drone {self.drone_config.hw_id} is set to current position: {self.drone_config.home_position}")
+                self.drone_config.home_position_source = 'fallback_position'
+                logging.info(
+                    "Fallback home position cache for drone %s set from first global position sample: %s",
+                    self.drone_config.hw_id,
+                    self.drone_config.home_position,
+                )
         else:
             logging.error('Received GLOBAL_POSITION_INT message with invalid data')
 

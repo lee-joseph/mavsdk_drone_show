@@ -20,6 +20,7 @@ Last Updated: 2025-12-27
 
 import pytest
 import json
+import time
 import tempfile
 import os
 import signal
@@ -231,6 +232,20 @@ class TestHealthEndpoints:
         assert 'timestamp' in data
 
 
+class TestSwarmTrajectoryPolicyEndpoint:
+    """Test Swarm Trajectory runtime policy endpoint."""
+
+    def test_returns_runtime_policy_from_params(self, test_client):
+        response = test_client.get("/api/v1/swarm-trajectories/policy")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["policy"]["speed"]["absolute_max"] == pytest.approx(20.0)
+        assert payload["policy"]["timing"]["derived_time_step_s"] == pytest.approx(0.1)
+        assert payload["policy"]["terrain"]["default_safe_clearance_m"] >= payload["policy"]["terrain"]["min_safe_clearance_m"]
+
+
 class TestBackgroundTelemetryHelpers:
     """Test live telemetry shaping used by the FastAPI background poller."""
 
@@ -262,6 +277,39 @@ class TestBackgroundTelemetryHelpers:
         assert payload['heartbeat_first_seen'] == 1699999999000
         assert payload['heartbeat_network_info'] == {'reachable': True}
 
+    def test_build_background_telemetry_record_marks_stale_local_feed_unavailable(self):
+        from app_fastapi import _build_background_telemetry_record, last_heartbeats
+
+        stale_update_time = int(time.time()) - 45
+
+        with patch.dict(last_heartbeats, {
+            '2': {
+                'timestamp': 1700000001123,
+                'first_seen': 1700000000.0,
+                'network_info': {'reachable': True},
+            }
+        }, clear=True):
+            payload = _build_background_telemetry_record(
+                2,
+                '192.168.1.102',
+                {
+                    'hw_id': 2,
+                    'position_lat': 35.123456,
+                    'position_long': -120.654321,
+                    'position_alt': 488.5,
+                    'update_time': stale_update_time,
+                    'is_ready_to_arm': True,
+                    'readiness_status': 'ready',
+                    'readiness_summary': 'Ready to fly',
+                },
+            )
+
+        assert payload['telemetry_available'] is False
+        assert 'stale' in payload['telemetry_error'].lower()
+        assert payload['is_ready_to_arm'] is False
+        assert payload['readiness_status'] == 'unknown'
+        assert payload['preflight_blockers']
+
 
 # ============================================================================
 # Configuration Tests
@@ -271,8 +319,8 @@ class TestConfigurationEndpoints:
     """Test drone configuration endpoints"""
 
     def test_get_config(self, test_client, mock_config):
-        """Test GET /get-config-data"""
-        response = test_client.get("/get-config-data")
+        """Test GET /api/v1/config/fleet"""
+        response = test_client.get("/api/v1/config/fleet")
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
@@ -283,10 +331,10 @@ class TestConfigurationEndpoints:
     @patch('app_fastapi.save_config')
     @patch('app_fastapi.validate_and_process_config')
     def test_save_config(self, mock_validate, mock_save, test_client, mock_config):
-        """Test POST /save-config-data"""
+        """Test PUT /api/v1/config/fleet"""
         mock_validate.return_value = {'updated_config': mock_config}
 
-        response = test_client.post("/save-config-data", json=mock_config)
+        response = test_client.request("PUT", "/api/v1/config/fleet", json=mock_config)
         assert response.status_code == 200
         data = response.json()
         assert data['success'] == True
@@ -294,7 +342,7 @@ class TestConfigurationEndpoints:
 
     @patch('app_fastapi.validate_and_process_config')
     def test_validate_config(self, mock_validate, test_client, mock_config):
-        """Test POST /validate-config"""
+        """Test POST /api/v1/config/fleet/validation"""
         mock_validate.return_value = {
             'updated_config': mock_config,
             'summary': {
@@ -304,10 +352,17 @@ class TestConfigurationEndpoints:
             }
         }
 
-        response = test_client.post("/validate-config", json=mock_config)
+        response = test_client.post("/api/v1/config/fleet/validation", json=mock_config)
         assert response.status_code == 200
         data = response.json()
         assert 'summary' in data
+
+    def test_save_config_rejects_invalid_format(self, test_client):
+        """Test PUT /api/v1/config/fleet returns typed validation errors for invalid payload shape."""
+        response = test_client.request("PUT", "/api/v1/config/fleet", json={"not": "a-list"})
+        assert response.status_code == 422
+        assert response.json()['error'] == "Validation error"
+        assert response.json()['detail'][0]['type'] == "list_type"
 
 
 # ============================================================================
@@ -317,19 +372,9 @@ class TestConfigurationEndpoints:
 class TestTelemetryEndpoints:
     """Test telemetry endpoints"""
 
-    def test_get_telemetry_legacy(self, test_client, mock_telemetry_data):
-        """Test GET /telemetry (legacy endpoint)"""
-        response = test_client.get("/telemetry")
-        assert response.status_code == 200
-        assert 'x-mds-server-time' in response.headers
-        data = response.json()
-        assert isinstance(data, dict)
-        assert '1' in data
-        assert data['1']['battery_voltage'] == 12.6
-
     def test_get_telemetry_typed(self, test_client):
-        """Test GET /api/telemetry (typed endpoint)"""
-        response = test_client.get("/api/telemetry")
+        """Test GET /api/v1/fleet/telemetry (typed endpoint)."""
+        response = test_client.get("/api/v1/fleet/telemetry")
         assert response.status_code == 200
         assert 'x-mds-server-time' in response.headers
         data = response.json()
@@ -349,7 +394,7 @@ class TestHeartbeatEndpoints:
 
     @patch('app_fastapi.handle_heartbeat_post')
     def test_post_heartbeat(self, mock_handle, test_client):
-        """Test POST /heartbeat"""
+        """Test POST /api/v1/fleet/heartbeats"""
         heartbeat_data = {
             'pos_id': 0,
             'hw_id': '1',
@@ -359,7 +404,7 @@ class TestHeartbeatEndpoints:
             'timestamp': 1700000000000
         }
 
-        response = test_client.post("/heartbeat", json=heartbeat_data)
+        response = test_client.post("/api/v1/fleet/heartbeats", json=heartbeat_data)
         assert response.status_code == 200
         data = response.json()
         assert data['success'] == True
@@ -371,14 +416,14 @@ class TestHeartbeatEndpoints:
 
     @patch('app_fastapi.get_all_heartbeats')
     def test_get_heartbeats(self, mock_get_heartbeats, test_client):
-        """Test GET /get-heartbeats"""
+        """Test GET /api/v1/fleet/heartbeats"""
         # get_all_heartbeats returns a dict keyed by hw_id
         mock_get_heartbeats.return_value = {
             '1': {'pos_id': 0, 'hw_id': '1', 'detected_pos_id': 1, 'ip': 'unknown', 'timestamp': 1700000000000},
             '2': {'pos_id': 1, 'hw_id': '2', 'detected_pos_id': 2, 'ip': '172.18.0.22', 'timestamp': 1700000000000}
         }
 
-        response = test_client.get("/get-heartbeats")
+        response = test_client.get("/api/v1/fleet/heartbeats")
         assert response.status_code == 200
         data = response.json()
         assert 'heartbeats' in data
@@ -398,18 +443,30 @@ class TestOriginEndpoints:
 
     @patch('app_fastapi.load_origin')
     def test_get_origin(self, mock_load, test_client, mock_origin):
-        """Test GET /get-origin"""
+        """Test GET /api/v1/origin"""
         mock_load.return_value = mock_origin
 
-        response = test_client.get("/get-origin")
+        response = test_client.get("/api/v1/origin")
         assert response.status_code == 200
         data = response.json()
         assert data['lat'] == 35.123456
         assert data['lon'] == -120.654321
 
+    @patch('app_fastapi.load_origin')
+    def test_get_origin_v1(self, mock_load, test_client, mock_origin):
+        """Test GET /api/v1/origin"""
+        mock_load.return_value = mock_origin
+
+        response = test_client.get("/api/v1/origin")
+        assert response.status_code == 200
+        data = response.json()
+        assert data['lat'] == 35.123456
+        assert data['lon'] == -120.654321
+        assert data['source'] == 'manual'
+
     @patch('app_fastapi.save_origin')
     def test_set_origin(self, mock_save, test_client):
-        """Test POST /set-origin"""
+        """Test PUT /api/v1/origin"""
         # API uses short field names: lat, lon, alt
         origin_data = {
             'lat': 35.123456,
@@ -417,31 +474,142 @@ class TestOriginEndpoints:
             'alt': 488.0
         }
 
-        response = test_client.post("/set-origin", json=origin_data)
+        response = test_client.request("PUT", "/api/v1/origin", json=origin_data)
         assert response.status_code == 200
         data = response.json()
         assert data['lat'] == origin_data['lat']
 
+    @patch('app_fastapi.save_origin')
+    def test_put_origin_v1(self, mock_save, test_client):
+        """Test PUT /api/v1/origin"""
+        origin_data = {
+            'lat': 35.123456,
+            'lon': -120.654321,
+            'alt': 488.0,
+        }
+
+        response = test_client.request("PUT", "/api/v1/origin", json=origin_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert data['lat'] == origin_data['lat']
+        assert data['source'] == 'manual'
+
+    @patch('app_fastapi.save_origin')
+    def test_put_origin_v1_defaults_optional_altitude_to_zero(self, mock_save, test_client):
+        """Test PUT /api/v1/origin defaults missing altitude to zero."""
+        origin_data = {
+            'lat': 35.123456,
+            'lon': -120.654321,
+        }
+
+        response = test_client.request("PUT", "/api/v1/origin", json=origin_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert data['alt'] == 0.0
+        mock_save.assert_called_once()
+        saved_origin = mock_save.call_args.args[0]
+        assert saved_origin['alt'] == 0.0
+
     @patch('app_fastapi.load_origin')
     def test_get_gps_global_origin(self, mock_load, test_client, mock_origin):
-        """Test GET /get-gps-global-origin"""
+        """Test GET /api/v1/navigation/global-origin"""
         mock_load.return_value = mock_origin
 
-        response = test_client.get("/get-gps-global-origin")
+        response = test_client.get("/api/v1/navigation/global-origin")
+        assert response.status_code == 200
+        data = response.json()
+        assert data['has_origin'] == True
+
+    @patch('app_fastapi.load_origin')
+    def test_get_gps_global_origin_v1(self, mock_load, test_client, mock_origin):
+        """Test GET /api/v1/navigation/global-origin"""
+        mock_load.return_value = mock_origin
+
+        response = test_client.get("/api/v1/navigation/global-origin")
         assert response.status_code == 200
         data = response.json()
         assert data['has_origin'] == True
 
     @patch('app_fastapi.load_origin')
     def test_get_origin_for_drone(self, mock_load, test_client, mock_origin):
-        """Test GET /get-origin-for-drone"""
+        """Test GET /api/v1/origin/bootstrap"""
         mock_load.return_value = mock_origin
 
-        response = test_client.get("/get-origin-for-drone")
+        response = test_client.get("/api/v1/origin/bootstrap")
         assert response.status_code == 200
         data = response.json()
         assert data['lat'] == 35.123456
         assert data['source'] == 'manual'
+
+    @patch('app_fastapi.load_origin')
+    def test_get_origin_bootstrap_v1(self, mock_load, test_client, mock_origin):
+        """Test GET /api/v1/origin/bootstrap"""
+        mock_load.return_value = mock_origin
+
+        response = test_client.get("/api/v1/origin/bootstrap")
+        assert response.status_code == 200
+        data = response.json()
+        assert data['lat'] == 35.123456
+        assert data['source'] == 'manual'
+        assert isinstance(data['timestamp'], int)
+
+    @patch('app_fastapi.save_origin')
+    @patch('app_fastapi.compute_origin_from_drone')
+    @patch('app_fastapi.get_expected_position_from_trajectory')
+    def test_compute_origin(
+        self,
+        mock_get_expected_position,
+        mock_compute_origin,
+        mock_save_origin,
+        test_client,
+    ):
+        """Test POST /api/v1/origin/compute"""
+        mock_get_expected_position.return_value = (10.0, 5.0)
+        mock_compute_origin.return_value = (35.555, -120.777)
+
+        response = test_client.post('/api/v1/origin/compute', json={
+            'current_lat': 35.123456,
+            'current_lon': -120.654321,
+            'pos_id': 1,
+        })
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'status': 'success',
+            'lat': 35.555,
+            'lon': -120.777,
+        }
+        mock_compute_origin.assert_called_once_with(35.123456, -120.654321, 10.0, 5.0)
+        mock_save_origin.assert_not_called()
+
+    @patch('app_fastapi.save_origin')
+    @patch('app_fastapi.compute_origin_from_drone')
+    @patch('app_fastapi.get_expected_position_from_trajectory')
+    def test_compute_origin_v1(
+        self,
+        mock_get_expected_position,
+        mock_compute_origin,
+        mock_save_origin,
+        test_client,
+    ):
+        """Test POST /api/v1/origin/compute"""
+        mock_get_expected_position.return_value = (10.0, 5.0)
+        mock_compute_origin.return_value = (35.555, -120.777)
+
+        response = test_client.post('/api/v1/origin/compute', json={
+            'current_lat': 35.123456,
+            'current_lon': -120.654321,
+            'pos_id': 1,
+        })
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'status': 'success',
+            'lat': 35.555,
+            'lon': -120.777,
+        }
+        mock_compute_origin.assert_called_once_with(35.123456, -120.654321, 10.0, 5.0)
+        mock_save_origin.assert_not_called()
 
 
 # ============================================================================
@@ -452,16 +620,16 @@ class TestShowManagementEndpoints:
     """Test show import and management endpoints"""
 
     def test_import_show_rejects_non_zip(self, test_client):
-        """Test POST /import-show rejects non-ZIP uploads early"""
+        """Test POST /api/v1/shows/skybrush/import rejects non-ZIP uploads early"""
         files = {'file': ('bad_show.txt', BytesIO(b'not-a-zip'), 'text/plain')}
 
-        response = test_client.post("/import-show", files=files)
+        response = test_client.post("/api/v1/shows/skybrush/import", files=files)
 
         assert response.status_code == 400
         assert 'ZIP' in response.json()['detail']
 
     def test_import_show_accepts_nested_zip_and_returns_summary(self, test_client, monkeypatch, tmp_path):
-        """Test POST /import-show stages nested CSVs and returns the new summary payload"""
+        """Test POST /api/v1/shows/skybrush/import stages nested CSVs and returns the new summary payload"""
         import app_fastapi
 
         live_skybrush = tmp_path / 'shapes_sitl' / 'swarm' / 'skybrush'
@@ -513,7 +681,7 @@ class TestShowManagementEndpoints:
         zip_buffer.seek(0)
 
         files = {'file': ('test_show.zip', zip_buffer, 'application/zip')}
-        response = test_client.post("/import-show", files=files)
+        response = test_client.post("/api/v1/shows/skybrush/import", files=files)
 
         assert response.status_code == 200
         data = response.json()
@@ -527,7 +695,7 @@ class TestShowManagementEndpoints:
     @patch('os.listdir')
     @patch('os.path.exists', return_value=True)
     def test_get_show_info(self, mock_exists, mock_listdir, test_client):
-        """Test GET /get-show-info"""
+        """Test GET /api/v1/shows/skybrush"""
         mock_listdir.return_value = ['Drone 1.csv', 'Drone 2.csv']
 
         with patch('builtins.open', create=True) as mock_open:
@@ -539,7 +707,29 @@ class TestShowManagementEndpoints:
             ]
             mock_open.return_value = mock_file
 
-            response = test_client.get("/get-show-info")
+            response = test_client.get("/api/v1/shows/skybrush")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert 'drone_count' in data
+        assert 'max_altitude' in data
+
+    @patch('os.listdir')
+    @patch('os.path.exists', return_value=True)
+    def test_get_show_info_v1(self, mock_exists, mock_listdir, test_client):
+        """Test GET /api/v1/shows/skybrush"""
+        mock_listdir.return_value = ['Drone 1.csv', 'Drone 2.csv']
+
+        with patch('builtins.open', create=True) as mock_open:
+            mock_file = MagicMock()
+            mock_file.__enter__.return_value.__iter__.return_value = [
+                't [ms],x [m],y [m],z [m],yaw [deg]\n',
+                '0,0,0,0,0\n',
+                '60000,1.0,1.0,5.0,0\n'
+            ]
+            mock_open.return_value = mock_file
+
+            response = test_client.get("/api/v1/shows/skybrush")
 
         assert response.status_code == 200
         data = response.json()
@@ -547,7 +737,7 @@ class TestShowManagementEndpoints:
         assert 'max_altitude' in data
 
     def test_get_custom_show_info(self, test_client, monkeypatch, tmp_path):
-        """Test GET /get-custom-show-info reports active custom CSV metadata."""
+        """Test GET /api/v1/shows/custom reports active custom CSV metadata."""
         import app_fastapi
 
         shapes_dir = tmp_path / 'shapes_sitl'
@@ -562,7 +752,7 @@ class TestShowManagementEndpoints:
 
         monkeypatch.setattr(app_fastapi, 'shapes_dir', str(shapes_dir))
 
-        response = test_client.get('/get-custom-show-info')
+        response = test_client.get('/api/v1/shows/custom')
 
         assert response.status_code == 200
         data = response.json()
@@ -575,8 +765,32 @@ class TestShowManagementEndpoints:
         assert data['execution_mode'] == 'local per-drone replay'
         assert 't' in data['required_columns']
 
+    def test_get_custom_show_info_v1(self, test_client, monkeypatch, tmp_path):
+        """Test GET /api/v1/shows/custom reports active custom CSV metadata."""
+        import app_fastapi
+
+        shapes_dir = tmp_path / 'shapes_sitl'
+        shapes_dir.mkdir(parents=True, exist_ok=True)
+        (shapes_dir / 'active.csv').write_text(
+            'idx,t,px,py,pz,vx,vy,vz,ax,ay,az,yaw,mode,ledr,ledg,ledb\n'
+            '0,0.0,0.0,0.0,-0.0,0,0,0,0,0,0,0,70,0,0,255\n'
+            '1,2.5,1.0,2.0,-5.0,0,0,0,0,0,0,0,70,0,0,255\n',
+            encoding='utf-8',
+        )
+        (shapes_dir / 'trajectory_plot.png').write_bytes(b'png')
+
+        monkeypatch.setattr(app_fastapi, 'shapes_dir', str(shapes_dir))
+
+        response = test_client.get('/api/v1/shows/custom')
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['exists'] is True
+        assert data['filename'] == 'active.csv'
+        assert data['preview_exists'] is True
+
     def test_import_custom_show_accepts_valid_protocol_csv(self, test_client, monkeypatch, tmp_path):
-        """Test POST /import-custom-show validates, stages, and activates a custom CSV."""
+        """Test POST /api/v1/shows/custom/import validates, stages, and activates a custom CSV."""
         import app_fastapi
 
         shapes_dir = tmp_path / 'shapes_sitl'
@@ -601,7 +815,7 @@ class TestShowManagementEndpoints:
         )
 
         files = {'file': ('custom_show.csv', csv_buffer, 'text/csv')}
-        response = test_client.post('/import-custom-show', files=files)
+        response = test_client.post('/api/v1/shows/custom/import', files=files)
 
         assert response.status_code == 200
         data = response.json()
@@ -614,7 +828,7 @@ class TestShowManagementEndpoints:
         assert (shapes_dir / 'trajectory_plot.png').exists()
 
     def test_import_custom_show_rejects_missing_protocol_columns(self, test_client, monkeypatch, tmp_path):
-        """Test POST /import-custom-show rejects non-protocol CSV files."""
+        """Test POST /api/v1/shows/custom/import rejects non-protocol CSV files."""
         import app_fastapi
 
         shapes_dir = tmp_path / 'shapes_sitl'
@@ -627,7 +841,7 @@ class TestShowManagementEndpoints:
         monkeypatch.setattr(app_fastapi.Params, 'GIT_AUTO_PUSH', False, raising=False)
 
         files = {'file': ('bad_custom_show.csv', BytesIO(b't,px,py\n0,0,0\n'), 'text/csv')}
-        response = test_client.post('/import-custom-show', files=files)
+        response = test_client.post('/api/v1/shows/custom/import', files=files)
 
         assert response.status_code == 400
         assert 'required protocol columns' in response.json()['detail']
@@ -660,7 +874,7 @@ class TestShowManagementEndpoints:
         monkeypatch.setattr(app_fastapi, 'load_origin', lambda: mock_origin)
         monkeypatch.setattr(app_fastapi, 'get_expected_position_from_trajectory', lambda *args, **kwargs: (0.0, 0.0))
 
-        response = test_client.get('/get-position-deviations')
+        response = test_client.get('/api/v1/origin/deviations')
 
         assert response.status_code == 200
         data = response.json()
@@ -710,11 +924,242 @@ class TestShowManagementEndpoints:
 
         monkeypatch.setattr(app_fastapi, '_refresh_saved_show_metrics', fake_refresh)
 
-        response = test_client.get('/get-comprehensive-metrics')
+        response = test_client.get('/api/v1/shows/skybrush/metrics')
 
         assert response.status_code == 200
         assert response.json()['basic_metrics']['drone_count'] == 5
         assert refresh_calls == [None]
+
+    def test_get_comprehensive_metrics_v1_recalculates_stale_cache(self, test_client, monkeypatch, tmp_path):
+        """Canonical metrics route should ignore stale saved metrics when processed count changes."""
+        import app_fastapi
+
+        swarm_dir = tmp_path / 'shapes_sitl' / 'swarm'
+        processed = swarm_dir / 'processed'
+        processed.mkdir(parents=True, exist_ok=True)
+
+        for drone_id in range(1, 6):
+            (processed / f'Drone {drone_id}.csv').write_text('idx,t,px,py,pz\n0,0,0,0,0\n', encoding='utf-8')
+
+        stale_metrics = {
+            'basic_metrics': {
+                'drone_count': 6,
+                'duration_seconds': 12.0,
+                'max_altitude_m': 9.0,
+            }
+        }
+        metrics_file = swarm_dir / 'comprehensive_metrics.json'
+        metrics_file.write_text(json.dumps(stale_metrics), encoding='utf-8')
+
+        refreshed_metrics = {
+            'basic_metrics': {
+                'drone_count': 5,
+                'duration_seconds': 25.0,
+                'max_altitude_m': 14.0,
+            }
+        }
+        refresh_calls = []
+
+        monkeypatch.setattr(app_fastapi, 'shapes_dir', str(tmp_path / 'shapes_sitl'))
+        monkeypatch.setattr(app_fastapi, 'processed_dir', str(processed))
+        monkeypatch.setattr(app_fastapi, 'METRICS_AVAILABLE', True)
+
+        def fake_refresh(show_filename=None):
+            refresh_calls.append(show_filename)
+            metrics_file.write_text(json.dumps(refreshed_metrics), encoding='utf-8')
+            return refreshed_metrics
+
+        monkeypatch.setattr(app_fastapi, '_refresh_saved_show_metrics', fake_refresh)
+
+        response = test_client.get('/api/v1/shows/skybrush/metrics')
+
+        assert response.status_code == 200
+        assert response.json()['basic_metrics']['drone_count'] == 5
+        assert refresh_calls == [None]
+
+    def test_validate_trajectory_preserves_fail_status_when_warnings_also_exist(self, test_client, monkeypatch, tmp_path):
+        """GET /api/v1/shows/skybrush/validation must preserve FAIL when warnings also exist."""
+        import app_fastapi
+
+        class DummyMetricsEngine:
+            def __init__(self, processed_dir):
+                self.processed_dir = processed_dir
+
+            def load_drone_data(self):
+                return True
+
+            def calculate_comprehensive_metrics(self):
+                return {
+                    'safety_metrics': {
+                        'safety_status': 'UNSAFE',
+                        'collision_warnings_count': 2,
+                    },
+                    'performance_metrics': {
+                        'max_velocity_ms': 18.0,
+                    },
+                    'formation_metrics': {
+                        'formation_quality': 'Degraded',
+                    },
+                }
+
+        monkeypatch.setattr(app_fastapi, 'METRICS_AVAILABLE', True)
+        monkeypatch.setattr(app_fastapi, 'DroneShowMetrics', DummyMetricsEngine)
+        monkeypatch.setattr(app_fastapi, 'processed_dir', str(tmp_path / 'processed'))
+
+        response = test_client.get('/api/v1/shows/skybrush/validation')
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['validation_status'] == 'FAIL'
+        assert any('Safety issue' in issue for issue in data['issues'])
+        assert any('collision warnings' in issue for issue in data['issues'])
+        assert any('High velocity' in issue for issue in data['issues'])
+
+    def test_validate_trajectory_v1_preserves_fail_status_when_warnings_also_exist(self, test_client, monkeypatch, tmp_path):
+        """Canonical validation route must preserve FAIL when warnings also exist."""
+        import app_fastapi
+
+        class DummyMetricsEngine:
+            def __init__(self, processed_dir):
+                self.processed_dir = processed_dir
+
+            def load_drone_data(self):
+                return True
+
+            def calculate_comprehensive_metrics(self):
+                return {
+                    'safety_metrics': {
+                        'safety_status': 'UNSAFE',
+                        'collision_warnings_count': 2,
+                    },
+                    'performance_metrics': {
+                        'max_velocity_ms': 18.0,
+                    },
+                    'formation_metrics': {
+                        'formation_quality': 'Degraded',
+                    },
+                }
+
+        monkeypatch.setattr(app_fastapi, 'METRICS_AVAILABLE', True)
+        monkeypatch.setattr(app_fastapi, 'DroneShowMetrics', DummyMetricsEngine)
+        monkeypatch.setattr(app_fastapi, 'processed_dir', str(tmp_path / 'processed'))
+
+        response = test_client.get('/api/v1/shows/skybrush/validation')
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['validation_status'] == 'FAIL'
+        assert any('Safety issue' in issue for issue in data['issues'])
+        assert any('collision warnings' in issue for issue in data['issues'])
+        assert any('High velocity' in issue for issue in data['issues'])
+
+    @patch('app_fastapi.git_operations')
+    def test_deploy_show_accepts_json_content_type_with_charset(self, mock_git_operations, test_client):
+        """POST /api/v1/shows/skybrush/deployments should parse standard JSON content-type variants."""
+        mock_git_operations.return_value = {
+            'success': True,
+            'message': 'ok',
+            'commit': 'abc12345',
+        }
+
+        response = test_client.post(
+            '/api/v1/shows/skybrush/deployments',
+            data=json.dumps({'message': 'Deploy via API'}),
+            headers={'content-type': 'application/json; charset=utf-8'},
+        )
+
+        assert response.status_code == 200
+        assert response.json()['success'] is True
+        mock_git_operations.assert_called_once()
+        assert mock_git_operations.call_args.args[1] == 'Deploy via API'
+
+    @patch('app_fastapi.git_operations')
+    def test_deploy_show_v1_accepts_json_content_type_with_charset(self, mock_git_operations, test_client):
+        """Canonical deployment route should parse standard JSON content-type variants."""
+        mock_git_operations.return_value = {
+            'success': True,
+            'message': 'ok',
+            'commit': 'abc12345',
+        }
+
+        response = test_client.post(
+            '/api/v1/shows/skybrush/deployments',
+            data=json.dumps({'message': 'Deploy via API'}),
+            headers={'content-type': 'application/json; charset=utf-8'},
+        )
+
+        assert response.status_code == 200
+        assert response.json()['success'] is True
+        mock_git_operations.assert_called_once()
+        assert mock_git_operations.call_args.args[1] == 'Deploy via API'
+
+
+# ============================================================================
+# GCS Management & Static Asset Tests
+# ============================================================================
+
+class TestGCSManagementEndpoints:
+    """Test GCS management, network, and static asset endpoints."""
+
+    def test_get_gcs_config(self, test_client, monkeypatch):
+        import app_fastapi
+
+        monkeypatch.setattr(app_fastapi.Params, 'sim_mode', True, raising=False)
+        monkeypatch.setattr(app_fastapi.Params, 'gcs_api_port', 3030, raising=False)
+        monkeypatch.setattr(app_fastapi.Params, 'GIT_AUTO_PUSH', False, raising=False)
+        monkeypatch.setattr(app_fastapi.Params, 'acceptable_deviation', 4.5, raising=False)
+
+        response = test_client.get('/api/v1/system/gcs-config')
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'sim_mode': True,
+            'gcs_port': 3030,
+            'git_auto_push': False,
+            'acceptable_deviation': 4.5,
+        }
+
+    def test_save_gcs_config_returns_explicit_stub_ack(self, test_client):
+        response = test_client.request('PUT', '/api/v1/system/gcs-config', json={'sim_mode': True})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is True
+        assert data['status'] == 'success'
+        assert data['persisted'] is False
+        assert data['warnings']
+
+    @patch('app_fastapi.get_network_info_from_heartbeats')
+    def test_get_network_info(self, mock_network_info, test_client):
+        mock_network_info.return_value = [
+            {'hw_id': '1', 'wifi': {'ssid': 'mds-net'}},
+            {'hw_id': '2', 'ethernet': {'interface': 'eth0'}},
+        ]
+
+        response = test_client.get('/api/v1/fleet/network-details')
+
+        assert response.status_code == 200
+        assert response.json()[0]['hw_id'] == '1'
+        assert response.json()[1]['ethernet']['interface'] == 'eth0'
+
+    def test_static_plot_serving(self, test_client, monkeypatch, tmp_path):
+        import app_fastapi
+
+        plots_dir = tmp_path / 'plots'
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        plot_file = plots_dir / 'drone_1.jpg'
+        plot_file.write_bytes(b'jpg')
+
+        monkeypatch.setattr(
+            app_fastapi,
+            'get_swarm_trajectory_folders',
+            lambda: {'plots': str(plots_dir)},
+        )
+
+        response = test_client.get('/api/v1/swarm-trajectories/plots/drone_1.jpg')
+
+        assert response.status_code == 200
+        assert response.content == b'jpg'
 
 
 # ============================================================================
@@ -731,13 +1176,13 @@ class TestGitStatusEndpoints:
     @patch('app_fastapi.get_gcs_git_report')
     @patch('app_fastapi.load_config')
     def test_get_git_status(self, mock_load_config, mock_gcs_git_report, test_client):
-        """Test GET /git-status"""
+        """Test GET /api/v1/git/status"""
         mock_load_config.return_value = [
             {'hw_id': 1, 'pos_id': 1, 'ip': '10.0.0.1'},
             {'hw_id': 2, 'pos_id': 2, 'ip': '10.0.0.2'},
         ]
         mock_gcs_git_report.return_value = {'branch': 'main', 'commit': 'abc12345'}
-        response = test_client.get("/git-status")
+        response = test_client.get("/api/v1/git/status")
         assert response.status_code == 200
         data = response.json()
         assert 'git_status' in data
@@ -746,6 +1191,26 @@ class TestGitStatusEndpoints:
         assert data['git_status']['1']['ip'] == '10.0.0.1'
         assert data['git_status']['1']['in_sync_with_gcs'] is True
         assert data['needs_sync_count'] == 0
+
+    @patch('app_fastapi.git_status_data_all_drones', {
+        '1': {'status': 'clean', 'branch': 'main', 'commit': 'abc12345', 'uncommitted_changes': []},
+        '2': {'status': 'clean', 'branch': 'main', 'commit': 'abc12345', 'uncommitted_changes': []}
+    })
+    @patch('app_fastapi.get_gcs_git_report')
+    @patch('app_fastapi.load_config')
+    def test_get_git_status_v1(self, mock_load_config, mock_gcs_git_report, test_client):
+        """Test GET /api/v1/git/status"""
+        mock_load_config.return_value = [
+            {'hw_id': 1, 'pos_id': 1, 'ip': '10.0.0.1'},
+            {'hw_id': 2, 'pos_id': 2, 'ip': '10.0.0.2'},
+        ]
+        mock_gcs_git_report.return_value = {'branch': 'main', 'commit': 'abc12345'}
+
+        response = test_client.get("/api/v1/git/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data['git_status']['1']['commit'] == 'abc12345'
+        assert data['gcs_status']['branch'] == 'main'
 
     @patch('app_fastapi.git_status_data_all_drones', {
         '1': {'status': 'clean', 'branch': 'main-candidate', 'commit': 'old12345', 'uncommitted_changes': []},
@@ -759,28 +1224,20 @@ class TestGitStatusEndpoints:
         mock_gcs_git_report,
         test_client,
     ):
-        """GET /git-status should flag clean-but-behind drones as out of sync with GCS."""
+        """GET /api/v1/git/status should flag clean-but-behind drones as out of sync with GCS."""
         mock_load_config.return_value = [
             {'hw_id': 1, 'pos_id': 1, 'ip': '10.0.0.1'},
             {'hw_id': 2, 'pos_id': 2, 'ip': '10.0.0.2'},
         ]
         mock_gcs_git_report.return_value = {'branch': 'main-candidate', 'commit': 'new67890'}
 
-        response = test_client.get("/git-status")
+        response = test_client.get("/api/v1/git/status")
 
         assert response.status_code == 200
         data = response.json()
         assert data['synced_count'] == 0
         assert data['needs_sync_count'] == 2
         assert data['git_status']['1']['in_sync_with_gcs'] is False
-
-    @patch('app_fastapi.get_gcs_git_report')
-    def test_get_gcs_git_status(self, mock_report, test_client):
-        """Test GET /get-gcs-git-status"""
-        mock_report.return_value = {'branch': 'main', 'status': 'clean'}
-
-        response = test_client.get("/get-gcs-git-status")
-        assert response.status_code == 200
 
     @patch('app_fastapi._verify_sync_targets')
     @patch('app_fastapi.send_commands_to_all')
@@ -794,7 +1251,7 @@ class TestGitStatusEndpoints:
         mock_verify_targets,
         test_client,
     ):
-        """POST /sync-repos should only report success after repo convergence is verified."""
+        """POST /api/v1/git/sync-operations should only report success after repo convergence is verified."""
         mock_load_config.return_value = [
             {'hw_id': '1', 'pos_id': 1, 'ip': '10.0.0.1'},
             {'hw_id': '2', 'pos_id': 2, 'ip': '10.0.0.2'},
@@ -811,7 +1268,45 @@ class TestGitStatusEndpoints:
         }
         mock_verify_targets.return_value = ([1], [2])
 
-        response = test_client.post('/sync-repos', json={})
+        response = test_client.post('/api/v1/git/sync-operations', json={})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['success'] is False
+        assert data['synced_drones'] == [1]
+        assert data['failed_drones'] == [2]
+        assert 'partially verified' in data['message']
+
+    @patch('app_fastapi._verify_sync_targets')
+    @patch('app_fastapi.send_commands_to_all')
+    @patch('app_fastapi.get_gcs_git_report')
+    @patch('app_fastapi.load_config')
+    def test_sync_repos_v1_verifies_actual_convergence(
+        self,
+        mock_load_config,
+        mock_gcs_git_report,
+        mock_send_commands,
+        mock_verify_targets,
+        test_client,
+    ):
+        """POST /api/v1/git/sync-operations should verify actual repo convergence."""
+        mock_load_config.return_value = [
+            {'hw_id': '1', 'pos_id': 1, 'ip': '10.0.0.1'},
+            {'hw_id': '2', 'pos_id': 2, 'ip': '10.0.0.2'},
+        ]
+        mock_gcs_git_report.return_value = {
+            'branch': 'main-candidate',
+            'commit': 'abc123def456',
+        }
+        mock_send_commands.return_value = {
+            'results': {
+                '1': {'category': 'accepted'},
+                '2': {'category': 'accepted'},
+            }
+        }
+        mock_verify_targets.return_value = ([1], [2])
+
+        response = test_client.post('/api/v1/git/sync-operations', json={})
 
         assert response.status_code == 200
         data = response.json()
@@ -830,29 +1325,84 @@ class TestSwarmEndpoints:
 
     @patch('app_fastapi.load_swarm')
     def test_get_swarm_data(self, mock_load, test_client):
-        """Test GET /get-swarm-data"""
-        mock_load.return_value = {'hierarchies': {}}
+        """Test GET /api/v1/config/swarm"""
+        mock_load.return_value = [{'hw_id': 1, 'follow': 0}]
 
-        response = test_client.get("/get-swarm-data")
+        response = test_client.get("/api/v1/config/swarm")
         assert response.status_code == 200
+        assert response.json() == {
+            'version': 1,
+            'assignments': [{
+                'hw_id': 1,
+                'follow': 0,
+                'offset_x': 0.0,
+                'offset_y': 0.0,
+                'offset_z': 0.0,
+                'frame': 'ned',
+            }],
+        }
+
+    @patch('app_fastapi.load_swarm')
+    def test_get_swarm_config_v1_returns_envelope(self, mock_load, test_client):
+        """Test GET /api/v1/config/swarm"""
+        mock_load.return_value = [{'hw_id': 1, 'follow': 0}]
+
+        response = test_client.get("/api/v1/config/swarm")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'version': 1,
+            'assignments': [{
+                'hw_id': 1,
+                'follow': 0,
+                'offset_x': 0.0,
+                'offset_y': 0.0,
+                'offset_z': 0.0,
+                'frame': 'ned',
+            }],
+        }
 
     @patch('app_fastapi.save_swarm')
     def test_save_swarm_data(self, mock_save, test_client):
-        """Test POST /save-swarm-data"""
-        swarm_data = {'hierarchies': {}}
+        """Test PUT /api/v1/config/swarm"""
+        swarm_data = {'version': 1, 'assignments': [{'hw_id': 1, 'follow': 0}]}
 
-        response = test_client.post("/save-swarm-data?commit=false", json=swarm_data)
+        response = test_client.request("PUT", "/api/v1/config/swarm?commit=false", json=swarm_data)
         assert response.status_code == 200
 
     @patch('app_fastapi.save_swarm')
-    def test_save_swarm_data_rejects_cycles(self, mock_save, test_client):
-        """Test POST /save-swarm-data rejects cyclic follow chains."""
-        swarm_data = [
-            {'hw_id': 1, 'follow': 2, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
-            {'hw_id': 2, 'follow': 1, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
-        ]
+    def test_put_swarm_config_v1(self, mock_save, test_client):
+        """Test PUT /api/v1/config/swarm"""
+        swarm_data = {'version': 1, 'assignments': [{'hw_id': 1, 'follow': 0}]}
 
-        response = test_client.post("/save-swarm-data", json=swarm_data)
+        response = test_client.request("PUT", "/api/v1/config/swarm?commit=false", json=swarm_data)
+
+        assert response.status_code == 200
+        assert response.json()['status'] == 'success'
+        assert response.json()['config'] == {
+            'version': 1,
+            'assignments': [{
+                'hw_id': 1,
+                'follow': 0,
+                'offset_x': 0.0,
+                'offset_y': 0.0,
+                'offset_z': 0.0,
+                'frame': 'ned',
+            }],
+        }
+
+    @patch('app_fastapi.save_swarm')
+    def test_save_swarm_data_rejects_cycles(self, mock_save, test_client):
+        """Test PUT /api/v1/config/swarm rejects cyclic follow chains."""
+        swarm_data = {
+            'version': 1,
+            'assignments': [
+                {'hw_id': 1, 'follow': 2, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
+                {'hw_id': 2, 'follow': 1, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
+            ],
+        }
+
+        response = test_client.request("PUT", "/api/v1/config/swarm", json=swarm_data)
 
         assert response.status_code == 400
         assert 'cycle' in response.json()['detail']
@@ -861,15 +1411,41 @@ class TestSwarmEndpoints:
     @patch('app_fastapi.save_swarm')
     @patch('app_fastapi.load_swarm')
     def test_request_new_leader_updates_swarm_assignment(self, mock_load, mock_save, test_client):
-        """Test POST /request-new-leader persists a single drone assignment update."""
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} persists a single assignment update."""
         mock_load.return_value = [
             {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
             {'hw_id': 2, 'follow': 1, 'offset_x': 5, 'offset_y': 0, 'offset_z': 0, 'frame': 'body'},
         ]
 
-        response = test_client.post(
-            "/request-new-leader",
-            json={'hw_id': 2, 'follow': 0, 'offset_x': 7, 'offset_y': 1, 'offset_z': 2, 'frame': 'ned'},
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/2",
+            json={'follow': 0, 'offset_x': 7, 'offset_y': 1, 'offset_z': 2, 'frame': 'ned'},
+        )
+
+        assert response.status_code == 200
+        assert response.json()['status'] == 'success'
+        saved_swarm = mock_save.call_args[0][0]
+        assert saved_swarm[1]['hw_id'] == 2
+        assert saved_swarm[1]['follow'] == 0
+        assert saved_swarm[1]['offset_x'] == 7.0
+        assert saved_swarm[1]['offset_y'] == 1.0
+        assert saved_swarm[1]['offset_z'] == 2.0
+        assert saved_swarm[1]['frame'] == 'ned'
+
+    @patch('app_fastapi.save_swarm')
+    @patch('app_fastapi.load_swarm')
+    def test_patch_swarm_assignment_v1_updates_swarm_assignment(self, mock_load, mock_save, test_client):
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} persists a single assignment update."""
+        mock_load.return_value = [
+            {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
+            {'hw_id': 2, 'follow': 1, 'offset_x': 5, 'offset_y': 0, 'offset_z': 0, 'frame': 'body'},
+        ]
+
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/2",
+            json={'follow': 0, 'offset_x': 7, 'offset_y': 1, 'offset_z': 2, 'frame': 'ned'},
         )
 
         assert response.status_code == 200
@@ -885,15 +1461,16 @@ class TestSwarmEndpoints:
     @patch('app_fastapi.save_swarm')
     @patch('app_fastapi.load_swarm')
     def test_request_new_leader_partial_update_preserves_offsets(self, mock_load, mock_save, test_client):
-        """Test POST /request-new-leader keeps existing offsets/frame when only follow changes."""
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} keeps existing offsets/frame when only follow changes."""
         mock_load.return_value = [
             {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
             {'hw_id': 2, 'follow': 1, 'offset_x': 5, 'offset_y': 2, 'offset_z': 3, 'frame': 'body'},
         ]
 
-        response = test_client.post(
-            "/request-new-leader",
-            json={'hw_id': 2, 'follow': 0},
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/2",
+            json={'follow': 0},
         )
 
         assert response.status_code == 200
@@ -907,14 +1484,15 @@ class TestSwarmEndpoints:
 
     @patch('app_fastapi.load_swarm')
     def test_request_new_leader_rejects_self_follow(self, mock_load, test_client):
-        """Test POST /request-new-leader rejects invalid self-follow changes."""
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} rejects invalid self-follow changes."""
         mock_load.return_value = [
             {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
         ]
 
-        response = test_client.post(
-            "/request-new-leader",
-            json={'hw_id': 1, 'follow': 1},
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/1",
+            json={'follow': 1},
         )
 
         assert response.status_code == 400
@@ -922,16 +1500,17 @@ class TestSwarmEndpoints:
 
     @patch('app_fastapi.load_swarm')
     def test_request_new_leader_rejects_cycle_creation(self, mock_load, test_client):
-        """Test POST /request-new-leader rejects updates that would create a follow loop."""
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} rejects updates that would create a follow loop."""
         mock_load.return_value = [
             {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
             {'hw_id': 2, 'follow': 1, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
             {'hw_id': 3, 'follow': 2, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
         ]
 
-        response = test_client.post(
-            "/request-new-leader",
-            json={'hw_id': 1, 'follow': 3},
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/1",
+            json={'follow': 3},
         )
 
         assert response.status_code == 400
@@ -939,15 +1518,16 @@ class TestSwarmEndpoints:
 
     @patch('app_fastapi.load_swarm')
     def test_request_new_leader_rejects_cycle(self, mock_load, test_client):
-        """Test POST /request-new-leader rejects updates that introduce a cycle."""
+        """Test PATCH /api/v1/config/swarm/assignments/{hw_id} rejects updates that introduce a cycle."""
         mock_load.return_value = [
             {'hw_id': 1, 'follow': 0, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
             {'hw_id': 2, 'follow': 1, 'offset_x': 0, 'offset_y': 0, 'offset_z': 0, 'frame': 'ned'},
         ]
 
-        response = test_client.post(
-            "/request-new-leader",
-            json={'hw_id': 1, 'follow': 2},
+        response = test_client.request(
+            "PATCH",
+            "/api/v1/config/swarm/assignments/1",
+            json={'follow': 2},
         )
 
         assert response.status_code == 400
@@ -968,24 +1548,56 @@ class TestSwarmTrajectoryEndpoints:
         route_paths = {route.path for route in app.routes}
 
         expected_paths = {
-            '/api/swarm/leaders',
-            '/api/swarm/trajectory/upload/{leader_id}',
-            '/api/swarm/trajectory/process',
-            '/api/swarm/trajectory/recommendation',
-            '/api/swarm/trajectory/status',
-            '/api/swarm/trajectory/clear-processed',
-            '/api/swarm/trajectory/clear',
-            '/api/swarm/trajectory/clear-leader/{leader_id}',
-            '/api/swarm/trajectory/remove/{leader_id}',
-            '/api/swarm/trajectory/download/{drone_id}',
-            '/api/swarm/trajectory/download-kml/{drone_id}',
-            '/api/swarm/trajectory/download-cluster-kml/{leader_id}',
-            '/api/swarm/trajectory/clear-drone/{drone_id}',
-            '/api/swarm/trajectory/commit',
+            '/api/v1/swarm-trajectories/leaders',
+            '/api/v1/swarm-trajectories/upload/{leader_id}',
+            '/api/v1/swarm-trajectories/process',
+            '/api/v1/swarm-trajectories/recommendation',
+            '/api/v1/swarm-trajectories/status',
+            '/api/v1/swarm-trajectories/clear-processed',
+            '/api/v1/swarm-trajectories/clear',
+            '/api/v1/swarm-trajectories/clear-leader/{leader_id}',
+            '/api/v1/swarm-trajectories/remove/{leader_id}',
+            '/api/v1/swarm-trajectories/download/{drone_id}',
+            '/api/v1/swarm-trajectories/download-kml/{drone_id}',
+            '/api/v1/swarm-trajectories/download-cluster-kml/{leader_id}',
+            '/api/v1/swarm-trajectories/clear-drone/{drone_id}',
+            '/api/v1/swarm-trajectories/commit',
         }
 
         missing_paths = expected_paths - route_paths
         assert not missing_paths, f"Missing swarm trajectory routes: {sorted(missing_paths)}"
+
+    def test_swarm_trajectory_process_rejects_malformed_json_with_shared_error_envelope(self, test_client):
+        response = test_client.post(
+            "/api/v1/swarm-trajectories/process",
+            data="{bad",
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["error"] == "Validation error"
+        assert isinstance(payload["detail"], list)
+        assert payload["detail"][0]["loc"][0] == "body"
+        assert payload["path"] == "/api/v1/swarm-trajectories/process"
+
+    @patch("app_fastapi.swarm_trajectory_service.commit_trajectory_changes_payload")
+    def test_swarm_trajectory_commit_surfaces_shared_operation_error(self, mock_commit, test_client):
+        mock_commit.return_value = {
+            "success": False,
+            "error": "Git push failed: network error. Check internet connectivity.",
+        }
+
+        response = test_client.post(
+            "/api/v1/swarm-trajectories/commit",
+            json={"message": "commit outputs"},
+        )
+
+        assert response.status_code == 502
+        payload = response.json()
+        assert payload["error"] == "Bad gateway"
+        assert payload["detail"] == "Git push failed: network error. Check internet connectivity."
+        assert payload["path"] == "/api/v1/swarm-trajectories/commit"
 
 
 # ============================================================================
@@ -995,11 +1607,32 @@ class TestSwarmTrajectoryEndpoints:
 class TestCommandEndpoints:
     """Test command submission endpoints"""
 
+    def test_submit_command_rejects_malformed_json(self, test_client):
+        response = test_client.post(
+            "/api/v1/commands",
+            data="{bad",
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "json_invalid"
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
     @patch('app_fastapi.send_commands_to_all')
+    @patch('app_fastapi.get_command_tracker')
     @patch('app_fastapi.load_config')
-    def test_submit_command(self, mock_load, mock_send, test_client, mock_config):
-        """Test POST /submit_command - new SubmitCommandResponse format"""
+    def test_submit_command(self, mock_load, mock_get_tracker, mock_send, mock_probe, test_client, mock_config):
+        """Test POST /api/v1/commands - new SubmitCommandResponse format"""
+        from command_tracker import CommandTracker
+
         mock_load.return_value = mock_config
+        mock_get_tracker.return_value = CommandTracker(max_commands=20)
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
         # Mock needs all expected fields from the updated command.py
         mock_send.return_value = {
             'success': 2, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
@@ -1009,13 +1642,13 @@ class TestCommandEndpoints:
             }
         }
 
-        # New format requires missionType and triggerTime
+        # Canonical request format uses snake_case field names.
         command_data = {
-            'missionType': 10,  # TAKE_OFF
-            'triggerTime': 0
+            'mission_type': 10,  # TAKE_OFF
+            'trigger_time': 0,
         }
 
-        response = test_client.post("/submit_command", json=command_data)
+        response = test_client.post("/api/v1/commands", json=command_data)
         assert response.status_code == 200
         data = response.json()
 
@@ -1026,7 +1659,349 @@ class TestCommandEndpoints:
         assert 'mission_name' in data
         assert 'target_drones' in data
         assert 'submitted_count' in data
+        assert data['replayed'] is False
         assert data['tracking_phase'] == 'pending_execution'
+        assert data['tracking_timeout_ms'] > 0
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.send_commands_to_selected')
+    @patch('app_fastapi.get_command_tracker')
+    @patch('app_fastapi.load_config')
+    def test_submit_command_accepts_snake_case_aliases(
+        self,
+        mock_load,
+        mock_get_tracker,
+        mock_send_selected,
+        mock_probe,
+        test_client,
+        mock_config,
+    ):
+        from command_tracker import CommandTracker
+
+        mock_load.return_value = mock_config
+        mock_get_tracker.return_value = CommandTracker(max_commands=20)
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
+        mock_send_selected.return_value = {
+            'success': 1, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
+            'result_summary': '1 accepted', 'results': {
+                '1': {'success': True, 'category': 'accepted'}
+            }
+        }
+
+        response = test_client.post("/api/v1/commands", json={
+            'mission_type': 'TAKE_OFF',
+            'trigger_time': 0,
+            'target_drone_ids': ['1'],
+            'operator_label': 'Takeoff alias',
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['mission_type'] == 10
+        assert data['target_drones'] == ['1']
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.send_commands_to_all')
+    @patch('app_fastapi.get_command_tracker')
+    @patch('app_fastapi.load_config')
+    def test_submit_command_replays_existing_idempotent_submission(
+        self,
+        mock_load,
+        mock_get_tracker,
+        mock_send,
+        mock_probe,
+        test_client,
+        mock_config,
+    ):
+        from command_tracker import CommandTracker
+
+        tracker = CommandTracker(max_commands=20)
+        mock_get_tracker.return_value = tracker
+        mock_load.return_value = mock_config
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
+        mock_send.return_value = {
+            'success': 2, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
+            'result_summary': '2 accepted', 'results': {
+                '1': {'success': True, 'category': 'accepted'},
+                '2': {'success': True, 'category': 'accepted'}
+            }
+        }
+
+        payload = {
+            'mission_type': 10,
+            'trigger_time': 0,
+            'idempotency_key': 'retry-123',
+        }
+
+        first = test_client.post("/api/v1/commands", json=payload)
+        second = test_client.post("/api/v1/commands", json=payload)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_body = first.json()
+        second_body = second.json()
+        assert first_body['replayed'] is False
+        assert second_body['replayed'] is True
+        assert second_body['command_id'] == first_body['command_id']
+        assert second_body['idempotency_key'] == 'retry-123'
+        assert mock_send.call_count == 1
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.send_commands_to_all')
+    @patch('app_fastapi.get_command_tracker')
+    @patch('app_fastapi.load_config')
+    def test_submit_command_rejects_conflicting_idempotency_key_reuse(
+        self,
+        mock_load,
+        mock_get_tracker,
+        mock_send,
+        mock_probe,
+        test_client,
+        mock_config,
+    ):
+        from command_tracker import CommandTracker
+
+        tracker = CommandTracker(max_commands=20)
+        mock_get_tracker.return_value = tracker
+        mock_load.return_value = mock_config
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
+        mock_send.return_value = {
+            'success': 2, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
+            'result_summary': '2 accepted', 'results': {
+                '1': {'success': True, 'category': 'accepted'},
+                '2': {'success': True, 'category': 'accepted'}
+            }
+        }
+
+        first = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 10,
+                'trigger_time': 0,
+                'idempotency_key': 'retry-123',
+            },
+        )
+        second = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 101,
+                'trigger_time': 0,
+                'idempotency_key': 'retry-123',
+            },
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 409
+        assert 'idempotency_key' in second.json()['detail']
+
+    @patch('app_fastapi.load_origin')
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.send_commands_to_all')
+    @patch('app_fastapi.load_config')
+    def test_submit_command_preserves_valid_zero_origin_coordinates(
+        self,
+        mock_load,
+        mock_send,
+        mock_probe,
+        mock_load_origin,
+        test_client,
+        mock_config,
+    ):
+        mock_load.return_value = mock_config
+        mock_load_origin.return_value = {
+            'lat': 0.0,
+            'lon': 0.0,
+            'alt': 4.5,
+            'timestamp': '2026-04-03T00:00:00',
+            'alt_source': 'manual',
+        }
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
+        mock_send.return_value = {
+            'success': 2, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
+            'result_summary': '2 accepted', 'results': {
+                '1': {'success': True, 'category': 'accepted'},
+                '2': {'success': True, 'category': 'accepted'}
+            }
+        }
+
+        response = test_client.post("/api/v1/commands", json={
+            'mission_type': 10,
+            'trigger_time': 0,
+            'auto_global_origin': True,
+        })
+
+        assert response.status_code == 200
+        sent_payload = mock_send.call_args[0][1]
+        assert sent_payload['origin']['lat'] == 0.0
+        assert sent_payload['origin']['lon'] == 0.0
+        assert sent_payload['origin']['alt'] == 4.5
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.send_commands_to_selected')
+    @patch('app_fastapi.load_config')
+    @patch('app_fastapi.get_swarm_trajectory_folders')
+    @patch('app_fastapi.swarm_trajectory_service.get_processing_status_payload')
+    def test_submit_command_swarm_trajectory_uses_selected_processed_timeout_budget(
+        self,
+        mock_status,
+        mock_folders,
+        mock_load,
+        mock_send_selected,
+        mock_probe,
+        test_client,
+        mock_config,
+        tmp_path,
+    ):
+        mock_load.return_value = mock_config
+        mock_probe.return_value = {
+            'all_ready': True,
+            'blocked_ids': [],
+            'unavailable_ids': [],
+            'results': {},
+        }
+        mock_send_selected.return_value = {
+            'success': 1, 'failed': 0, 'offline': 0, 'rejected': 0, 'errors': 0,
+            'result_summary': '1 accepted', 'results': {
+                '1': {'success': True, 'category': 'accepted'}
+            }
+        }
+        mock_status.return_value = {
+            'status': {
+                'processed_drones': [1, 2],
+                'follow_map': {'1': 0, '2': 1},
+            }
+        }
+
+        processed_dir = tmp_path / "swarm_trajectory" / "processed"
+        processed_dir.mkdir(parents=True)
+        (processed_dir / "Drone 1.csv").write_text("t,alt\n0,10\n100,25\n", encoding="utf-8")
+        (processed_dir / "Drone 2.csv").write_text("t,alt\n0,10\n500,25\n", encoding="utf-8")
+        mock_folders.return_value = {
+            'base': str(tmp_path / "swarm_trajectory"),
+            'raw': str(tmp_path / "swarm_trajectory" / "raw"),
+            'processed': str(processed_dir),
+            'plots': str(tmp_path / "swarm_trajectory" / "plots"),
+        }
+
+        response = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 4,
+                'trigger_time': 0,
+                'target_drone_ids': ['1'],
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data['tracking_timeout_ms'] == 540000
+        assert data['tracking_phase'] == 'pending_execution'
+        mock_send_selected.assert_called_once()
+
+    @patch('app_fastapi.probe_live_armability_for_drones')
+    @patch('app_fastapi.load_config')
+    def test_submit_command_rejects_takeoff_when_live_probe_fails(
+        self,
+        mock_load,
+        mock_probe,
+        test_client,
+        mock_config,
+    ):
+        mock_load.return_value = mock_config
+        mock_probe.return_value = {
+            'all_ready': False,
+            'blocked_ids': ['1'],
+            'unavailable_ids': [],
+            'results': {
+                '1': {
+                    'summary': 'waiting for PX4 armability',
+                },
+            },
+        }
+
+        response = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 10,
+                'trigger_time': 0,
+            },
+        )
+
+        assert response.status_code == 400
+        assert 'Live launch readiness probe failed' in response.json()['detail']
+
+    @patch('app_fastapi.send_commands_to_selected')
+    @patch('app_fastapi.load_config')
+    @patch('app_fastapi.swarm_trajectory_service.get_processing_status_payload')
+    def test_submit_command_rejects_invalid_swarm_trajectory_subset(
+        self,
+        mock_status,
+        mock_load,
+        mock_send_selected,
+        test_client,
+        mock_config,
+    ):
+        mock_load.return_value = mock_config
+        mock_status.return_value = {
+            'status': {
+                'processed_drones': [1, 2, 3],
+                'follow_map': {'1': 0, '2': 1, '3': 2},
+            }
+        }
+
+        response = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 4,
+                'trigger_time': 0,
+                'target_drone_ids': ['2', '3'],
+            },
+        )
+
+        assert response.status_code == 400
+        assert 'Unsafe Swarm Trajectory target set' in response.json()['detail']
+        mock_send_selected.assert_not_called()
+
+    @patch('app_fastapi.load_config')
+    def test_submit_command_rejects_unmatched_target_drones(
+        self,
+        mock_load,
+        test_client,
+        mock_config,
+    ):
+        mock_load.return_value = mock_config
+
+        response = test_client.post(
+            "/api/v1/commands",
+            json={
+                'mission_type': 10,
+                'trigger_time': 0,
+                'target_drone_ids': ['999'],
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json()['detail'] == 'No configured drones matched target_drone_ids'
 
 
 # ============================================================================
@@ -1040,15 +2015,197 @@ class TestErrorHandling:
         """Test 404 error for non-existent endpoint"""
         response = test_client.get("/nonexistent-endpoint")
         assert response.status_code == 404
+        assert response.json()["error"] == "Not found"
+        assert response.json()["path"] == "/nonexistent-endpoint"
 
     def test_invalid_json(self, test_client):
         """Test handling of invalid JSON in POST request"""
-        response = test_client.post(
-            "/save-config-data",
+        response = test_client.request(
+            "PUT",
+            "/api/v1/config/fleet",
             data="invalid json",
             headers={"Content-Type": "application/json"}
         )
-        assert response.status_code in [400, 422, 500]
+        assert response.status_code == 422
+        assert response.json()["error"] == "Validation error"
+        assert response.json()["detail"][0]["type"] == "json_invalid"
+
+
+class TestAPIV1Aliases:
+    """Test canonical v1 aliases for the current GCS API surface."""
+
+    def test_route_inventory_includes_current_core_surfaces(self, test_client):
+        routes = {route.path for route in test_client.app.routes}
+
+        expected_routes = {
+            "/ping",
+            "/health",
+            "/api/v1/system/health",
+            "/api/v1/fleet/telemetry",
+            "/api/v1/fleet/heartbeats",
+            "/api/v1/fleet/network-status",
+            "/api/v1/config/fleet",
+            "/api/v1/config/fleet/validation",
+            "/api/v1/config/fleet/trajectory-start-positions",
+            "/api/v1/config/fleet/trajectory-start-positions/{pos_id}",
+            "/api/v1/config/swarm",
+            "/api/v1/config/swarm/assignments/{hw_id}",
+            "/api/v1/origin",
+            "/api/v1/navigation/global-origin",
+            "/api/v1/origin/elevation",
+            "/api/v1/origin/bootstrap",
+            "/api/v1/origin/deviations",
+            "/api/v1/origin/compute",
+            "/api/v1/origin/launch-positions",
+            "/api/v1/git/status",
+            "/api/v1/git/sync-operations",
+            "/api/v1/shows/skybrush",
+            "/api/v1/shows/custom",
+            "/api/v1/shows/skybrush/import",
+            "/api/v1/shows/custom/import",
+            "/api/v1/shows/skybrush/metrics",
+            "/api/v1/shows/skybrush/safety-report",
+            "/api/v1/shows/skybrush/validation",
+            "/api/v1/shows/skybrush/deployments",
+            "/api/v1/shows/skybrush/archives/raw",
+            "/api/v1/shows/skybrush/archives/processed",
+            "/api/v1/shows/skybrush/plots",
+            "/api/v1/shows/skybrush/plots/{filename}",
+            "/api/v1/shows/custom/preview",
+            "/api/v1/commands",
+            "/api/v1/commands/{command_id}",
+            "/api/v1/commands/recent",
+            "/api/v1/commands/active",
+            "/api/v1/commands/statistics",
+            "/api/v1/command-reports/execution-start",
+            "/api/v1/command-reports/execution-result",
+            "/api/v1/swarm-trajectories/leaders",
+            "/api/v1/swarm-trajectories/upload/{leader_id}",
+            "/api/v1/swarm-trajectories/process",
+            "/api/v1/swarm-trajectories/recommendation",
+            "/api/v1/swarm-trajectories/status",
+            "/api/v1/swarm-trajectories/policy",
+            "/api/v1/swarm-trajectories/clear-processed",
+            "/api/v1/swarm-trajectories/clear",
+            "/api/v1/swarm-trajectories/clear-leader/{leader_id}",
+            "/api/v1/swarm-trajectories/remove/{leader_id}",
+            "/api/v1/swarm-trajectories/download/{drone_id}",
+            "/api/v1/swarm-trajectories/download-kml/{drone_id}",
+            "/api/v1/swarm-trajectories/download-cluster-kml/{leader_id}",
+            "/api/v1/swarm-trajectories/clear-drone/{drone_id}",
+            "/api/v1/swarm-trajectories/commit",
+            "/api/logs/sources",
+            "/api/logs/sessions",
+            "/api/logs/sessions/{session_id}",
+            "/api/logs/stream",
+            "/api/logs/frontend",
+            "/api/logs/export",
+            "/api/logs/drone/{drone_id}/export",
+            "/api/logs/drone/{drone_id}/sessions",
+            "/api/logs/drone/{drone_id}/sessions/{session_id}",
+            "/api/logs/drone/{drone_id}/stream",
+            "/api/logs/config",
+            "/api/sar/mission/plan",
+            "/api/sar/mission/launch",
+            "/api/sar/mission/{mission_id}/status",
+            "/api/sar/mission/{mission_id}/pause",
+            "/api/sar/mission/{mission_id}/resume",
+            "/api/sar/mission/{mission_id}/abort",
+            "/api/sar/mission/{mission_id}/progress",
+            "/api/sar/poi",
+            "/api/sar/poi/{poi_id}",
+            "/api/sar/elevation/batch",
+            "/ws/telemetry",
+            "/ws/heartbeats",
+            "/ws/git-status",
+        }
+
+        assert expected_routes.issubset(routes)
+
+    def test_v1_health_alias(self, test_client):
+        response = test_client.get("/api/v1/system/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "timestamp" in data
+        assert "version" in data
+
+    def test_v1_fleet_telemetry_alias(self, test_client):
+        response = test_client.get("/api/v1/fleet/telemetry")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "telemetry" in data
+        assert "total_drones" in data
+        assert "online_drones" in data
+
+    def test_v1_fleet_heartbeat_post_alias(self, test_client):
+        payload = {
+            "hw_id": "1",
+            "pos_id": 1,
+            "detected_pos_id": 1,
+            "ip": "192.168.1.101",
+            "timestamp": 1700000000000,
+            "network_info": {},
+        }
+
+        response = test_client.post("/api/v1/fleet/heartbeats", json=payload)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == "Heartbeat received"
+
+    def test_v1_fleet_heartbeats_alias(self, test_client):
+        response = test_client.get("/api/v1/fleet/heartbeats")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "heartbeats" in data
+        assert "online_count" in data
+        assert "timestamp" in data
+
+    def test_v1_fleet_network_status_alias(self, test_client):
+        response = test_client.get("/api/v1/fleet/network-status")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "network_status" in data
+        assert "reachable_count" in data
+        assert "timestamp" in data
+
+    def test_v1_fleet_config_alias(self, test_client):
+        response = test_client.get("/api/v1/config/fleet")
+
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
+
+    @patch('app_fastapi.save_config')
+    @patch('app_fastapi.validate_and_process_config')
+    def test_v1_fleet_config_put_alias(self, mock_validate, mock_save, test_client, mock_config):
+        del mock_save
+        mock_validate.return_value = {'updated_config': mock_config}
+
+        response = test_client.request("PUT", "/api/v1/config/fleet", json=mock_config)
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+
+    @patch('app_fastapi.validate_and_process_config')
+    def test_v1_fleet_config_validation_alias(self, mock_validate, test_client, mock_config):
+        mock_validate.return_value = {'updated_config': mock_config, 'summary': {}}
+
+        response = test_client.post("/api/v1/config/fleet/validation", json=mock_config)
+
+        assert response.status_code == 200
+        assert "summary" in response.json()
+
+    def test_v1_fleet_trajectory_start_positions_alias(self, test_client):
+        response = test_client.get("/api/v1/config/fleet/trajectory-start-positions")
+
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)
 
 
 if __name__ == "__main__":

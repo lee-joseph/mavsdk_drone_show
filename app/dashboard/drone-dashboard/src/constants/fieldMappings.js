@@ -70,6 +70,8 @@ export const FIELD_NAMES = {
   HEARTBEAT_LAST_SEEN: 'heartbeat_last_seen',
   HEARTBEAT_FIRST_SEEN: 'heartbeat_first_seen',
   HEARTBEAT_NETWORK_INFO: 'heartbeat_network_info',
+  TELEMETRY_AVAILABLE: 'telemetry_available',
+  TELEMETRY_ERROR: 'telemetry_error',
 };
 
 export const DRONE_RUNTIME_CLOCK_PROP = '__runtimeClock';
@@ -113,7 +115,7 @@ function getRuntimeClockReferenceMs(droneData) {
     return null;
   }
 
-  const telemetryTimestampMs = normalizeRuntimeTimestampMs(droneData.timestamp ?? droneData.update_time);
+  const telemetryTimestampMs = normalizeRuntimeTimestampMs(droneData.update_time ?? droneData.timestamp);
   const heartbeatTimestampMs = normalizeRuntimeTimestampMs(droneData.heartbeat_last_seen);
 
   return Math.max(telemetryTimestampMs ?? 0, heartbeatTimestampMs ?? 0) || null;
@@ -237,6 +239,8 @@ export function normalizeDroneData(droneData) {
     Heartbeat_Last_Seen: 'heartbeat_last_seen',
     Heartbeat_First_Seen: 'heartbeat_first_seen',
     Heartbeat_Network_Info: 'heartbeat_network_info',
+    Telemetry_Available: 'telemetry_available',
+    Telemetry_Error: 'telemetry_error',
   };
 
   const normalized = {};
@@ -253,7 +257,7 @@ export function normalizeDroneData(droneData) {
 /**
  * Normalize telemetry response containing multiple drones
  *
- * @param {Object} telemetryResponse - Response from /telemetry endpoint
+ * @param {Object} telemetryResponse - Drone map from the canonical fleet telemetry payload
  * @returns {Object} Normalized telemetry with all drones using snake_case
  *
  * @example
@@ -328,6 +332,8 @@ export function getField(drone, fieldKey, defaultValue = undefined) {
     'vdop': ['Vdop'],
     'timestamp': ['Timestamp'],
     'update_time': ['Update_Time'],
+    'telemetry_available': ['Telemetry_Available'],
+    'telemetry_error': ['Telemetry_Error'],
   };
 
   const legacyNames = legacyMap[fieldKey] || [];

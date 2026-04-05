@@ -33,6 +33,9 @@ The MDS project uses a **two-layer identity model**:
 - `hw_id` = "which physical drone" (like a serial number)
 - `pos_id` = "what role/trajectory this drone flies" (like a jersey number)
 - Decoupling allows **hot-swap**: spare drone hw_id=10 can replace failed hw_id=3 by assigning pos_id=3
+- Dense operator-facing dashboard surfaces use the compact shorthand `Pn|Hm`
+- Example: `P3|H10` means `Position ID 3 | Hardware ID 10`
+- The shorthand is for high-density cards, cluster scopes, and plots; configuration forms remain explicit with `Position ID` and `Hardware ID`
 
 This is the **correct architectural pattern** used by all major commercial drone show platforms (Verge Aero, Skybrush/CollMot). However, the MDS implementation has **significant bugs, inconsistencies, and code duplication** that must be fixed.
 
@@ -353,7 +356,7 @@ This means hw_id determines network ports. This is fine for small fleets but:
 | `app/.../components/OriginModal.js` | Uses pos_id for origin computation |
 | `app/.../components/DeviationView.js` | Falls back to hw_id if pos_id missing |
 | `app/.../utilities/missionConfigUtilities.js` | CSV parser (strict 6-column), export |
-| `app/.../pages/ImportShow.js` | Trajectory fetch by hw_id |
+| legacy `app/.../pages/ImportShow.js` (removed 2026-04-03) | Historical trajectory fetch by hw_id |
 
 #### SITL
 | File | Role |

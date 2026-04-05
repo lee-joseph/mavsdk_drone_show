@@ -108,7 +108,7 @@ Do **not** look for version numbers in the filename. Release versioning lives in
 ```bash
 cd ~
 # Public Mega download via the official MEGAcmd client; large archives may take several minutes.
-mega-get 'https://mega.nz/file/qewEgKDZ#KHah4cc_2zjLTEnHAGQuGF5sNlQ0K8de-3Uf_6w6a4I' .
+mega-get 'https://mega.nz/file/7HBx0KoR#fCMcO33bAA5ZVSc_cMt43eaqxJDwV3lKWN_4tUwz-TA' .
 # Validate the archive before extracting it.
 7z t mavsdk-drone-show-sitl-image.7z
 # Extraction also takes time on large images.
@@ -164,6 +164,8 @@ rm -f ~/mavsdk-drone-show-sitl-image.tar ~/mavsdk-drone-show-sitl-image.7z
 > **Need a custom release workflow?** See [SITL Custom Release Workflow](sitl-custom-release-workflow.md) for the clean path to maintain your own fork, rebuild a validated image, package it, and redistribute it without relying on ad hoc container edits.
 >
 > **Large-fleet note:** for validated demo/production runs with many containers, prefer a rebuilt image plus `MDS_SITL_GIT_SYNC=false` and usually `MDS_SITL_REQUIREMENTS_SYNC=false` so startup does not fan out into one remote git fetch or Python re-sync per container.
+>
+> **Regression note:** the reusable all-mode operator regression on Hetzner is now validated in that pinned-image mode. For repeatable acceptance gates on a persistent VPS, rebuild the image for the target commit, recreate the fleet from that image, and keep both boot-sync flags off during the run.
 
 #### Image Features and Components
 
@@ -187,6 +189,7 @@ Moreover, it has an auto hardware ID detection and instance creation system for 
 > - each container can still fetch and hard-reset to the latest configured MDS branch on startup, and that sync now also cleans untracked MDS files while preserving runtime artifacts such as `venv/`, `logs/`, `*.hwID`, and the baked `mavsdk_server`
 > - PX4 and the baked `mavsdk_server` binary are pinned inside the image and are updated only through a validated image rebuild; they are not auto-pulled during container startup
 > - `MDS_SITL_GIT_SYNC=true` is a mutable latest-on-boot mode. It is convenient for active development, but it is not the same as a reproducible validated release because the runtime MDS checkout may move ahead of the pinned PX4/image contents
+> - for promotion-grade regression runs on a long-lived host, do not mix an older baked image with boot-time repo sync to a newer commit; use a fresh image rebuild plus `MDS_SITL_GIT_SYNC=false` and usually `MDS_SITL_REQUIREMENTS_SYNC=false`
 > - image prep writes build metadata and PX4 provenance into the repo root so startup logs can show what was baked into the image
 > - `requirements.txt` changes trigger a venv sync automatically; unchanged requirements do not reinstall on every boot
 > - runtime file logs are bounded by default so containers stay small, common PX4 `pxh>` prompt noise is reduced in the raw SITL log, and those logs disappear when the container is removed
@@ -234,7 +237,7 @@ Notes:
 - This installer now handles headless SSH sessions cleanly. If no interactive TTY is available, it automatically switches to non-interactive defaults instead of trying to read from `/dev/tty`.
 - After the installer finishes and you launch the dashboard, give the backend a few seconds to come up before treating a first `curl` failure as a problem. The quickest readiness check is:
   ```bash
-  curl http://127.0.0.1:5000/health
+  curl http://127.0.0.1:5000/api/v1/system/health
   ```
 
 #### Option B: Manual Setup
@@ -268,6 +271,8 @@ bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --sitl
 ```
 
 - `--sitl` by itself starts the dashboard in **development mode**: React `npm start` on port `3030` plus FastAPI with auto-reload on port `5000`.
+- `--sitl` by itself starts the dashboard in **development mode**: React `npm start` on port `3030` plus FastAPI on port `5000`, but the backend now stays single-process by default so telemetry, heartbeats, command tracking, and other in-memory runtime state remain coherent during live SITL operations.
+- Backend auto-reload is now an explicit debug override only. Set `export MDS_GCS_BACKEND_RELOAD=true` only when you are actively editing backend Python code and accept that live operational state may become inconsistent while reload is enabled.
 - Use `bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --prod --sitl` when you want the optimized production-style launch instead.
 - Production currently uses a single Gunicorn worker on purpose because heartbeat state, command tracking, and background pollers still live in process memory.
 - Production serves the React build with SPA route fallback, so direct browser refresh on routes like `/logs` or `/mission-config` keeps working.
@@ -278,7 +283,7 @@ bash ~/mavsdk_drone_show/app/linux_dashboard_start.sh --sitl
 - Raw Uvicorn/Gunicorn access logs are disabled by default because MDS already emits structured API request logs. Re-enable them only when you explicitly need that extra layer with `export MDS_GCS_ACCESS_LOGS=true`.
 - The dashboard auto-detects the server IP from the browser URL — no manual IP configuration needed.
 - To override the IP: use `--overwrite-ip "YOUR_SERVER_IP"` or edit the `.env` file.
-- The official stock SITL package now auto-seeds a default launch origin from `data/origin.sitl.default.json` (Azadi Stadium). That gives first-time testers an immediate green Mission Config baseline without a manual `/set-origin`.
+- The official stock SITL package now auto-seeds a default launch origin from `data/origin.sitl.default.json` (Azadi Stadium). That gives first-time testers an immediate green Mission Config baseline without a manual `PUT /api/v1/origin`.
 - If you later change origin from the dashboard or API, MDS writes a local runtime override to `data/origin.json`. That file is intentionally untracked and overrides the packaged SITL default on that server until you replace or remove it.
 - If you want to return a server back to the stock Azadi demo baseline, delete the local `data/origin.json` override and restart the normal SITL flow.
 
@@ -555,6 +560,129 @@ If you want the validated 5-drone Smart Swarm acceptance run from the command li
 ```bash
 python3 tools/validate_smart_swarm_runtime.py
 ```
+
+If you are chaining multiple mission-family validators on the same SITL fleet, reset the fleet back onto its intended launch geometry before the next Drone Show run. Smart Swarm and Swarm Trajectory can leave drones idle at non-show positions, which is operationally valid for those modes but should fail Drone Show launch readiness. On a clean demo stack, the simplest reset is to recreate the containers from the same repo/branch source:
+
+```bash
+bash multiple_sitl/create_dockers.sh 3
+```
+
+For the reusable operator-grade validation platform, including standalone action
+controls, Mission Config/origin validation, built-in templates, JSON plan
+files, deterministic artifacts, and the runtime-vs-validator repo split, use:
+
+- [SITL Validation Platform](sitl-validation-platform.md)
+
+If you want the default operator regression suite, use:
+
+```bash
+python3 tools/run_sitl_validation_suite.py \
+  --base-url http://127.0.0.1:5000 \
+  --validator-root ~/mavsdk_drone_show \
+  --repo-root ~/mavsdk_drone_show \
+  --drone-ids 1 2 3
+```
+
+That default template now includes:
+
+- Mission Config / origin validation
+- a protective reset before Drone Show
+- Drone Show
+- standalone action controls
+- Smart Swarm
+- Swarm Trajectory
+
+To run only the configuration/origin gate:
+
+```bash
+python3 tools/run_sitl_validation_suite.py \
+  --template config_only \
+  --base-url http://127.0.0.1:5000 \
+  --validator-root ~/mavsdk_drone_show \
+  --repo-root ~/mavsdk_drone_show \
+  --drone-ids 1 2 3
+```
+
+To run only the mission-family regression without the standalone action drill or
+the configuration gate:
+
+```bash
+python3 tools/run_sitl_validation_suite.py \
+  --template mission_regression \
+  --base-url http://127.0.0.1:5000 \
+  --validator-root ~/mavsdk_drone_show \
+  --repo-root ~/mavsdk_drone_show \
+  --drone-ids 1 2 3
+```
+
+If the validator tooling is being executed from a temporary checkout but the
+live GCS and SITL runtime are using a different repo path, pass both roots
+explicitly so Swarm Trajectory processing, configuration cleanup, and final
+reset target the same runtime tree:
+
+```bash
+python3 tools/run_sitl_validation_suite.py \
+  --base-url http://127.0.0.1:5000 \
+  --validator-root /root/mavsdk_drone_show_validator_sync \
+  --repo-root /root/mavsdk_drone_show_main_candidate_runtime_live \
+  --drone-ids 1 2 3
+```
+
+The validation platform is not tied to one VPS layout. Use:
+
+- one shared path when the validator tools and live runtime are on the same host
+- split `validator_root` and `repo_root` when you need a temporary tooling checkout
+- a remote `--base-url` when the validator is not running on the same host as the GCS
+
+Plain synced validator copies are supported. A real git checkout still gives
+better provenance in `suite-summary.json`, but it is not required.
+
+For serious regression runs, the container policy is:
+
+- recreate the fleet at the start
+- let the suite recreate again before any later Drone Show leg that follows a different mission family
+- let the suite recreate again at the end
+
+That is the clean acceptance-grade default. Reusing already-running containers
+is only recommended for narrow local debugging when you intentionally accept the
+inherited runtime state.
+
+QuickScout remains intentionally deferred from this reusable SITL gate until the
+mission subsystem itself is more mature.
+
+If you want checked-in named scenarios instead of remembering plan-file paths,
+the suite now ships with a bundled plan library under `tools/sitl_plans/`.
+
+List the bundled plans:
+
+```bash
+python3 tools/run_sitl_validation_suite.py --list-bundled-plans
+```
+
+Run one by name:
+
+```bash
+python3 tools/run_sitl_validation_suite.py \
+  --plan-name actions_core \
+  --base-url http://127.0.0.1:5000 \
+  --validator-root ~/mavsdk_drone_show \
+  --repo-root ~/mavsdk_drone_show \
+  --drone-ids 1 2 3
+```
+
+Current stable bundled scenarios include:
+
+- `config_roundtrip`
+- `config_then_drone_show`
+- `drone_show_matrix`
+- `actions_core`
+- `smart_swarm_runtime`
+- `swarm_trajectory_short_profile`
+- `mission_regression`
+- `operator_regression`
+
+More aggressive combined-mode and fault-injection scenarios are intentionally
+tracked as deferred work until they stay deterministic enough for routine use.
 
 
 ## Additional Resources

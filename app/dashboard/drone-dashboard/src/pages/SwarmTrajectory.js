@@ -1,8 +1,66 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { getBackendURL } from '../utilities/utilities';
-import { getProcessingRecommendation, processTrajectories, clearProcessedData } from '../services/droneApiService';
+import { toast } from 'react-toastify';
+
+import ConfirmationModal from '../components/ConfirmationModal';
+import SwarmTrajectoryWorkspaceSummary from '../components/trajectory/SwarmTrajectoryWorkspaceSummary';
+import useFetch from '../hooks/useFetch';
+import { GCS_ROUTE_KEYS } from '../services/gcsApiService';
+import {
+  buildSwarmTrajectoryPlotUrl,
+  clearAllSwarmTrajectories,
+  clearSwarmTrajectoryDrone,
+  clearSwarmTrajectoryLeader,
+  clearProcessedData,
+  commitSwarmTrajectoryOutputs,
+  downloadSwarmClusterKml,
+  downloadSwarmTrajectoryCsv,
+  downloadSwarmTrajectoryKml,
+  getSwarmLeaders,
+  getSwarmTrajectoryStatus,
+  processTrajectories,
+  removeSwarmTrajectoryUpload,
+  uploadSwarmTrajectory,
+} from '../services/droneApiService';
+import {
+  buildSwarmTrajectoryViewModel,
+  getClusterStateMeta,
+} from '../utilities/swarmTrajectoryViewModel';
+import {
+  buildSwarmTrajectoryStages,
+  buildSwarmTrajectoryWorkspaceStatus,
+} from '../utilities/swarmTrajectoryWorkspaceModel';
 import '../styles/SwarmTrajectory.css';
+
+const buildListLabel = (values = []) => (values.length > 0 ? values.join(', ') : 'None');
+
+const buildConfirmMessage = ({ summary, details = [], warning = '' }) => (
+  <div className="swarm-trajectory-confirm">
+    <p>{summary}</p>
+    {details.length > 0 ? (
+      <ul className="swarm-trajectory-confirm__list">
+        {details.map((detail) => (
+          <li key={detail}>{detail}</li>
+        ))}
+      </ul>
+    ) : null}
+    {warning ? <p className="swarm-trajectory-confirm__warning">{warning}</p> : null}
+  </div>
+);
+
+const formatRecommendationTone = (action = '') => action.replace(/_/g, '-');
+
+const triggerBlobDownload = (blob, filename) => {
+  const url = window.URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  window.URL.revokeObjectURL(url);
+};
 
 const SwarmTrajectory = () => {
   const [leaders, setLeaders] = useState([]);
@@ -20,336 +78,404 @@ const SwarmTrajectory = () => {
   const [kmlProgress, setKmlProgress] = useState(null);
   const [recommendation, setRecommendation] = useState(null);
   const [clearingData, setClearingData] = useState(false);
-  const processedDroneIds = results?.processed_drone_list || status?.processed_drones || [];
-  const processedDroneSet = new Set(processedDroneIds);
-  const visibleClusterLeaders = leaders.filter(
-    (leaderId) => uploadedLeaders.has(leaderId) && processedDroneSet.has(leaderId)
-  );
+  const [pageError, setPageError] = useState('');
+  const [operatorNotice, setOperatorNotice] = useState(null);
+  const [confirmDialog, setConfirmDialog] = useState(null);
+  const { data: gcsConfig } = useFetch(GCS_ROUTE_KEYS.gcsConfig);
 
   useEffect(() => {
+    // This screen intentionally boots once, then refreshes from explicit operator actions.
     initializeComponent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const initializeComponent = async () => {
-    await fetchLeaders();
-    await fetchStatus();
-    await checkExistingResults();
-    await fetchRecommendation();
+  const viewModel = useMemo(
+    () => buildSwarmTrajectoryViewModel({
+      leaders,
+      hierarchies,
+      followerDetails,
+      uploadedLeaders: Array.from(uploadedLeaders),
+      status,
+      results,
+    }),
+    [leaders, hierarchies, followerDetails, uploadedLeaders, status, results],
+  );
+
+  const clusterByLeader = useMemo(
+    () => new Map(viewModel.clusters.map((cluster) => [Number(cluster.leader_id), cluster])),
+    [viewModel.clusters],
+  );
+  const processedDroneSet = useMemo(() => new Set(viewModel.processedDroneList), [viewModel.processedDroneList]);
+  const hasProcessedOutputs = Boolean(status?.has_results || results?.success || viewModel.processedDroneCount > 0);
+  const workspaceStatus = useMemo(
+    () => buildSwarmTrajectoryWorkspaceStatus({ viewModel, recommendation, hasProcessedOutputs }),
+    [viewModel, recommendation, hasProcessedOutputs],
+  );
+  const workflowStages = useMemo(
+    () => buildSwarmTrajectoryStages({ viewModel, recommendation, hasProcessedOutputs }),
+    [viewModel, recommendation, hasProcessedOutputs],
+  );
+  const commitMode = gcsConfig == null
+    ? 'unknown'
+    : gcsConfig.git_auto_push
+      ? 'commit_and_push'
+      : 'local_commit';
+  const isPartialPackage = viewModel.currentOutcome === 'partial';
+
+  const notify = (tone, title, message = '') => {
+    const method = toast[tone] || toast.info;
+    method(message ? `${title} — ${message}` : title);
   };
 
-  const fetchRecommendation = async () => {
-    try {
-      const response = await getProcessingRecommendation();
-      if (response.success) {
-        setRecommendation(response.recommendation);
-      }
-    } catch (error) {
-      console.error('Error fetching recommendation:', error);
-    }
+  const showNotice = (tone, title, message, details = []) => {
+    setOperatorNotice({ tone, title, message, details });
+    notify(tone, title, message);
   };
 
-  const checkExistingResults = async () => {
-    try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/status`);
-      const data = await response.json();
-      
-      if (data.success && data.status.has_results) {
-        // Create results object to show existing processed trajectories
-        setResults({
-          success: true,
-          processed_drones: data.status.processed_trajectories,
-          statistics: {
-            leaders: data.status.leader_count || 0,
-            followers: data.status.follower_count || 0,
-            errors: 0
-          },
-          processed_drone_list: data.status.processed_drones // Store the list of processed drone IDs
-        });
-      }
-    } catch (error) {
-      console.error('Error checking existing results:', error);
+  const openConfirmDialog = ({
+    title,
+    summary,
+    details = [],
+    warning = '',
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    isDanger = false,
+    onConfirm,
+  }) => {
+    setConfirmDialog({
+      title,
+      message: buildConfirmMessage({ summary, details, warning }),
+      confirmLabel,
+      cancelLabel,
+      isDanger,
+      onConfirm,
+    });
+  };
+
+  const closeConfirmDialog = () => {
+    setConfirmDialog(null);
+  };
+
+  const handleConfirmDialog = async () => {
+    const action = confirmDialog?.onConfirm;
+    closeConfirmDialog();
+    if (action) {
+      await action();
     }
   };
 
   const fetchLeaders = async () => {
     try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/leaders`);
-      const data = await response.json();
-      
-      if (data.success) {
-        setLeaders(data.leaders);
-        setHierarchies(data.hierarchies);
-        setFollowerDetails(data.follower_details || {});
-        setUploadedLeaders(new Set(data.uploaded_leaders));
-        setSimulationMode(data.simulation_mode);
-      } else {
-        console.error('Failed to fetch leaders:', data.error);
-        alert(`Failed to load swarm configuration: ${data.error}`);
+      const data = await getSwarmLeaders();
+
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to load swarm configuration');
       }
+
+      setLeaders(data.leaders || []);
+      setHierarchies(data.hierarchies || {});
+      setFollowerDetails(data.follower_details || {});
+      setSimulationMode(Boolean(data.simulation_mode));
+      setPageError('');
     } catch (error) {
       console.error('Error fetching leaders:', error);
-      alert('Error connecting to backend. Please check server status.');
+      setPageError(error.message || 'Unable to load swarm configuration');
     }
   };
 
   const fetchStatus = async () => {
     try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/status`);
-      const data = await response.json();
-      
-      if (data.success) {
-        setStatus(data.status);
-        setResults((prev) => {
-          if (!prev) {
-            return data.status.has_results ? prev : null;
-          }
+      const data = await getSwarmTrajectoryStatus();
 
-          if (!data.status.has_results) {
-            return null;
-          }
-
-          return {
-            ...prev,
-            processed_drones: data.status.processed_trajectories,
-            processed_drone_list: data.status.processed_drones || [],
-            statistics: {
-              ...prev.statistics,
-              leaders: data.status.leader_count ?? prev.statistics?.leaders ?? 0,
-              followers: data.status.follower_count ?? prev.statistics?.followers ?? 0,
-            },
-          };
-        });
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to load processing status');
       }
+
+      const nextStatus = data.status;
+      const inferredOutcome = nextStatus.cluster_summary?.overall_state === 'partial' ? 'partial' : 'success';
+
+      setStatus(nextStatus);
+      setRecommendation(nextStatus.processing_recommendation || null);
+      setUploadedLeaders(new Set((nextStatus.uploaded_leaders || []).map(Number)));
+      setPageError('');
+
+      setResults((prev) => {
+        if (!nextStatus.has_results) {
+          return null;
+        }
+
+        return {
+          success: true,
+          outcome: inferredOutcome,
+          message: prev?.message
+            || (inferredOutcome === 'partial'
+              ? 'Some clusters still need attention before launch.'
+              : 'All processed swarm trajectory outputs are ready for launch preflight.'),
+          processed_drones: nextStatus.processed_trajectories || 0,
+          processed_drone_list: nextStatus.processed_drones || [],
+          processed_leaders: nextStatus.processed_leaders || [],
+          statistics: {
+            leaders: nextStatus.leader_count || 0,
+            followers: nextStatus.follower_count || 0,
+            errors: prev?.statistics?.errors || 0,
+          },
+          session_id: nextStatus.session?.session_id || prev?.session_id || null,
+          missing_leaders: prev?.missing_leaders || [],
+          skipped_drone_ids: prev?.skipped_drone_ids || [],
+          auto_reloaded: prev?.auto_reloaded || [],
+        };
+      });
+
+      return nextStatus;
     } catch (error) {
       console.error('Error fetching status:', error);
+      setPageError(error.message || 'Unable to load swarm trajectory status');
+      return null;
     }
   };
 
+  const refreshOperationalState = async ({ reloadStructure = false } = {}) => {
+    const tasks = [fetchStatus()];
+    if (reloadStructure) {
+      tasks.unshift(fetchLeaders());
+    }
+    await Promise.all(tasks);
+  };
+
+  const initializeComponent = async () => {
+    await Promise.all([fetchLeaders(), fetchStatus()]);
+  };
+
   const handleFileUpload = async (leaderId, file) => {
-    if (!file) return;
+    if (!file) {
+      return;
+    }
 
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/upload/${leaderId}`, {
-        method: 'POST',
-        body: formData
-      });
-      
-      const result = await response.json();
-      
-      if (result.success) {
-        setUploadedLeaders(prev => new Set([...prev, leaderId]));
-        await fetchStatus(); // Refresh status
-        alert(`Drone ${leaderId} trajectory uploaded successfully`);
-      } else {
-        alert(`Upload failed: ${result.error}`);
+      const result = await uploadSwarmTrajectory(leaderId, file, file.name);
+
+      if (!result.success) {
+        throw new Error(result.error || 'Upload failed');
       }
+
+      setOperatorNotice(null);
+      await refreshOperationalState();
+      showNotice(
+        'success',
+        `Leader ${leaderId} CSV uploaded`,
+        'Review the processing recommendation before launch.',
+      );
     } catch (error) {
       console.error('Upload error:', error);
-      alert(`Upload error: ${error.message}`);
+      showNotice('error', `Leader ${leaderId} upload failed`, error.message || 'Upload failed');
     }
   };
 
-  const handleSmartProcessing = async (forceRestart = false) => {
+  const executeProcessing = async (processingOptions) => {
     setProcessing(true);
     setResults(null);
+    setOperatorNotice(null);
 
     try {
-      // Get latest recommendation
-      await fetchRecommendation();
-
-      let processingOptions = { auto_reload: true };
-
-      if (forceRestart) {
-        processingOptions.force_clear = true;
-      } else if (recommendation?.requires_confirmation) {
-        // Show confirmation dialog for critical actions
-        const confirmMessage = `${recommendation.message}\n\n${recommendation.details.join('\n')}\n\nContinue?`;
-
-        if (!window.confirm(confirmMessage)) {
-          setProcessing(false);
-          return;
-        }
-
-        // Set appropriate options based on recommendation
-        if (recommendation.action === 'mandatory_full_reprocess' || recommendation.action === 'recommended_full_reprocess') {
-          processingOptions.force_clear = true;
-        }
-      }
-
-      const result = await processTrajectories(processingOptions); // Using imported function
+      const result = await processTrajectories(processingOptions);
 
       setResults(result);
-      await fetchStatus();
-      await fetchRecommendation(); // Update recommendation after processing
+      await refreshOperationalState();
 
       if (result.success) {
-        let message = `✅ Processing complete! ${result.processed_drones} drones processed successfully.`;
-
-        if (result.auto_reloaded && result.auto_reloaded.length > 0) {
-          message += `\n\n📋 Auto-reloaded existing trajectories: ${result.auto_reloaded.join(', ')}`;
+        const detailLines = [];
+        if (result.auto_reloaded?.length) {
+          detailLines.push(`Auto-reloaded leaders: ${buildListLabel(result.auto_reloaded)}`);
+        }
+        if (result.missing_leaders?.length) {
+          detailLines.push(`Missing leaders: ${buildListLabel(result.missing_leaders)}`);
+        }
+        if (result.skipped_drone_ids?.length) {
+          detailLines.push(`Missing outputs: ${buildListLabel(result.skipped_drone_ids)}`);
         }
 
-        if (result.missing_leaders && result.missing_leaders.length > 0) {
-          message += `\n\n⚠️ Missing leaders: ${result.missing_leaders.join(', ')}`;
-        }
-
-        alert(message);
-      } else {
-        let errorMessage = `❌ Processing failed: ${result.error}`;
-
-        if (result.recommendation && result.recommendation.message) {
-          errorMessage += `\n\n💡 Recommendation: ${result.recommendation.message}`;
-        }
-
-        alert(errorMessage);
+        showNotice(
+          result.outcome === 'partial' ? 'warning' : 'success',
+          result.outcome === 'partial' ? 'Processing finished with attention items' : 'Formation outputs ready',
+          result.message,
+          detailLines,
+        );
+        return;
       }
+
+      showNotice(
+        'error',
+        'Processing failed',
+        result.error || 'Unable to generate swarm trajectory outputs.',
+        result.recommendation?.message ? [result.recommendation.message] : [],
+      );
     } catch (error) {
       console.error('Processing error:', error);
-      alert(`❌ Processing error: ${error.message}`);
+      showNotice('error', 'Processing failed', error.message || 'Unable to process trajectories');
     } finally {
       setProcessing(false);
     }
   };
 
-  const handleExplicitClear = async () => {
-    if (!window.confirm('🗑️ Clear All Processed Data?\n\nThis will remove:\n• All processed trajectory files\n• Generated plots and visualizations\n• Session tracking data\n\nThis action cannot be undone. Continue?')) {
+  const requestProcessing = async (forceRestart = false) => {
+    if (viewModel.uploadedLeaderIds.length === 0) {
+      notify('info', 'Upload at least one leader CSV before processing');
       return;
     }
 
-    setClearingData(true);
+    const latestStatus = await fetchStatus();
+    const latestRecommendation = latestStatus?.processing_recommendation || recommendation;
+    const processingOptions = {
+      auto_reload: true,
+      force_clear: Boolean(forceRestart),
+    };
 
-    try {
-      const result = await clearProcessedData();
-
-      if (result.success) {
-        setResults(null);
-        await fetchStatus();
-        await fetchRecommendation();
-        alert(`✅ Cleared successfully!\n\n${result.message}`);
-      } else {
-        alert(`❌ Clear failed: ${result.error}`);
-      }
-    } catch (error) {
-      console.error('Clear error:', error);
-      alert(`❌ Clear error: ${error.message}`);
-    } finally {
-      setClearingData(false);
+    if (forceRestart) {
+      openConfirmDialog({
+        title: 'Rebuild all cluster outputs?',
+        summary: 'This will clear processed outputs and regenerate the entire swarm trajectory package from the current leader uploads.',
+        details: [
+          `Uploaded leaders: ${buildListLabel(viewModel.uploadedLeaderIds)}`,
+          `Expected leaders: ${buildListLabel(viewModel.expectedLeaderIds)}`,
+        ],
+        warning: 'Use this when cluster assignments changed or when you want a clean processing baseline.',
+        confirmLabel: 'Start Fresh',
+        isDanger: false,
+        onConfirm: () => executeProcessing(processingOptions),
+      });
+      return;
     }
+
+    if (latestRecommendation?.requires_confirmation) {
+      openConfirmDialog({
+        title: 'Review processing change set',
+        summary: latestRecommendation.message,
+        details: latestRecommendation.details || [],
+        warning: 'This decision affects the generated follower outputs and readiness state shown to operators.',
+        confirmLabel: latestRecommendation.action === 'safe_incremental' ? 'Process' : 'Continue',
+        onConfirm: () => executeProcessing(processingOptions),
+      });
+      return;
+    }
+
+    await executeProcessing(processingOptions);
   };
 
-  // Keep the old function name for compatibility but delegate to smart processing
-  const processTrajectories_old = () => handleSmartProcessing(false);
+  const handleExplicitClear = async () => {
+    openConfirmDialog({
+      title: 'Clear processed outputs only?',
+      summary: 'This removes generated follower CSVs, plots, and the current processing session, but keeps uploaded leader CSVs.',
+      details: [
+        `Uploaded leaders stay available: ${buildListLabel(viewModel.uploadedLeaderIds)}`,
+        'Use this when you want to keep source leader paths but force a clean reprocess.',
+      ],
+      warning: 'Processed outputs will disappear from launch preflight until you run processing again.',
+      confirmLabel: 'Clear Processed Outputs',
+      isDanger: true,
+      onConfirm: async () => {
+        setClearingData(true);
+        try {
+          const result = await clearProcessedData();
+
+          if (!result.success) {
+            throw new Error(result.error || 'Clear failed');
+          }
+
+          setResults(null);
+          await refreshOperationalState();
+          showNotice('success', 'Processed outputs cleared', result.message || 'Processed outputs removed.');
+        } catch (error) {
+          console.error('Clear error:', error);
+          showNotice('error', 'Clear failed', error.message || 'Unable to clear processed outputs');
+        } finally {
+          setClearingData(false);
+        }
+      },
+    });
+  };
 
   const removeTrajectoryFile = async (leaderId) => {
-    if (!window.confirm(`Remove trajectory for Drone ${leaderId}?\n\nThis will delete:\n• Raw trajectory CSV\n• All processed files for this cluster\n• All generated plots\n\nThis cannot be undone.`)) {
-      return;
-    }
+    const cluster = clusterByLeader.get(Number(leaderId));
 
-    try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/remove/${leaderId}`, {
-        method: 'DELETE'
-      });
-      const result = await response.json();
+    openConfirmDialog({
+      title: `Remove leader ${leaderId} upload?`,
+      summary: 'This deletes the raw leader CSV and all generated outputs for the cluster tied to this leader.',
+      details: [
+        `Follower IDs: ${buildListLabel(cluster?.follower_ids || [])}`,
+        `Current cluster state: ${getClusterStateMeta(cluster).label}`,
+      ],
+      warning: 'This action removes both source and processed artifacts for this cluster.',
+      confirmLabel: 'Remove Leader CSV',
+      isDanger: true,
+      onConfirm: async () => {
+        try {
+          const result = await removeSwarmTrajectoryUpload(leaderId);
 
-      if (result.success) {
-        // Remove from uploaded leaders
-        setUploadedLeaders(prev => {
-          const newSet = new Set(prev);
-          newSet.delete(leaderId);
-          return newSet;
-        });
+          if (!result.success) {
+            throw new Error(result.error || 'Remove failed');
+          }
 
-        // Clear results if this was affecting processed data
-        if (results && results.processed_leaders && results.processed_leaders.includes(leaderId)) {
-          setResults(null);
+          await refreshOperationalState();
+          showNotice('success', `Leader ${leaderId} removed`, result.message || 'Leader CSV removed.');
+        } catch (error) {
+          console.error('Remove error:', error);
+          showNotice('error', `Leader ${leaderId} remove failed`, error.message || 'Unable to remove leader CSV');
         }
-
-        await fetchStatus();
-        await fetchRecommendation();
-        alert(`✅ Drone ${leaderId} trajectory removed successfully!\n\n${result.message}`);
-      } else {
-        alert(`❌ Remove failed: ${result.error}`);
-      }
-    } catch (error) {
-      console.error('Remove error:', error);
-      alert(`❌ Remove error: ${error.message}`);
-    }
+      },
+    });
   };
 
   const clearAll = async () => {
-    if (!window.confirm('This will clear all uploaded trajectories, processed files, and generated plots. Continue?')) {
-      return;
-    }
+    openConfirmDialog({
+      title: 'Clear all swarm trajectory artifacts?',
+      summary: 'This removes all uploaded leader CSVs, processed follower outputs, plots, and the current processing session.',
+      details: [
+        `Uploaded leaders: ${buildListLabel(viewModel.uploadedLeaderIds)}`,
+        `Processed drones: ${viewModel.processedDroneCount}`,
+      ],
+      warning: 'Use this only when resetting the entire Swarm Trajectory workspace.',
+      confirmLabel: 'Clear Everything',
+      isDanger: true,
+      onConfirm: async () => {
+        try {
+          const result = await clearAllSwarmTrajectories();
 
-    try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/clear`, {
-        method: 'POST'
-      });
-      const result = await response.json();
+          if (!result.success) {
+            throw new Error(result.error || 'Clear failed');
+          }
 
-      if (result.success) {
-        setUploadedLeaders(new Set());
-        setResults(null);
-        await fetchStatus(); // Refresh status
-        alert('All trajectory files cleared successfully');
-      } else {
-        alert(`Clear failed: ${result.error}`);
-      }
-    } catch (error) {
-      console.error('Clear error:', error);
-      alert(`Clear error: ${error.message}`);
-    }
+          setResults(null);
+          await refreshOperationalState({ reloadStructure: true });
+          showNotice('success', 'Swarm trajectory workspace cleared', result.message || 'All files cleared.');
+        } catch (error) {
+          console.error('Clear error:', error);
+          showNotice('error', 'Workspace clear failed', error.message || 'Unable to clear files');
+        }
+      },
+    });
   };
 
   const downloadDroneTrajectory = async (droneId) => {
     try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/download/${droneId}`);
-      
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `Drone ${droneId}_trajectory.csv`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-      } else {
-        const error = await response.json();
-        alert(`Download failed: ${error.error}`);
-      }
+      const blob = await downloadSwarmTrajectoryCsv(droneId);
+      triggerBlobDownload(blob, `Drone ${droneId}_trajectory.csv`);
     } catch (error) {
       console.error('Download error:', error);
-      alert(`Download error: ${error.message}`);
+      notify('error', `Drone ${droneId} CSV download failed`, error.message || 'Unable to download CSV');
     }
   };
 
   const downloadDroneKML = async (droneId) => {
     try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/download-kml/${droneId}`);
-      
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `Drone ${droneId}_trajectory.kml`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-        alert(`KML file downloaded! Open with Google Earth to view 3D trajectory over terrain.`);
-      } else {
-        const error = await response.json();
-        alert(`KML download failed: ${error.error}`);
-      }
+      const blob = await downloadSwarmTrajectoryKml(droneId);
+      triggerBlobDownload(blob, `Drone ${droneId}_trajectory.kml`);
+      notify('success', `Drone ${droneId} KML ready`, 'Open the file in Google Earth or another KML viewer.');
     } catch (error) {
       console.error('KML download error:', error);
-      alert(`KML download error: ${error.message}`);
+      notify('error', `Drone ${droneId} KML download failed`, error.message || 'Unable to download KML');
     }
   };
 
@@ -357,106 +483,90 @@ const SwarmTrajectory = () => {
     try {
       setDownloadingKML(true);
       setKmlProgress({ step: 'Analyzing cluster formation...', progress: 20 });
-      
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/download-cluster-kml/${leaderId}`);
-      
+
+      const blob = await downloadSwarmClusterKml(leaderId);
+
       setKmlProgress({ step: 'Generating KML file...', progress: 60 });
-      
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `Cluster_Leader_${leaderId}.kml`;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-        
-        setKmlProgress({ step: 'Download complete!', progress: 100 });
-        
-        setTimeout(() => {
-          alert(`🌍 KML Downloaded Successfully!\n\n📁 File: Cluster_Leader_${leaderId}.kml\n🚀 Open with Google Earth to view 3D trajectories`);
-          setKmlProgress(null);
-        }, 500);
-      } else {
-        const error = await response.json();
-        throw new Error(error.error || 'Download failed');
-      }
+
+      triggerBlobDownload(blob, `Cluster_Leader_${leaderId}.kml`);
+
+      setKmlProgress({ step: 'Download complete', progress: 100 });
+      setTimeout(() => {
+        setKmlProgress(null);
+        notify('success', `Cluster ${leaderId} KML ready`, 'Open the file in Google Earth to review the full cluster path.');
+      }, 500);
     } catch (error) {
       console.error('KML download error:', error);
       setKmlProgress(null);
-      alert(`❌ KML Download Failed\n\nError: ${error.message}`);
+      notify('error', `Cluster ${leaderId} KML download failed`, error.message || 'Unable to download cluster KML');
     } finally {
       setDownloadingKML(false);
     }
   };
 
   const getFollowersForLeader = (leaderId) => {
+    const cluster = clusterByLeader.get(Number(leaderId));
+    if (cluster?.follower_ids?.length) {
+      return cluster.follower_ids;
+    }
     return followerDetails[leaderId] || [];
   };
 
   const getProcessedFollowersForLeader = (leaderId) => {
+    const cluster = clusterByLeader.get(Number(leaderId));
+    if (cluster?.processed_follower_ids?.length) {
+      return cluster.processed_follower_ids;
+    }
+
     return getFollowersForLeader(leaderId).filter((droneId) => processedDroneSet.has(droneId));
   };
 
   const clearSingleTrajectory = async (leaderId) => {
-    if (!window.confirm(`Clear trajectory for Drone ${leaderId}? This will also remove all associated follower trajectories.`)) {
-      return;
-    }
+    const cluster = clusterByLeader.get(Number(leaderId));
 
-    try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/clear-leader/${leaderId}`, {
-        method: 'POST'
-      });
-
-      if (response.ok) {
-        // Remove from uploaded leaders
-        setUploadedLeaders(prev => {
-          const newSet = new Set(prev);
-          newSet.delete(leaderId);
-          return newSet;
-        });
-        
-        // Clear results if no leaders left
-        if (uploadedLeaders.size === 1) {
+    openConfirmDialog({
+      title: `Clear cluster ${leaderId}?`,
+      summary: 'This removes the leader CSV and every generated follower output tied to this cluster.',
+      details: [
+        `Follower IDs: ${buildListLabel(cluster?.follower_ids || [])}`,
+        `Processed drones in cluster: ${cluster?.processed_drone_count || 0}`,
+      ],
+      warning: 'Use this when the cluster assignment or leader path is no longer valid.',
+      confirmLabel: 'Clear Cluster',
+      isDanger: true,
+      onConfirm: async () => {
+        try {
+          const result = await clearSwarmTrajectoryLeader(leaderId);
           setResults(null);
+          await refreshOperationalState();
+          showNotice('success', `Cluster ${leaderId} cleared`, result.message || 'Cluster outputs removed.');
+        } catch (error) {
+          console.error('Clear single trajectory error:', error);
+          showNotice('error', `Cluster ${leaderId} clear failed`, error.message || 'Unable to clear cluster');
         }
-        
-        await fetchStatus(); // Refresh status
-        alert(`Drone ${leaderId} trajectory cleared successfully`);
-      } else {
-        const error = await response.json();
-        alert(`Clear failed: ${error.error}`);
-      }
-    } catch (error) {
-      console.error('Clear single trajectory error:', error);
-      alert(`Clear error: ${error.message}`);
-    }
+      },
+    });
   };
 
   const clearIndividualDrone = async (droneId) => {
-    if (!window.confirm(`🗑️ Remove trajectory for Drone ${droneId}?\n\nThis will delete the drone's trajectory file and plot. This action cannot be undone.`)) {
-      return;
-    }
-
-    try {
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/clear-drone/${droneId}`, {
-        method: 'POST'
-      });
-
-      if (response.ok) {
-        await fetchStatus(); // Refresh status
-        alert(`✅ Drone ${droneId} trajectory removed successfully`);
-      } else {
-        const error = await response.json();
-        alert(`❌ Delete failed: ${error.error}`);
-      }
-    } catch (error) {
-      console.error('Delete drone error:', error);
-      alert(`❌ Delete error: ${error.message}`);
-    }
+    openConfirmDialog({
+      title: `Remove drone ${droneId} output?`,
+      summary: 'This deletes the processed CSV and plot for the selected drone only.',
+      details: ['Use this for targeted regeneration when one follower output is known to be invalid.'],
+      warning: 'The cluster will remain in a partial-output state until the next processing pass.',
+      confirmLabel: 'Remove Output',
+      isDanger: true,
+      onConfirm: async () => {
+        try {
+          await clearSwarmTrajectoryDrone(droneId);
+          await refreshOperationalState();
+          showNotice('success', `Drone ${droneId} output removed`, 'Run processing again to regenerate this output.');
+        } catch (error) {
+          console.error('Delete drone error:', error);
+          showNotice('error', `Drone ${droneId} output removal failed`, error.message || 'Unable to delete output');
+        }
+      },
+    });
   };
 
   const openLightbox = (imageSrc, title) => {
@@ -467,568 +577,661 @@ const SwarmTrajectory = () => {
     setLightboxImage(null);
   };
 
-  // Handle ESC key for lightbox
   useEffect(() => {
-    const handleEscape = (e) => {
-      if (e.key === 'Escape' && lightboxImage) {
+    const handleEscape = (event) => {
+      if (event.key === 'Escape' && lightboxImage) {
         closeLightbox();
       }
     };
-    
+
     document.addEventListener('keydown', handleEscape);
     return () => document.removeEventListener('keydown', handleEscape);
   }, [lightboxImage]);
 
   const commitAndPushChanges = async () => {
-    if (!results || results.processed_drones === 0) {
-      alert('⚠️ No trajectories to commit. Please process trajectories first.');
+    if (!hasProcessedOutputs || viewModel.processedDroneCount === 0) {
+      notify('info', 'Process the swarm trajectory package before committing');
       return;
     }
 
-    const confirmed = window.confirm(`🚀 Commit & Push Changes?\n\nSave ${results.processed_drones} trajectories to repository and sync with all drones.\n\nContinue?`);
-    
-    if (!confirmed) return;
+    const isPushMode = commitMode === 'commit_and_push';
+    const title = isPushMode ? 'Commit and push mission outputs?' : 'Commit mission outputs locally?';
+    const summary = isPushMode
+      ? 'This stages the generated cluster outputs, creates a git commit, and pushes the result to the active repository.'
+      : 'This stages the generated cluster outputs and creates a local git commit on the GCS. Repository push is disabled for this deployment.';
+    const warning = isPushMode
+      ? 'Only commit when the plots and readiness summary reflect the exact package you want operators to see in launch preflight.'
+      : 'Use this to preserve a traceable local mission package. Launch can still use the current processed outputs even when repository push is disabled.';
+    const finalWarning = isPartialPackage
+      ? `${warning} Current outputs still have attention items, so do not treat this commit as a full-fleet release package until processing issues are resolved.`
+      : warning;
+    const confirmLabel = isPushMode ? 'Commit & Push' : 'Commit Locally';
 
-    setCommitting(true);
-    setCommitProgress({ step: 'Preparing...', progress: 10 });
+    openConfirmDialog({
+      title,
+      summary,
+      details: [
+        `Processed drones: ${viewModel.processedDroneCount}`,
+        `Ready clusters: ${viewModel.clusterSummary.ready_cluster_count}/${viewModel.clusterSummary.cluster_count}`,
+        `Session: ${viewModel.session.session_id || 'No active processing session'}`,
+      ],
+      warning: finalWarning,
+      confirmLabel,
+      onConfirm: async () => {
+        setCommitting(true);
+        setCommitProgress({ step: 'Preparing files...', progress: 10 });
 
-    try {
-      // Simulate progress steps for better UX
-      const progressSteps = [
-        { step: 'Staging trajectory files...', progress: 25 },
-        { step: 'Creating git commit...', progress: 50 },
-        { step: 'Pushing to remote repository...', progress: 75 },
-        { step: 'Finalizing...', progress: 90 }
-      ];
+        try {
+          const progressSteps = isPushMode
+            ? [
+                { step: 'Staging trajectory outputs...', progress: 25 },
+                { step: 'Creating git commit...', progress: 50 },
+                { step: 'Pushing to repository...', progress: 75 },
+                { step: 'Finalizing...', progress: 90 },
+              ]
+            : [
+                { step: 'Staging trajectory outputs...', progress: 35 },
+                { step: 'Creating local git commit...', progress: 70 },
+                { step: 'Finalizing...', progress: 90 },
+              ];
 
-      for (const progressStep of progressSteps) {
-        setCommitProgress(progressStep);
-        await new Promise(resolve => setTimeout(resolve, 800)); // Smooth progress
-      }
+          for (const progressStep of progressSteps) {
+            setCommitProgress(progressStep);
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
 
-      const response = await fetch(`${getBackendURL()}/api/swarm/trajectory/commit`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: `Swarm trajectory update: ${results.processed_drones} drones processed - ${new Date().toISOString().split('T')[0]}`
-        })
-      });
+          const data = await commitSwarmTrajectoryOutputs(
+            `Swarm trajectory update: ${viewModel.processedDroneCount} drones processed - ${new Date().toISOString().split('T')[0]}`
+          );
 
-      const data = await response.json();
+          if (!data.success) {
+            throw new Error(data.error || 'Commit failed');
+          }
 
-      if (data.success) {
-        setCommitProgress({ step: 'Success!', progress: 100 });
-        
-        setTimeout(() => {
-          alert(`✅ Changes Committed Successfully!\n\n${results.processed_drones} trajectories synced to repository\n${data.git_info?.message || 'All drones updated'}`);
+          setCommitProgress({ step: 'Complete', progress: 100 });
+          setTimeout(() => {
+            setCommitProgress(null);
+            showNotice(
+              'success',
+              isPushMode ? 'Swarm trajectory outputs committed and pushed' : 'Swarm trajectory outputs committed locally',
+              data.git_info?.message || data.message || 'Mission outputs were recorded successfully.',
+            );
+          }, 500);
+        } catch (error) {
+          console.error('Commit error:', error);
           setCommitProgress(null);
-        }, 500);
-      } else {
-        throw new Error(data.error || 'Commit failed');
-      }
-
-    } catch (error) {
-      console.error('Commit error:', error);
-      setCommitProgress(null);
-      alert(`❌ Commit failed: ${error.message}\n\nPlease check your git configuration and try again.`);
-    } finally {
-      setCommitting(false);
-    }
+          showNotice('error', 'Commit failed', error.message || 'Unable to commit trajectory outputs');
+        } finally {
+          setCommitting(false);
+        }
+      },
+    });
   };
 
   return (
     <div className="swarm-trajectory">
-      {/* Header with clear title and mode indicator */}
       <div className="header">
         <div className="title-section">
-          <h1>Swarm Trajectory Planning</h1>
-          <p className="subtitle">Upload drone trajectories and process swarm formations automatically</p>
+          <h1>Swarm Trajectory Mission</h1>
+          <p className="subtitle">
+            Assign authored leader paths, regenerate follower outputs from the current swarm structure,
+            review cluster plots, and prepare a mission package for launch preflight.
+          </p>
         </div>
         <div className="mode-badge">
           {simulationMode ? 'SIMULATION' : 'LIVE'}
         </div>
       </div>
 
-      {/* Clean Workflow Guidance */}
       <div className="workflow-guide">
         <div className="guide-content">
-          <span className="guide-icon">💡</span>
+          <span className="guide-icon">Route</span>
           <div className="guide-text">
-            <span className="guide-main">Complete Workflow:</span>
+            <span className="guide-main">Operator Flow</span>
             <span className="guide-steps">
-              1. <Link to="/swarm-design" className="guide-link">Design your swarm structure</Link>
+              1. <Link to="/swarm-design" className="guide-link">Verify swarm structure</Link>
               {' → '}
-              2. <Link to="/trajectory-planning" className="guide-link">Plan trajectories</Link>
+              2. <Link to="/trajectory-planning" className="guide-link">Author leader path</Link>
               {' → '}
-              3. Upload exported CSV files here to generate swarm trajectories
+              3. Send from planner or upload leader CSVs here
+              {' → '}
+              4. Process follower outputs
+              {' → '}
+              5. Review plots, confirm readiness, then commit if needed and launch from Dashboard
             </span>
           </div>
         </div>
       </div>
 
-      {/* Current Status - Clean overview with smart recommendations */}
       <div className="status-card">
-        <h2>Current Status</h2>
+        <h2>Mission Status</h2>
+
         <div className="status-metrics">
           <div className="metric">
-            <span className="metric-value">{leaders.length}</span>
-            <span className="metric-label">Clusters Found</span>
+            <span className="metric-value">{viewModel.clusterSummary.cluster_count || leaders.length}</span>
+            <span className="metric-label">Clusters</span>
           </div>
           <div className="metric">
-            <span className="metric-value">{uploadedLeaders.size}</span>
-            <span className="metric-label">Uploaded</span>
+            <span className="metric-value">{viewModel.uploadedLeaderIds.length}</span>
+            <span className="metric-label">Leader CSVs</span>
           </div>
           <div className="metric">
-            <span className="metric-value">{status?.processed_trajectories || 0}</span>
-            <span className="metric-label">Processed</span>
+            <span className="metric-value">{viewModel.clusterSummary.ready_cluster_count}</span>
+            <span className="metric-label">Ready Clusters</span>
+          </div>
+          <div className="metric">
+            <span className="metric-value">{viewModel.processedDroneCount}</span>
+            <span className="metric-label">Processed Drones</span>
           </div>
         </div>
 
-        {/* Smart Processing Recommendation */}
-        {recommendation && (
-          <div className={`processing-recommendation ${recommendation.action.replace('_', '-')}`}>
-            <div className="recommendation-header">
-              <span className="recommendation-icon">
-                {recommendation.action === 'mandatory_full_reprocess' ? '⚠️' :
-                 recommendation.action === 'recommended_full_reprocess' ? '💡' :
-                 recommendation.action === 'incremental_with_option' ? '🔄' :
-                 recommendation.action === 'safe_incremental' ? '✅' :
-                 recommendation.action === 'no_uploads' ? '📁' : 'ℹ️'}
-              </span>
-              <span className="recommendation-title">{recommendation.message}</span>
+        {pageError ? (
+          <div className="swarm-status-banner swarm-status-banner--error" role="alert">
+            <div>
+              <strong>Status load failed.</strong>
+              <span>{pageError}</span>
             </div>
-            {recommendation.details && recommendation.details.length > 0 && (
-              <div className="recommendation-details">
-                {recommendation.details.map((detail, index) => (
-                  <div key={index} className="recommendation-detail">• {detail}</div>
-                ))}
-              </div>
-            )}
-
-            {/* Additional processing options for advanced users */}
-            {recommendation.uploaded_count > 0 && (
-              <div className="advanced-processing-options">
-                <button
-                  className="process-option-btn primary"
-                  onClick={() => handleSmartProcessing(false)}
-                  disabled={processing}
-                >
-                  <span className="btn-icon">⚡</span>
-                  {recommendation.action === 'safe_incremental' ? 'Process Normally' : 'Smart Process'}
-                </button>
-
-                <button
-                  className="process-option-btn secondary"
-                  onClick={() => handleSmartProcessing(true)}
-                  disabled={processing}
-                >
-                  <span className="btn-icon">🔄</span>
-                  Start Fresh
-                </button>
-
-                <button
-                  className="process-option-btn tertiary"
-                  onClick={handleExplicitClear}
-                  disabled={clearingData}
-                >
-                  <span className="btn-icon">🗑️</span>
-                  {clearingData ? 'Clearing...' : 'Clear Only'}
-                </button>
-              </div>
-            )}
           </div>
-        )}
+        ) : null}
+
+        {operatorNotice ? (
+          <div className={`swarm-status-banner swarm-status-banner--${operatorNotice.tone}`} role="status">
+            <div>
+              <strong>{operatorNotice.title}</strong>
+              <span>{operatorNotice.message}</span>
+              {operatorNotice.details?.length ? (
+                <ul className="swarm-status-banner__details">
+                  {operatorNotice.details.map((detail) => (
+                    <li key={detail}>{detail}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+            <button type="button" className="swarm-status-banner__dismiss" onClick={() => setOperatorNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+
+        <SwarmTrajectoryWorkspaceSummary
+          workspaceStatus={workspaceStatus}
+          stages={workflowStages}
+          session={viewModel.session}
+        />
       </div>
 
-      {/* Step-by-step workflow */}
       {leaders.length > 0 ? (
         <>
-          {/* Step 1: Upload Trajectories */}
           <div className="workflow-step">
             <div className="step-header">
-              <h3><span className="step-number">1</span>Upload Drone Trajectories</h3>
-              <p>Upload trajectory files for lead drones.</p>
+              <h3><span className="step-number">1</span>Upload Leader CSVs</h3>
+              <p>Upload only top-leader paths. Followers are generated later from the current swarm hierarchy.</p>
             </div>
-            
-            <div className="leaders-grid">
-              {leaders.map(leaderId => (
-                <div key={leaderId} className={`leader-card ${uploadedLeaders.has(leaderId) ? 'completed' : 'pending'}`}>
-                  <div className="leader-header">
-                    <h4>Drone {leaderId}</h4>
-                    <span className="follower-badge">
-                      {hierarchies[leaderId] || 0} followers
-                    </span>
-                  </div>
-                  
-                  <div className="upload-area">
-                    <input
-                      type="file"
-                      accept=".csv"
-                      onChange={(e) => {
-                        if (e.target.files[0]) {
-                          handleFileUpload(leaderId, e.target.files[0]);
-                        }
-                      }}
-                      id={`file-${leaderId}`}
-                      style={{ display: 'none' }}
-                    />
-                    <div className="upload-controls">
-                      <label htmlFor={`file-${leaderId}`} className="upload-btn">
-                        {uploadedLeaders.has(leaderId) ? (
-                          <>
-                            <span className="upload-icon">✓</span>
-                            Replace CSV
-                          </>
-                        ) : (
-                          <>
-                            <span className="upload-icon">↑</span>
-                            Upload CSV
-                          </>
-                        )}
-                      </label>
 
-                      {uploadedLeaders.has(leaderId) && (
-                        <button
-                          className="remove-btn"
-                          onClick={() => removeTrajectoryFile(leaderId)}
-                          title={`Remove trajectory for Drone ${leaderId}`}
-                        >
-                          <span className="remove-icon">🗑️</span>
-                          Remove
-                        </button>
-                      )}
+            <div className="leaders-grid">
+              {viewModel.clusters.map((cluster) => {
+                const leaderId = Number(cluster.leader_id);
+                const stateMeta = getClusterStateMeta(cluster);
+                const followerIds = cluster.follower_ids || getFollowersForLeader(leaderId);
+                const stateClass = stateMeta.tone === 'warning' ? 'attention' : stateMeta.tone;
+
+                return (
+                  <div
+                    key={leaderId}
+                    className={`leader-card leader-card--${stateClass} ${cluster.ready ? 'completed' : cluster.leader_uploaded ? 'uploaded' : 'pending'}`}
+                  >
+                    <div className="leader-header">
+                      <div>
+                        <h4>Leader {leaderId}</h4>
+                        <p className="leader-subtext">
+                          Followers: {followerIds.length > 0 ? followerIds.join(', ') : 'None'}
+                        </p>
+                      </div>
+                      <span className={`leader-state-badge ${stateClass}`}>{stateMeta.label}</span>
+                    </div>
+
+                    <p className="leader-card__summary">{stateMeta.summary}</p>
+
+                    <div className="leader-metrics">
+                      <div className="leader-metric">
+                        <strong>{cluster.expected_drone_count || 1 + (cluster.follower_count || 0)}</strong>
+                        <span>Expected</span>
+                      </div>
+                      <div className="leader-metric">
+                        <strong>{cluster.processed_drone_count || 0}</strong>
+                        <span>Processed</span>
+                      </div>
+                      <div className="leader-metric">
+                        <strong>{cluster.follower_count || followerIds.length}</strong>
+                        <span>Followers</span>
+                      </div>
+                    </div>
+
+                    {(cluster.issues?.length || cluster.advisories?.length) ? (
+                      <div className="leader-flags">
+                        {(cluster.issues || []).map((issue) => (
+                          <span key={issue} className="leader-flag leader-flag--issue">{issue}</span>
+                        ))}
+                        {(cluster.advisories || []).map((advisory) => (
+                          <span key={advisory} className="leader-flag leader-flag--advisory">{advisory}</span>
+                        ))}
+                      </div>
+                    ) : null}
+
+                    <div className="upload-area">
+                      <input
+                        type="file"
+                        accept=".csv"
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          if (file) {
+                            handleFileUpload(leaderId, file);
+                          }
+                          event.target.value = '';
+                        }}
+                        id={`file-${leaderId}`}
+                        style={{ display: 'none' }}
+                      />
+                      <div className="upload-controls">
+                        <label htmlFor={`file-${leaderId}`} className="upload-btn">
+                          {cluster.leader_uploaded ? 'Replace Leader CSV' : 'Upload Leader CSV'}
+                        </label>
+
+                        {cluster.leader_uploaded ? (
+                          <button
+                            className="remove-btn"
+                            onClick={() => removeTrajectoryFile(leaderId)}
+                            title={`Remove leader ${leaderId} CSV and related outputs`}
+                          >
+                            Remove Leader CSV
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 
-          {/* Step 2: Process Formation */}
           <div className="workflow-step">
             <div className="step-header">
-              <h3><span className="step-number">2</span>Process Formation</h3>
-              <p>Generate trajectories for the complete formation.</p>
+              <h3><span className="step-number">2</span>Generate Cluster Outputs</h3>
+              <p>Run processing to create follower trajectories, plots, and the current review package for launch preflight.</p>
             </div>
-            
+
+            <div className="process-summary">
+              <div className="process-summary__item">
+                <strong>{viewModel.clusterSummary.ready_cluster_count}/{viewModel.clusterSummary.cluster_count || leaders.length}</strong>
+                <span>Ready clusters</span>
+              </div>
+              <div className="process-summary__item">
+                <strong>{viewModel.clusterSummary.needs_processing_cluster_count}</strong>
+                <span>Need processing</span>
+              </div>
+              <div className="process-summary__item">
+                <strong>{viewModel.clusterSummary.partial_output_cluster_count}</strong>
+                <span>Partial outputs</span>
+              </div>
+              <div className="process-summary__item">
+                <strong>{viewModel.missingLeaderIds.length}</strong>
+                <span>Missing leader CSVs</span>
+              </div>
+            </div>
+
+            {recommendation ? (
+              <div className={`processing-recommendation ${formatRecommendationTone(recommendation.action)}`}>
+                <div className="recommendation-header">
+                  <span className="recommendation-title">{recommendation.message}</span>
+                </div>
+
+                {recommendation.details?.length ? (
+                  <div className="recommendation-details">
+                    {recommendation.details.map((detail) => (
+                      <div key={detail} className="recommendation-detail">• {detail}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
             <div className="process-controls">
-              <button 
-                className={`process-btn ${processing ? 'processing' : ''} ${uploadedLeaders.size === 0 ? 'disabled' : ''}`}
-                onClick={processTrajectories_old} 
-                disabled={processing || uploadedLeaders.size === 0}
+              <button
+                className={`process-btn ${processing ? 'processing' : ''} ${viewModel.uploadedLeaderIds.length === 0 ? 'disabled' : ''}`}
+                onClick={() => requestProcessing(false)}
+                disabled={processing || viewModel.uploadedLeaderIds.length === 0}
               >
                 {processing ? (
                   <>
                     <span className="spinner"></span>
-                    Processing Formation...
+                    Processing Cluster Outputs...
                   </>
                 ) : (
-                  <>
-                    <span className="process-icon">⚡</span>
-                    Process Swarm Formation
-                  </>
+                  recommendation?.action === 'safe_incremental'
+                    ? 'Process Current Uploads'
+                    : 'Process Swarm Trajectory Package'
                 )}
               </button>
-              
-              {uploadedLeaders.size === 0 && (
-                <p className="requirement-note">Please upload at least one drone trajectory</p>
+
+              {viewModel.uploadedLeaderIds.length === 0 ? (
+                <p className="requirement-note">Upload at least one leader CSV before processing.</p>
+              ) : (
+                <p className="requirement-note requirement-note--soft">
+                  Recommended order: confirm the swarm hierarchy, upload each changed leader path, then process once for the full formation.
+                </p>
               )}
+
+              {viewModel.uploadedLeaderIds.length > 0 ? (
+                <div className="advanced-processing-options">
+                  <button
+                    className="process-option-btn secondary"
+                    onClick={() => requestProcessing(true)}
+                    disabled={processing}
+                  >
+                    Start Fresh
+                  </button>
+
+                  <button
+                    className="process-option-btn tertiary"
+                    onClick={handleExplicitClear}
+                    disabled={clearingData}
+                  >
+                    {clearingData ? 'Clearing...' : 'Clear Processed Only'}
+                  </button>
+                </div>
+              ) : null}
             </div>
           </div>
 
-          {/* Step 3: Results & Download */}
-          {results && (
-            <div className="workflow-step">
-              <div className="step-header">
-                <h3><span className="step-number">3</span>Results & Download</h3>
-              </div>
-              
-              {results.success ? (
-                <div className="success-card">
-                  <div className="success-header">
-                    <span className="success-icon">✅</span>
-                    <div>
-                      <h4>Processing Complete!</h4>
-                      <p>{results.processed_drones} drones processed successfully</p>
-                    </div>
+          {hasProcessedOutputs ? (
+          <div className="workflow-step">
+            <div className="step-header">
+              <h3><span className="step-number">3</span>Review and Prepare Launch</h3>
+              <p>Inspect generated cluster outputs, confirm readiness, then optionally record the mission package to git before launch.</p>
+            </div>
+
+              <div className={`success-card ${viewModel.currentOutcome === 'partial' ? 'success-card--warning' : ''}`}>
+                <div className="success-header">
+                  <span className="success-icon">{viewModel.currentOutcome === 'partial' ? '!' : 'OK'}</span>
+                  <div>
+                    <h4>
+                      {viewModel.currentOutcome === 'partial'
+                        ? 'Outputs generated, review still required'
+                        : 'Mission outputs ready for launch preflight'}
+                    </h4>
+                    <p>
+                      {viewModel.processedDroneCount} drone output{viewModel.processedDroneCount === 1 ? '' : 's'} available across{' '}
+                      {viewModel.clusterSummary.processed_cluster_count} processed cluster{viewModel.clusterSummary.processed_cluster_count === 1 ? '' : 's'}.
+                    </p>
                   </div>
-                  
-                  {results.statistics && (
-                    <div className="processing-stats">
-                      <div className="stat">
-                        <span className="stat-value">{results.statistics.leaders}</span>
-                        <span className="stat-label">Lead Drones</span>
-                      </div>
-                      <div className="stat">
-                        <span className="stat-value">{results.statistics.followers}</span>
-                        <span className="stat-label">Followers</span>
-                      </div>
-                      {results.statistics.errors > 0 && (
-                        <div className="stat error">
-                          <span className="stat-value">{results.statistics.errors}</span>
-                          <span className="stat-label">Errors</span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  
-                  <div className="next-steps">
-                    <p><strong>Next:</strong> Set Mission Type 4 (Swarm Trajectory) and trigger the mission</p>
+                </div>
+
+                <div className="processing-stats">
+                  <div className="stat">
+                    <span className="stat-value">{status?.leader_count || results?.statistics?.leaders || 0}</span>
+                    <span className="stat-label">Leaders</span>
                   </div>
-                  
-                  {/* Advanced Preview Section - Progressive Disclosure */}
-                  <div className="advanced-section">
-                    <details className="trajectory-preview">
-                      <summary className="preview-toggle">
-                        <span className="toggle-icon">📊</span>
-                        View Trajectory Previews & Advanced Controls
-                        <span className="toggle-hint">Click to expand</span>
-                      </summary>
-                      
-                      <div className="preview-content">
-                        {/* Cluster-based organization */}
-                        {visibleClusterLeaders.map(leaderId => (
-                          <div key={leaderId} className="cluster-section">
-                            <div className="cluster-header">
-                              <h4>🎯 Cluster {leaderId} Formation</h4>
-                              <span className="cluster-stats">
-                                {1 + (hierarchies[leaderId] || 0)} drones total
-                              </span>
-                            </div>
-                            
-                            {/* Cluster Overview Plot */}
-                            <div className="cluster-plot-section">
-                              <div className="cluster-plot-card">
-                                <div className="cluster-plot-header">
-                                  <div className="plot-header-left">
-                                    <h5>📊 Complete Cluster View</h5>
-                                    <span className="plot-description">All trajectories in this formation</span>
-                                  </div>
-                                  <div className="plot-header-actions">
-                                    <button 
-                                      className={`cluster-kml-btn ${downloadingKML ? 'loading' : ''}`}
-                                      onClick={() => downloadClusterKML(leaderId)}
-                                      disabled={downloadingKML}
-                                      title="Download cluster formation as KML for Google Earth"
-                                      aria-label={`Download cluster ${leaderId} KML file for Google Earth`}
-                                    >
-                                      {downloadingKML ? (
-                                        <>
-                                          <span className="btn-icon spinner">⏳</span>
-                                          <div className="btn-content">
-                                            <span className="btn-text">Generating...</span>
-                                            <span className="btn-subtitle">Please wait</span>
-                                          </div>
-                                        </>
-                                      ) : (
-                                        <>
-                                          <span className="btn-icon">🌍</span>
-                                          <div className="btn-content">
-                                            <span className="btn-text">Cluster KML</span>
-                                            <span className="btn-subtitle">Google Earth</span>
-                                          </div>
-                                        </>
-                                      )}
-                                    </button>
-                                  </div>
-                                </div>
-                                <div className="cluster-plot clickable" onClick={() => openLightbox(`${getBackendURL()}/static/plots/cluster_leader_${leaderId}.jpg`, `Cluster ${leaderId} Formation`)}>
-                                  <img 
-                                    src={`${getBackendURL()}/static/plots/cluster_leader_${leaderId}.jpg`}
-                                    alt={`Cluster ${leaderId} formation trajectories`}
-                                    onError={(e) => {
-                                      e.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="100%" height="100%" fill="%23f8fafc"/><text x="50%" y="50%" font-family="Arial" font-size="16" fill="%23667eea" text-anchor="middle">Cluster Formation Plot</text></svg>';
-                                    }}
-                                  />
-                                  <div className="zoom-overlay">
-                                    <span className="zoom-icon">🔍</span>
-                                    <span>Click to enlarge</span>
+                  <div className="stat">
+                    <span className="stat-value">{status?.follower_count || results?.statistics?.followers || 0}</span>
+                    <span className="stat-label">Followers</span>
+                  </div>
+                  <div className="stat">
+                    <span className="stat-value">{viewModel.clusterSummary.ready_cluster_count}</span>
+                    <span className="stat-label">Ready Clusters</span>
+                  </div>
+                  {(viewModel.issueCount > 0 || viewModel.advisoryCount > 0) ? (
+                    <div className="stat error">
+                      <span className="stat-value">{viewModel.issueCount + viewModel.advisoryCount}</span>
+                      <span className="stat-label">Attention Items</span>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="next-steps">
+                  <p>
+                    <strong>Next:</strong>{' '}
+                    {isPartialPackage
+                      ? 'review the cluster plots below, resolve the listed attention items, and reprocess before treating this as a full-fleet launch package. Dashboard preflight can still validate an intentional selected-subset plan later if the chosen leader chain remains complete.'
+                      : 'review the cluster plots below, optionally record the generated outputs to git for traceability, then launch Mission Type 4 from Dashboard → Command Control → Mission Trigger with preflight checks enabled.'}
+                  </p>
+                </div>
+
+                <div className="review-actions">
+                  <button className="utility-btn commit" onClick={commitAndPushChanges} disabled={committing}>
+                    {committing
+                      ? 'Saving...'
+                      : commitMode === 'local_commit'
+                        ? 'Commit Outputs Locally'
+                        : commitMode === 'commit_and_push'
+                          ? 'Commit & Push Outputs'
+                          : 'Commit Mission Outputs'}
+                  </button>
+                  <Link className="utility-btn" to="/">
+                    Open Mission Trigger
+                  </Link>
+                </div>
+
+                <div className="advanced-section">
+                  <details className="trajectory-preview" open={viewModel.clusterSummary.ready_cluster_count > 0}>
+                    <summary className="preview-toggle">
+                      Review processed cluster plots and downloads
+                    </summary>
+
+                    <div className="preview-content">
+                      {viewModel.clusters
+                        .filter((cluster) => viewModel.visibleClusterLeaders.includes(Number(cluster.leader_id)))
+                        .map((cluster) => {
+                          const leaderId = Number(cluster.leader_id);
+                          const stateMeta = getClusterStateMeta(cluster);
+
+                          return (
+                            <div key={leaderId} className="cluster-section">
+                              <div className="cluster-header">
+                                <div>
+                                  <h4>Cluster {leaderId}</h4>
+                                  <div className="cluster-header__meta">
+                                    <span>{cluster.expected_drone_count || 1 + (cluster.follower_count || 0)} drones total</span>
+                                    <span className={`leader-state-badge ${stateMeta.tone === 'warning' ? 'attention' : stateMeta.tone}`}>
+                                      {stateMeta.label}
+                                    </span>
                                   </div>
                                 </div>
-                                <div className="cluster-features">
-                                  <div className="feature-item">
-                                    <span className="feature-icon">🎬</span>
-                                    <span className="feature-text">Time Animation</span>
-                                  </div>
-                                  <div className="feature-item">
-                                    <span className="feature-icon">📍</span>
-                                    <span className="feature-text">Precise Coordinates</span>
-                                  </div>
-                                  <div className="feature-item">
-                                    <span className="feature-icon">🎨</span>
-                                    <span className="feature-text">Color-Coded Paths</span>
-                                  </div>
-                                </div>
+                                <span className="cluster-stats">
+                                  {cluster.processed_drone_count || 0} processed
+                                </span>
                               </div>
-                            </div>
-                            
-                            {/* Individual Drone Trajectories */}
-                            <div className="individual-drones-section">
-                              <h5 className="section-title">🎯 Individual Drone Trajectories</h5>
-                              <div className="drones-grid">
-                                {/* Lead Drone */}
-                                <div className="drone-preview-card">
-                                  <div className="preview-header">
-                                    <h6>Drone {leaderId}</h6>
-                                    <div className="header-actions">
-                                      <span className="drone-type-badge leader">LEAD</span>
+
+                              {cluster.missing_follower_ids?.length ? (
+                                <div className="cluster-warning">
+                                  Missing follower outputs: {cluster.missing_follower_ids.join(', ')}
+                                </div>
+                              ) : null}
+
+                              <div className="cluster-plot-section">
+                                <div className="cluster-plot-card">
+                                  <div className="cluster-plot-header">
+                                    <div className="plot-header-left">
+                                      <h5>Cluster review plot</h5>
+                                      <p className="plot-description">Combined leader and follower trajectories for this cluster.</p>
+                                    </div>
+                                    <div className="plot-header-actions">
+                                      <button
+                                        className={`cluster-kml-btn ${downloadingKML ? 'loading' : ''}`}
+                                        onClick={() => downloadClusterKML(leaderId)}
+                                        disabled={downloadingKML}
+                                        title="Download cluster formation KML"
+                                        aria-label={`Download cluster ${leaderId} KML file`}
+                                      >
+                                        {downloadingKML ? (
+                                          <>
+                                            <span className="btn-icon spinner">⏳</span>
+                                            <div className="btn-content">
+                                              <span className="btn-text">Generating...</span>
+                                              <span className="btn-subtitle">Please wait</span>
+                                            </div>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <span className="btn-icon">🌍</span>
+                                            <div className="btn-content">
+                                              <span className="btn-text">Cluster KML</span>
+                                              <span className="btn-subtitle">Google Earth</span>
+                                            </div>
+                                          </>
+                                        )}
+                                      </button>
                                     </div>
                                   </div>
-                                  
-                                  <div className="preview-plot clickable" onClick={() => openLightbox(`${getBackendURL()}/static/plots/drone_${leaderId}_trajectory.jpg`, `Drone ${leaderId} Trajectory`)}>
-                                    <img 
-                                      src={`${getBackendURL()}/static/plots/drone_${leaderId}_trajectory.jpg`}
-                                      alt={`Drone ${leaderId} trajectory`}
-                                      onError={(e) => {
-                                        e.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150"><rect width="100%" height="100%" fill="%23f0f0f0"/><text x="50%" y="50%" font-family="Arial" font-size="14" fill="%23666" text-anchor="middle">Plot Loading...</text></svg>';
+                                  <div
+                                    className="cluster-plot clickable"
+                                    onClick={() => openLightbox(buildSwarmTrajectoryPlotUrl(`cluster_leader_${leaderId}.jpg`), `Cluster ${leaderId} Formation`)}
+                                  >
+                                    <img
+                                      src={buildSwarmTrajectoryPlotUrl(`cluster_leader_${leaderId}.jpg`)}
+                                      alt={`Cluster ${leaderId} formation trajectories`}
+                                      onError={(event) => {
+                                        event.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="100%" height="100%" fill="%23f8fafc"/><text x="50%" y="50%" font-family="Arial" font-size="16" fill="%23667eea" text-anchor="middle">Cluster Formation Plot</text></svg>';
                                       }}
                                     />
                                     <div className="zoom-overlay">
                                       <span className="zoom-icon">🔍</span>
+                                      <span>Click to enlarge</span>
                                     </div>
                                   </div>
-                                  
-                                  <div className="preview-actions">
-                                    <button 
-                                      className="preview-btn download"
-                                      onClick={() => downloadDroneTrajectory(leaderId)}
-                                      title="Download CSV"
-                                    >
-                                      <span className="btn-icon">⬇</span>
-                                      CSV
-                                    </button>
-                                    <button 
-                                      className="preview-btn kml"
-                                      onClick={() => downloadDroneKML(leaderId)}
-                                      title="Download KML"
-                                    >
-                                      <span className="btn-icon">🌍</span>
-                                      KML
-                                    </button>
-                                    <button 
-                                      className="preview-btn clear-single"
-                                      onClick={() => clearSingleTrajectory(leaderId)}
-                                      title="Clear cluster"
-                                    >
-                                      <span className="btn-icon">🗑</span>
-                                      Clear
-                                    </button>
+                                  <div className="cluster-features">
+                                    <div className="feature-item">
+                                      <span className="feature-text">Combined path review</span>
+                                    </div>
+                                    <div className="feature-item">
+                                      <span className="feature-text">Cluster terrain export</span>
+                                    </div>
+                                    <div className="feature-item">
+                                      <span className="feature-text">Mission validation artifact</span>
+                                    </div>
                                   </div>
                                 </div>
+                              </div>
 
-                                {/* Followers */}
-                                {getProcessedFollowersForLeader(leaderId).map(followerId => (
-                                  <div key={followerId} className="drone-preview-card">
+                              <div className="individual-drones-section">
+                                <h5 className="section-title">Individual drone outputs</h5>
+                                <div className="drones-grid">
+                                  <div className="drone-preview-card">
                                     <div className="preview-header">
-                                      <h6>Drone {followerId}</h6>
+                                      <h6>Drone {leaderId}</h6>
                                       <div className="header-actions">
-                                        <span className="drone-type-badge follower">FOLLOW</span>
-                                        <button 
-                                          className="delete-drone-btn"
-                                          onClick={() => clearIndividualDrone(followerId)}
-                                          title="Delete this drone's trajectory"
-                                        >
-                                          🗑️
-                                        </button>
+                                        <span className="drone-type-badge leader">LEADER</span>
                                       </div>
                                     </div>
-                                    
-                                    <div className="preview-plot clickable" onClick={() => openLightbox(`${getBackendURL()}/static/plots/drone_${followerId}_trajectory.jpg`, `Drone ${followerId} Trajectory`)}>
-                                      <img 
-                                        src={`${getBackendURL()}/static/plots/drone_${followerId}_trajectory.jpg`}
-                                        alt={`Drone ${followerId} trajectory`}
-                                        onError={(e) => {
-                                          e.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150"><rect width="100%" height="100%" fill="%23f7fafc"/><text x="50%" y="50%" font-family="Arial" font-size="14" fill="%2338a169" text-anchor="middle">Follower Plot</text></svg>';
+
+                                    <div
+                                      className="preview-plot clickable"
+                                      onClick={() => openLightbox(buildSwarmTrajectoryPlotUrl(`drone_${leaderId}_trajectory.jpg`), `Drone ${leaderId} Trajectory`)}
+                                    >
+                                      <img
+                                        src={buildSwarmTrajectoryPlotUrl(`drone_${leaderId}_trajectory.jpg`)}
+                                        alt={`Drone ${leaderId} trajectory`}
+                                        onError={(event) => {
+                                          event.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150"><rect width="100%" height="100%" fill="%23f0f0f0"/><text x="50%" y="50%" font-family="Arial" font-size="14" fill="%23666" text-anchor="middle">Plot Loading...</text></svg>';
                                         }}
                                       />
                                       <div className="zoom-overlay">
                                         <span className="zoom-icon">🔍</span>
                                       </div>
                                     </div>
-                                    
+
                                     <div className="preview-actions">
-                                      <button 
-                                        className="preview-btn download"
-                                        onClick={() => downloadDroneTrajectory(followerId)}
-                                        title="Download CSV"
-                                      >
-                                        <span className="btn-icon">⬇</span>
+                                      <button className="preview-btn download" onClick={() => downloadDroneTrajectory(leaderId)} title="Download CSV">
                                         CSV
                                       </button>
-                                      <button 
-                                        className="preview-btn kml"
-                                        onClick={() => downloadDroneKML(followerId)}
-                                        title="Download KML"
-                                      >
-                                        <span className="btn-icon">🌍</span>
+                                      <button className="preview-btn kml" onClick={() => downloadDroneKML(leaderId)} title="Download KML">
                                         KML
+                                      </button>
+                                      <button className="preview-btn clear-single" onClick={() => clearSingleTrajectory(leaderId)} title="Clear cluster">
+                                        Clear Cluster
                                       </button>
                                     </div>
                                   </div>
-                                ))}
+
+                                  {getProcessedFollowersForLeader(leaderId).map((followerId) => (
+                                    <div key={followerId} className="drone-preview-card">
+                                      <div className="preview-header">
+                                        <h6>Drone {followerId}</h6>
+                                        <div className="header-actions">
+                                          <span className="drone-type-badge follower">FOLLOWER</span>
+                                          <button
+                                            className="delete-drone-btn"
+                                            onClick={() => clearIndividualDrone(followerId)}
+                                            title="Delete this drone output"
+                                          >
+                                            🗑️
+                                          </button>
+                                        </div>
+                                      </div>
+
+                                      <div
+                                        className="preview-plot clickable"
+                                        onClick={() => openLightbox(buildSwarmTrajectoryPlotUrl(`drone_${followerId}_trajectory.jpg`), `Drone ${followerId} Trajectory`)}
+                                      >
+                                        <img
+                                          src={buildSwarmTrajectoryPlotUrl(`drone_${followerId}_trajectory.jpg`)}
+                                          alt={`Drone ${followerId} trajectory`}
+                                          onError={(event) => {
+                                            event.target.src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="200" height="150"><rect width="100%" height="100%" fill="%23f7fafc"/><text x="50%" y="50%" font-family="Arial" font-size="14" fill="%2338a169" text-anchor="middle">Follower Plot</text></svg>';
+                                          }}
+                                        />
+                                        <div className="zoom-overlay">
+                                          <span className="zoom-icon">🔍</span>
+                                        </div>
+                                      </div>
+
+                                      <div className="preview-actions">
+                                        <button className="preview-btn download" onClick={() => downloadDroneTrajectory(followerId)} title="Download CSV">
+                                          CSV
+                                        </button>
+                                        <button className="preview-btn kml" onClick={() => downloadDroneKML(followerId)} title="Download KML">
+                                          KML
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
                               </div>
                             </div>
-                          </div>
-                        ))}
-                      </div>
-                    </details>
-                  </div>
+                          );
+                        })}
+                    </div>
+                  </details>
                 </div>
-              ) : (
-                <div className="error-card">
-                  <span className="error-icon">❌</span>
-                  <div>
-                    <h4>Processing Failed</h4>
-                    <p>{results.error}</p>
-                  </div>
-                </div>
-              )}
+              </div>
             </div>
-          )}
+          ) : null}
 
-          {/* Utility Actions */}
           <div className="utility-actions">
-            <button className="utility-btn" onClick={fetchStatus}>
-              <span className="utility-icon">↻</span>
+            <button className="utility-btn" onClick={() => refreshOperationalState({ reloadStructure: true })}>
               Refresh Status
             </button>
-            
-            {results && results.processed_drones > 0 && (
-              <button 
-                className="utility-btn commit" 
-                onClick={commitAndPushChanges}
-                disabled={committing}
-              >
-                <span className="utility-icon">🚀</span>
-                {committing ? 'Committing...' : 'Commit & Push Changes'}
-              </button>
-            )}
-            
+
             <button className="utility-btn danger" onClick={clearAll}>
-              <span className="utility-icon">🗑</span>
-              Clear All Files
+              Clear Workspace
             </button>
           </div>
         </>
       ) : (
-        /* No Lead Drones Found State */
         <div className="empty-state">
           <div className="empty-icon">🤖</div>
-          <h3>No Clusters Found</h3>
-          <p>Please check your swarm configuration. Make sure you have lead drones with follow=0 defined to create clusters.</p>
-          <button className="utility-btn" onClick={fetchLeaders}>
-            <span className="utility-icon">↻</span>
+          <h3>No clusters found</h3>
+          <p>
+            Configure top leaders in <Link to="/swarm-design" className="guide-link">Swarm Design</Link> before using this workflow.
+          </p>
+          <button className="utility-btn" onClick={() => refreshOperationalState({ reloadStructure: true })}>
             Reload Configuration
           </button>
         </div>
       )}
 
-      {/* Professional Lightbox Modal */}
-      {lightboxImage && (
+      {lightboxImage ? (
         <div className="lightbox-overlay" onClick={closeLightbox}>
-          <div className="lightbox-container" onClick={(e) => e.stopPropagation()}>
+          <div className="lightbox-container" onClick={(event) => event.stopPropagation()}>
             <div className="lightbox-header">
               <h3>{lightboxImage.title}</h3>
               <button className="lightbox-close" onClick={closeLightbox}>
@@ -1036,8 +1239,8 @@ const SwarmTrajectory = () => {
               </button>
             </div>
             <div className="lightbox-content">
-              <img 
-                src={lightboxImage.src} 
+              <img
+                src={lightboxImage.src}
                 alt={lightboxImage.title}
                 className="lightbox-image"
               />
@@ -1047,56 +1250,48 @@ const SwarmTrajectory = () => {
             </div>
           </div>
         </div>
-      )}
+      ) : null}
 
-      {/* Professional Progress Modal */}
-      {commitProgress && (
+      {commitProgress ? (
         <div className="progress-overlay">
           <div className="progress-modal">
             <div className="progress-header">
-              <h3>🚀 Committing Changes</h3>
+              <h3>Committing Changes</h3>
               <div className="progress-subtitle">
-                Syncing trajectories with repository
+                Syncing processed swarm trajectory outputs with the repository
               </div>
             </div>
-            
+
             <div className="progress-content">
               <div className="progress-bar-container">
-                <div 
-                  className="progress-bar-fill" 
-                  style={{ width: `${commitProgress.progress}%` }}
-                ></div>
+                <div className="progress-bar-fill" style={{ width: `${commitProgress.progress}%` }}></div>
               </div>
-              
+
               <div className="progress-step">
                 {commitProgress.step}
               </div>
-              
+
               <div className="progress-percentage">
                 {commitProgress.progress}%
               </div>
             </div>
           </div>
         </div>
-      )}
+      ) : null}
 
-      {/* KML Download Progress Modal */}
-      {kmlProgress && (
+      {kmlProgress ? (
         <div className="progress-overlay">
           <div className="progress-modal">
             <div className="progress-header">
-              <h3>🌍 Generating KML</h3>
+              <h3>Generating KML</h3>
               <div className="progress-subtitle">
-                Preparing 3D visualization file
+                Preparing a 3D review artifact for terrain inspection
               </div>
             </div>
 
             <div className="progress-content">
               <div className="progress-bar-container">
-                <div
-                  className="progress-bar-fill"
-                  style={{ width: `${kmlProgress.progress}%` }}
-                ></div>
+                <div className="progress-bar-fill" style={{ width: `${kmlProgress.progress}%` }}></div>
               </div>
 
               <div className="progress-step">
@@ -1109,7 +1304,18 @@ const SwarmTrajectory = () => {
             </div>
           </div>
         </div>
-      )}
+      ) : null}
+
+      <ConfirmationModal
+        isOpen={Boolean(confirmDialog)}
+        title={confirmDialog?.title || 'Confirm'}
+        message={confirmDialog?.message || ''}
+        confirmLabel={confirmDialog?.confirmLabel || 'Confirm'}
+        cancelLabel={confirmDialog?.cancelLabel || 'Cancel'}
+        isDanger={Boolean(confirmDialog?.isDanger)}
+        onConfirm={handleConfirmDialog}
+        onCancel={closeConfirmDialog}
+      />
     </div>
   );
 };

@@ -48,8 +48,14 @@ For a clean first Smart Swarm demo in SITL:
    ```bash
    python3 tools/validate_smart_swarm_runtime.py
    ```
+9. if you plan to chain Drone Show or Swarm Trajectory validation immediately afterward on the same SITL fleet, recreate the containers or manually restage the aircraft onto the next mode's launch geometry before the next run
 
 The shipped 5-drone SITL demo layout currently contains two clusters and mixed `ned` / `body` offsets, so formation settle time is not instantaneous after takeoff.
+
+Validator note:
+
+- the Smart Swarm validator restores the selected saved swarm assignments after a successful reassignment drill, so a temporary runtime reassignment does not become the new saved SITL baseline
+- it does **not** magically put landed aircraft back onto Drone Show staging slots; cross-mode launch validation still needs a deliberate launch-geometry reset between mission families
 
 ## Operator Model
 
@@ -89,6 +95,8 @@ The runtime panel supports:
 Specific cluster selections in `Formation Analysis` also drive the cluster-scoped runtime target. The `All executable clusters` option is analysis-only and does not issue one command across the full fleet.
 
 This keeps swarm intent explicit instead of overloading the generic command sender with swarm-only controls, and it preserves mixed-mission operations when only part of the fleet is flying Smart Swarm.
+
+These runtime commands now publish into the same shared command lifecycle stream as `Command Control` and per-drone airborne overrides. That means the backend-backed live/recent command monitor can recover command context after refresh/navigation instead of keeping Smart Swarm runtime actions as toast-only events.
 
 ### Formation preview and live readiness
 
@@ -233,7 +241,7 @@ Available policy values in [params.py](/opt/mavsdk_drone_show/src/params.py):
 Cycle protection is enforced in two places:
 
 - dashboard assignment validation before save
-- GCS backend validation for `save-swarm-data` and `request-new-leader`
+- GCS backend validation for canonical `PUT /api/v1/config/swarm` and `PATCH /api/v1/config/swarm/assignments/{hw_id}` updates
 
 That prevents live leader changes from silently introducing a loop into the follow chain.
 
@@ -258,10 +266,10 @@ That prevents live leader changes from silently introducing a loop into the foll
 
 ### GCS persistence and live updates
 
-- [app_fastapi.py](../../gcs-server/app_fastapi.py)
-  - `GET /get-swarm-data`
-  - `POST /save-swarm-data`
-  - `POST /request-new-leader`
+- [swarm.py](../../gcs-server/api_routes/swarm.py)
+  - `GET /api/v1/config/swarm`
+  - `PUT /api/v1/config/swarm`
+  - `PATCH /api/v1/config/swarm/assignments/{hw_id}`
 
 ### Frontend control surfaces
 

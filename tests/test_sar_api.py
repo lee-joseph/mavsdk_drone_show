@@ -61,11 +61,8 @@ def client():
     """Create TestClient with mocked telemetry and config."""
     with patch('app_fastapi.load_config', return_value=MOCK_CONFIG):
         with patch('app_fastapi.telemetry_data_all_drones', MOCK_TELEMETRY):
-            # Also mock telemetry in sar.routes
-            with patch('sar.routes.telemetry_data_all_drones', MOCK_TELEMETRY):
-                with patch('sar.routes.load_config', return_value=MOCK_CONFIG):
-                    from app_fastapi import app
-                    yield TestClient(app)
+            from app_fastapi import app
+            yield TestClient(app)
 
 
 @pytest.fixture(autouse=True)
@@ -169,6 +166,9 @@ class TestMissionStatus:
         """GET /status for unknown mission should return 404."""
         resp = client.get("/api/sar/mission/nonexistent/status")
         assert resp.status_code == 404
+        payload = resp.json()
+        assert payload["error"] == "Not found"
+        assert payload["detail"] == "Mission nonexistent not found"
 
 
 class TestMissionLifecycle:
@@ -208,6 +208,9 @@ class TestMissionLifecycle:
         """POST /pause for unknown mission should return 404."""
         resp = client.post("/api/sar/mission/nonexistent/pause")
         assert resp.status_code == 404
+        payload = resp.json()
+        assert payload["error"] == "Not found"
+        assert payload["detail"] == "Mission nonexistent not found"
 
     def test_progress_report(self, client):
         """POST /progress should update drone state."""

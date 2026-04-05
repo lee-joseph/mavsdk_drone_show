@@ -6,6 +6,16 @@ from enum import Enum
 from pathlib import Path
 
 from mds_logging import get_logger
+from src.drone_api_routes import (
+    DRONE_COMMANDS_ROUTE,
+    DRONE_LIVE_ARMABILITY_ROUTE,
+    DRONE_LOCAL_POSITION_ROUTE,
+    DRONE_NAVIGATION_GLOBAL_ORIGIN_ROUTE,
+    DRONE_NAVIGATION_HOME_ROUTE,
+    DRONE_POSITION_DEVIATION_ROUTE,
+    DRONE_STATE_ROUTE,
+)
+from src.gcs_api_routes import GCS_FLEET_HEARTBEATS_ROUTE
 
 logger = get_logger("params")
 
@@ -187,8 +197,8 @@ class Params:
     git_poll_interval = 10                  # GCS git status polling interval in seconds
     GCS_TELEMETRY_REQUEST_TIMEOUT_SEC = 2.0 # Per-request timeout for GCS -> drone telemetry pulls
     GCS_GIT_STATUS_REQUEST_TIMEOUT_SEC = 5.0  # Per-request timeout for GCS -> drone git-status pulls
-    get_drone_state_URI = 'get_drone_state' # URI for getting drone state
-    send_drone_command_URI = 'api/send-command'  # Replace with actual URI
+    get_drone_state_URI = DRONE_STATE_ROUTE.lstrip('/')  # Canonical drone state route
+    send_drone_command_URI = DRONE_COMMANDS_ROUTE.lstrip('/')  # Canonical drone command route
 
     # Professional Logging & Status Reporting Configuration (Ultra-Quiet Mode)
     TELEMETRY_REPORT_INTERVAL = 120         # Report telemetry summary every 2 minutes (was 30s)
@@ -208,8 +218,10 @@ class Params:
     API_ERROR_LOG_THRESHOLD = 400           # Only log API responses >= this status code
     LOG_SUCCESSFUL_COMMANDS = True          # Still log successful command completions
 
-    get_drone_home_URI = 'get-home-pos'     # URI for getting drone home position
-    get_drone_gps_origin_URI = 'get-gps-global-origin'  # URI for getting drone GPS global origin position
+    get_drone_home_URI = DRONE_NAVIGATION_HOME_ROUTE.lstrip('/')  # Canonical drone home route
+    get_drone_gps_origin_URI = DRONE_NAVIGATION_GLOBAL_ORIGIN_ROUTE.lstrip('/')  # Canonical drone origin route
+    get_live_armability_URI = DRONE_LIVE_ARMABILITY_ROUTE.lstrip('/')  # Canonical drone live-armability route
+    get_drone_local_position_URI = DRONE_LOCAL_POSITION_ROUTE.lstrip('/')  # Canonical LOCAL_POSITION_NED route
 
     # GCS Server Port Configuration (Legacy Aliases)
     GCS_PORT = gcs_api_port                 # DEPRECATED: Use gcs_api_port instead
@@ -217,7 +229,7 @@ class Params:
     flask_telem_socket_port = gcs_api_port  # DEPRECATED: Use gcs_api_port instead
     GCS_FLASK_PORT = gcs_api_port           # DEPRECATED: Use gcs_api_port instead
 
-    get_position_deviation_URI = 'get-position-deviation'
+    get_position_deviation_URI = DRONE_POSITION_DEVIATION_ROUTE.lstrip('/')
     acceptable_deviation = 3.0              # Acceptable deviation in meters
 
     TELEMETRY_POLLING_TIMEOUT = 10  # Threshold in seconds to check for telemetry timeout
@@ -250,6 +262,9 @@ class Params:
     # These ports must match the external router configuration:
     mavsdk_port = 14540                # MAVSDK SDK connection
     local_mavlink_port = 12550         # LocalMavlinkController (pymavlink telemetry)
+    LOCAL_MAVLINK_TIMEOUT_SEC = 5      # Per-read timeout for local pymavlink listener
+    LOCAL_MAVLINK_RECONNECT_AFTER_TIMEOUTS = 3  # Re-open listener after repeated silence
+    LOCAL_MAVLINK_STALE_TIMEOUT_SEC = 15  # Treat the local telemetry feed as stale after this many seconds without updates
     local_mavlink2rest_port = 14569    # mavlink2rest REST API bridge
     gcs_mavlink_port = 14550           # Ground Control Station (QGC)
 
@@ -271,6 +286,29 @@ class Params:
     default_takeoff_alt = 10       # Default takeoff altitude
     TAKEOFF_PREFLIGHT_TIMEOUT_SEC = 30  # MAVSDK GPS/home readiness wait before takeoff
     TAKEOFF_ALTITUDE_CONFIRM_TIMEOUT_SEC = 60  # Allow slower multi-drone SITL climbs before declaring takeoff failure
+    LAND_ACTION_MIN_DISARM_WAIT_SEC = 45       # Minimum wait budget for LAND action to fully disarm
+    LAND_ACTION_ASSUMED_DESCENT_RATE_MPS = 1.5 # Conservative PX4 autonomous descent-rate estimate for high-altitude LAND/RTL flows
+    LAND_ACTION_DISARM_BUFFER_SEC = 30         # Extra landing/disarm buffer above the estimated descent time
+    LAND_ACTION_MAX_DISARM_WAIT_SEC = 900      # Cap LAND action wait time for very high-altitude recoveries
+    LAND_ACTION_TOUCHDOWN_DISARM_GRACE_SEC = 20  # Extra wait after touchdown before forcing explicit disarm
+    RTL_ACTION_COMPLETION_TIMEOUT = 300        # Minimum wait budget for standalone RTL to return home, land, and disarm
+    RTL_ACTION_COMPLETION_BUFFER_SEC = 120     # Extra travel-home buffer above the estimated landing/disarm time
+    RTL_ACTION_COMPLETION_MAX_TIMEOUT = 1200   # Hard cap for very long standalone RTL recoveries
+    COMMAND_TRACKING_DEFAULT_TIMEOUT_MS = 60000  # Fallback tracker timeout when no mission-specific estimate is available
+    COMMAND_TRACKING_ACTION_BUFFER_SEC = 30      # Extra tracker slack for short actions after expected completion
+    COMMAND_TRACKING_MISSION_BUFFER_SEC = 120    # Extra tracker slack for show/trajectory mission playback
+    COMMAND_TRACKING_HOVER_TEST_TIMEOUT_SEC = 180  # Conservative tracker budget for hover-test workflows
+    COMMAND_TRACKING_QUICKSCOUT_TIMEOUT_SEC = 900  # Fallback tracker budget until QuickScout duration is estimator-backed
+    COMMAND_TRACKING_CHECK_INTERVAL_SEC = 1.0     # Background cadence for promoting stale commands to terminal timeout state
+    COMMAND_SYNC_DISPATCH_GUARD_SEC = 1.0         # Extra lead time before synchronized mission trigger-minus-warmup; GCS stops retries after this safe queue window
+    COMMAND_REPORT_HTTP_TIMEOUT_SEC = 5           # Per-attempt HTTP timeout for drone -> GCS execution callbacks
+    COMMAND_REPORT_RETRY_BASE_DELAY_SEC = 2       # Initial backoff for queued execution callback retries
+    COMMAND_REPORT_RETRY_MAX_DELAY_SEC = 60       # Maximum backoff between queued execution callback retries
+    COMMAND_REPORT_RETRY_MAX_AGE_SEC = 1800       # Drop queued execution callbacks after this age if GCS never returns
+    COMMAND_REPORT_RETRY_LOOP_INTERVAL_SEC = 1.0  # Retry worker wake interval for queued execution callbacks
+    COMMAND_IDEMPOTENCY_HISTORY_SEC = 1800        # Keep recently completed command_ids for this long so late resends cannot re-execute
+    COMMAND_IDEMPOTENCY_MAX_HISTORY = 256         # Maximum recent command_id records retained per drone
+    SYNCHRONIZED_MISSION_LATE_START_TOLERANCE_SEC = 1.0  # Abort synchronized offboard missions if actual launch slips past this tolerance after the requested start time
 
     # LED Configuration
     led_count = 25        # Number of LED pixels
@@ -300,7 +338,7 @@ class Params:
     heartbeat_interval = 10  
 
     # The API endpoint path for receiving drone heartbeats on GCS
-    gcs_heartbeat_endpoint = "/drone-heartbeat"
+    gcs_heartbeat_endpoint = GCS_FLEET_HEARTBEATS_ROUTE
 
     netbird_ip_prefix = "100."
 
@@ -359,6 +397,16 @@ class Params:
     PREFLIGHT_MAX_RETRIES = 40       # Maximum number of retries for pre-flight checks
     PRE_FLIGHT_TIMEOUT = 80          # Timeout for pre-flight checks in seconds
     LANDING_TIMEOUT = 10            # Timeout during landing phase in seconds
+    OFFBOARD_ARM_HEALTH_TIMEOUT_SEC = 15.0   # Wait budget for PX4 armability after preflight already passed
+    OFFBOARD_ARM_HEALTH_POLL_SEC = 0.5       # Max wait between MAVSDK health samples during mission startup
+    OFFBOARD_ARM_HEALTH_STABLE_SAMPLES = 1   # Consecutive healthy samples required before arming
+    OFFBOARD_ARM_MAX_ATTEMPTS = 3            # Bounded arm retries for transient PX4 pre-arm denials
+    OFFBOARD_ARM_RETRY_DELAY_SEC = 2.0       # Delay between arm retries after COMMAND_DENIED
+    OFFBOARD_START_MAX_ATTEMPTS = 3          # Bounded retries when starting offboard mode
+    OFFBOARD_START_RETRY_DELAY_SEC = 1.0     # Delay between offboard-start retries
+    LIVE_ARMABILITY_PROBE_CONNECT_TIMEOUT_SEC = 5.0  # Local MAVSDK connect wait for on-demand launch probes
+    LIVE_ARMABILITY_PROBE_TIMEOUT_SEC = 6.0          # Bounded wait for live MAVSDK armability probes
+    LIVE_ARMABILITY_PROBE_HTTP_BUFFER_SEC = 2.0      # Extra transport margin for the HTTP caller wrapping the probe
 
     # Trajectory and Landing Configuration
     GROUND_ALTITUDE_THRESHOLD = 1.0        # Threshold to determine if trajectory ends at ground level
@@ -367,6 +415,8 @@ class Params:
     MISSION_PROGRESS_THRESHOLD = 0.5       # Minimum mission progress percentage for controlled landing
     CONTROLLED_DESCENT_SPEED = 0.5         # Descent speed during controlled landing in m/s
     CONTROLLED_LANDING_TIMEOUT = 7        # Maximum time to wait during controlled landing
+    CONTROLLED_LANDING_BUFFER_SEC = 5      # Extra touchdown margin for low-altitude precision descent
+    CONTROLLED_LANDING_MAX_TIMEOUT_SEC = 120  # Hard cap for controlled landing fallback wait
 
 
     AUTO_LAUNCH_POSITION = True  # Auto start trajectories at 0,0,0
@@ -409,6 +459,18 @@ class Params:
     # Basic Trajectory Settings
     swarm_trajectory_dt = 0.05              # Trajectory interpolation timestep (seconds)
     swarm_trajectory_max_speed = 20.0       # Maximum allowed speed (m/s) - for safety
+    TRAJECTORY_PLANNER_DEFAULT_MSL = 100.0  # Default altitude entry for authored leader waypoints (m MSL)
+    TRAJECTORY_PLANNER_DEFAULT_TARGET_AGL = 100.0  # Default terrain clearance when authoring in AGL mode (m)
+    TRAJECTORY_PLANNER_MIN_MSL = 1.0        # Minimum authored altitude accepted by the planner (m MSL)
+    TRAJECTORY_PLANNER_MAX_MSL = 10000.0    # Maximum authored altitude accepted by the planner (m MSL)
+    TRAJECTORY_PLANNER_DEFAULT_PREFERRED_SPEED = 8.0  # Default preferred inbound leg speed (m/s)
+    TRAJECTORY_PLANNER_MIN_PREFERRED_SPEED = 0.5      # Minimum preferred inbound leg speed (m/s)
+    TRAJECTORY_PLANNER_OPTIMAL_MAX_SPEED = 12.0       # Nominal operator planning band upper bound (m/s)
+    TRAJECTORY_PLANNER_ROUTE_ENTRY_DELAY_S = 10.0     # Default delay from mission start to route entry (s)
+    TRAJECTORY_PLANNER_FALLBACK_LEG_DURATION_S = 10.0 # Fallback leg duration when no better timing data exists (s)
+    TRAJECTORY_PLANNER_DERIVED_TIME_STEP_S = 0.1      # Time quantization step for derived ETA values (s)
+    TRAJECTORY_PLANNER_MIN_SAFE_CLEARANCE_M = 50.0    # Minimum terrain clearance before planner warns (m)
+    TRAJECTORY_PLANNER_DEFAULT_SAFE_CLEARANCE_M = 100.0  # Suggested safe terrain clearance for one-click fixes (m)
 
     # WAYPOINT ACCEPTANCE RADIUS (most important setting)
     # How close to waypoint before considering "reached" and starting turn
@@ -460,6 +522,23 @@ class Params:
     SWARM_TRAJECTORY_SAFETY_MARGIN = 2.0       # Safety margin for trajectory execution
     SWARM_TRAJECTORY_MAX_VELOCITY = 15.0       # Maximum velocity for trajectory mode
     SWARM_TRAJECTORY_TIMEOUT_MULTIPLIER = 1.2  # Timeout multiplier for mission duration
+    SWARM_TRAJECTORY_RTL_COMPLETION_TIMEOUT = 600  # Max time to wait for RTL end behavior to land/disarm
+    SWARM_TRAJECTORY_RTL_COMPLETION_BUFFER_SEC = 180  # Extra RTL leg time before touchdown/disarm should complete
+    SWARM_TRAJECTORY_RTL_COMPLETION_MAX_TIMEOUT = 1800  # Hard cap for very long RTL recoveries
+    SWARM_TRAJECTORY_RTL_DISARM_GRACE_SEC = 15    # Grace period to auto-disarm after RTL touchdown if PX4 remains armed
+    SWARM_TRAJECTORY_RTL_HOME_STALL_RADIUS_M = 25.0  # Treat the drone as "back home" when within this horizontal radius
+    SWARM_TRAJECTORY_RTL_STALL_DESCENT_EPS_MPS = 0.3  # Smaller descent rates are treated as effectively stalled
+    SWARM_TRAJECTORY_RTL_HOME_STALL_TRIGGER_SEC = 20  # Time to tolerate home-hover stall before forcing LAND fallback
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_ALTITUDE_M = 0.75  # Treat RTL as effectively down once relative altitude is near ground
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_SPEED_EPS_MPS = 1.5  # Horizontal motion below this starts the near-ground RTL cleanup timer
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_STALL_TRIGGER_SEC = 10  # Time to tolerate a near-ground low-motion RTL state before forcing LAND fallback
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_ALTITUDE_M = 1.5  # Once the timer starts, keep it armed until the aircraft climbs well clear of the ground again
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_SPEED_EPS_MPS = 2.5  # Near-ground cleanup tolerates some skid/drift before resetting the timer
+    SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_DESCENT_EPS_MPS = 0.6  # Release the timer only when vertical motion meaningfully departs from the near-ground state
+    SWARM_TRAJECTORY_ACTION_COMMAND_TIMEOUT_SEC = 10  # Bound MAVSDK action RPCs so cleanup cannot hang indefinitely
+    SWARM_TRAJECTORY_RTL_MODE_TRANSITION_TIMEOUT_SEC = 15  # PX4 should enter RTL promptly after command acceptance
+    SWARM_TRAJECTORY_RTL_ENGAGE_MAX_ATTEMPTS = 2  # Retry RTL once before degrading to LAND fallback
+    SWARM_TRAJECTORY_LAND_TRANSITION_TIMEOUT_SEC = 15  # LAND should reach a landing/touchdown state promptly once commanded
     
     # Takeoff Configuration (same as drone show)
     SWARM_TRAJECTORY_TAKEOFF_MODE = "BODY_VELOCITY"  # Use same as drone show
@@ -468,6 +547,7 @@ class Params:
     # Logging and Debug
     SWARM_TRAJECTORY_VERBOSE_LOGGING = True     # Enable detailed trajectory logging
     SWARM_TRAJECTORY_LOG_WAYPOINTS = False      # Log each waypoint execution
+    SWARM_TRAJECTORY_PROGRESS_LOG_INTERVAL_WAYPOINTS = 200  # Regular progress-log cadence during long missions
     
     # React UI Integration
     swarm_trajectory_executer = "swarm_trajectory_mission.py"  # Script name for UI
@@ -481,6 +561,7 @@ class Params:
     SWARM_TRAJECTORY_INITIAL_CLIMB_HEIGHT = 5.0    # meters above first setpoint altitude
     SWARM_TRAJECTORY_INITIAL_CLIMB_TIME = 5.0      # seconds for climb phase duration
     SWARM_TRAJECTORY_INITIAL_CLIMB_SPEED = 1.0     # m/s vertical climb speed (positive = up)
+    SWARM_TRAJECTORY_SHARED_DIR = os.getenv("MDS_SITL_SHARED_SWARM_TRAJECTORY_DIR", "").strip()
 
     @classmethod
     def get_swarm_trajectory_file_path(cls, position_id):
@@ -493,15 +574,25 @@ class Params:
         Returns:
             str: Full path to the trajectory CSV file
         """
-        base_dir = 'shapes_sitl' if cls.sim_mode else 'shapes'
         filename = f"{cls.SWARM_TRAJECTORY_FILE_PREFIX}{position_id}{cls.SWARM_TRAJECTORY_FILE_SUFFIX}"
-        
+
+        if cls.sim_mode and cls.SWARM_TRAJECTORY_SHARED_DIR:
+            shared_path = os.path.join(
+                cls.SWARM_TRAJECTORY_SHARED_DIR,
+                "processed",
+                filename,
+            )
+            if os.path.exists(shared_path):
+                logger.debug(f"Swarm Trajectory File: {shared_path} (shared SITL workspace)")
+                return shared_path
+
+        base_dir = 'shapes_sitl' if cls.sim_mode else 'shapes'
         trajectory_path = os.path.join(
-            base_dir, 
-            cls.SWARM_TRAJECTORY_BASE_PATH, 
+            base_dir,
+            cls.SWARM_TRAJECTORY_BASE_PATH,
             filename
         )
-        
+
         logger.debug(f"Swarm Trajectory File: {trajectory_path}")
         return trajectory_path
 

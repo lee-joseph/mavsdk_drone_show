@@ -12,7 +12,7 @@
   padding: var(--spacing-sm);
   border: 1px solid var(--color-border-primary);
   border-radius: var(--border-radius-base);
-  background: var(--color-bg-tertiary);
+  background: var(--color-surface-inset);
   color: var(--color-text-primary);
   cursor: pointer;
   font-family: var(--font-family-primary);
@@ -27,10 +27,10 @@
 .theme-toggle-cycle:hover,
 .theme-toggle-button:hover,
 .theme-toggle-trigger:hover {
-  background: var(--color-primary-light);
+  background: rgba(var(--color-primary-rgb), 0.1);
   border-color: var(--color-primary-border);
   transform: translateY(-1px);
-  box-shadow: var(--shadow-dark-sm);
+  box-shadow: var(--shadow-sm);
 }
 
 .theme-toggle-simple:active,
@@ -70,6 +70,57 @@
   white-space: nowrap;
 }
 
+.theme-toggle-segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--spacing-xs);
+  width: 100%;
+  padding: var(--spacing-xs);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-base);
+  background: var(--color-surface-inset);
+  box-shadow: inset 0 0 0 1px var(--color-border-light);
+}
+
+.theme-segment {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-xs);
+  min-height: 40px;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid transparent;
+  border-radius: calc(var(--border-radius-base) - 2px);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-family: var(--font-family-primary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  transition: var(--transition-all);
+}
+
+.theme-segment:hover {
+  background: rgba(var(--color-primary-rgb), 0.08);
+  color: var(--color-text-primary);
+}
+
+.theme-segment.active {
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+  border-color: var(--color-primary-border);
+  box-shadow: var(--shadow-sm);
+}
+
+.theme-segment .theme-icon {
+  color: inherit;
+}
+
+.theme-segment.active .theme-label,
+.theme-segment.active .theme-icon {
+  color: inherit;
+}
+
 /* Simple Variant */
 .theme-toggle-simple {
   width: 40px;
@@ -94,9 +145,11 @@
 .theme-toggle-dropdown {
   position: relative;
   display: inline-block;
+  width: 100%;
 }
 
 .theme-toggle-trigger {
+  width: 100%;
   min-width: 120px;
   padding: var(--spacing-sm) var(--spacing-base);
   justify-content: space-between;
@@ -121,6 +174,7 @@
   top: calc(100% + var(--spacing-xs));
   left: 0;
   right: 0;
+  min-width: 100%;
   background: var(--color-bg-secondary);
   border: 1px solid var(--color-border-primary);
   border-radius: var(--border-radius-md);
@@ -196,23 +250,47 @@
   border-radius: var(--border-radius-base);
 }
 
+.sidebar-theme-toggle .theme-toggle-dropdown {
+  width: 100%;
+}
+
+.sidebar-theme-toggle .theme-toggle-segmented {
+  width: 100%;
+}
+
+.sidebar-theme-toggle .theme-toggle-trigger,
 .sidebar-theme-toggle .theme-toggle-cycle,
 .sidebar-theme-toggle .theme-toggle-button {
   width: 100%;
-  justify-content: flex-start;
-  padding: var(--spacing-base);
+  justify-content: space-between;
+  padding: 0.85rem 1rem;
   border-radius: var(--border-radius-base);
-  background: var(--color-bg-quaternary);
+  background: var(--color-surface-inset);
+  border-color: var(--color-border-primary);
 }
 
 .sidebar-theme-toggle .theme-icon {
   margin-right: var(--spacing-sm);
 }
 
+.sidebar-theme-toggle .theme-label {
+  flex: 1;
+  text-align: left;
+}
+
 /* Responsive Design */
 @media (max-width: 768px) {
   .theme-toggle-dropdown {
     position: static;
+  }
+
+  .theme-segment {
+    min-height: 38px;
+    padding: 0.45rem 0.35rem;
+  }
+
+  .theme-segment .theme-label {
+    font-size: var(--font-size-xs);
   }
 
   .theme-dropdown-menu {
@@ -230,10 +308,6 @@
     min-width: auto;
     flex: 1;
   }
-
-  .theme-label {
-    display: none;
-  }
 }
 
 /* Dark Theme Specific Adjustments */
@@ -248,13 +322,13 @@
 
 /* Light Theme Specific Adjustments */
 [data-theme="light"] .theme-dropdown-menu {
-  background: #ffffff;
-  border-color: #e0e0e0;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  background: var(--color-bg-secondary);
+  border-color: var(--color-border-secondary);
+  box-shadow: var(--shadow-base);
 }
 
 [data-theme="light"] .theme-option:hover {
-  background: #f8f9fa;
+  background: var(--color-bg-tertiary);
 }
 
 /* Accessibility */

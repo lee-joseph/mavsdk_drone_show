@@ -1,35 +1,58 @@
 // src/pages/Overview.js
 import React, { useState, useEffect, useRef } from 'react';
 import PropTypes from 'prop-types';
-import axios from 'axios';
 import CommandSender from '../components/CommandSender';
+import ClusterScopeBar from '../components/ClusterScopeBar';
 import DroneWidget from '../components/DroneWidget';
 import ExpandedDronePortal from '../components/ExpandedDronePortal';
+import useFetch from '../hooks/useFetch';
 import {
+  DRONE_RUNTIME_CLOCK_PROP,
+  FIELD_NAMES,
   attachDroneRuntimeClock,
-  extractServerNowMs,
   normalizeTelemetryResponse,
 } from '../constants/fieldMappings';
 import { normalizeComparableId } from '../utilities/missionIdentityUtils';
-import { getBackendURL, getTelemetryURL } from '../utilities/utilities';
+import { getDroneRuntimeStatus } from '../utilities/droneRuntimeStatus';
+import { getDroneReadinessModel } from '../utilities/droneReadiness';
+import {
+  DRONE_SEARCH_HELP_TEXT,
+  DRONE_SEARCH_PLACEHOLDER,
+  matchesDroneSearchQuery,
+} from '../utilities/dronePresentation';
+import {
+  buildClusterScopeOptions,
+  buildSwarmViewModel,
+  filterClustersByScope,
+} from '../utilities/swarmDesignUtils';
+import {
+  GCS_ROUTE_KEYS,
+  getFleetConfigResponse,
+  getFleetTelemetryResponse,
+  unwrapFleetTelemetryPayload,
+  unwrapSwarmConfigPayload,
+} from '../services/gcsApiService';
 import '../styles/Overview.css';
 
 const Overview = ({ setSelectedDrone }) => {
   const [drones, setDrones] = useState([]);
   const [configByHwId, setConfigByHwId] = useState({});
   const [expandedDrone, setExpandedDrone] = useState(null);
+  const [droneQuery, setDroneQuery] = useState('');
+  const [cardFilter, setCardFilter] = useState('all');
+  const [clusterScope, setClusterScope] = useState('all');
   const [originRect, setOriginRect] = useState(null);
   const [error, setError] = useState(null);
   const [notification, setNotification] = useState(null);
   const droneRefs = useRef({});
+  const { data: swarmDataFetched } = useFetch(GCS_ROUTE_KEYS.swarmConfig);
 
   useEffect(() => {
-    const backendURL = getBackendURL();
     let active = true;
 
     const loadConfig = async () => {
       try {
-        const response = await axios.get(`${backendURL}/get-config-data`);
+        const response = await getFleetConfigResponse();
         if (!active || !Array.isArray(response.data)) {
           return;
         }
@@ -58,20 +81,36 @@ const Overview = ({ setSelectedDrone }) => {
   }, []);
 
   useEffect(() => {
-    const url = getTelemetryURL();
     const fetchData = async () => {
       try {
-        const response = await axios.get(url);
+        const response = await getFleetTelemetryResponse();
         const clockMeta = {
           receivedAtMs: Date.now(),
-          serverNowMs: extractServerNowMs(response.headers),
+          serverNowMs: response.headers?.['x-mds-server-time'] ?? response.headers?.date ?? null,
         };
-        const normalizedTelemetry = normalizeTelemetryResponse(response.data || {}, clockMeta);
-        const dronesArray = Object.keys(normalizedTelemetry).map((hw_ID) => attachDroneRuntimeClock({
-          ...(configByHwId[normalizeComparableId(hw_ID)] || {}),
-          hw_ID,
-          ...normalizedTelemetry[hw_ID],
-        }, clockMeta));
+        const normalizedTelemetry = normalizeTelemetryResponse(
+          unwrapFleetTelemetryPayload(response.data),
+          clockMeta
+        );
+        const dronesArray = Object.keys(normalizedTelemetry).map((hw_ID) => {
+          const mergedDrone = {
+            ...(configByHwId[normalizeComparableId(hw_ID)] || {}),
+            hw_ID,
+            [FIELD_NAMES.HW_ID]: hw_ID,
+            ...normalizedTelemetry[hw_ID],
+          };
+          const runtimeClock = normalizedTelemetry[hw_ID]?.[DRONE_RUNTIME_CLOCK_PROP];
+          if (runtimeClock) {
+            Object.defineProperty(mergedDrone, DRONE_RUNTIME_CLOCK_PROP, {
+              value: runtimeClock,
+              configurable: true,
+              writable: true,
+              enumerable: false,
+            });
+            return mergedDrone;
+          }
+          return attachDroneRuntimeClock(mergedDrone, clockMeta);
+        });
 
         const validDrones = dronesArray.filter(
           (drone) =>
@@ -126,22 +165,209 @@ const Overview = ({ setSelectedDrone }) => {
     setOriginRect(null);
   };
 
+  const fleetSummary = React.useMemo(() => {
+    const summary = {
+      total: drones.length,
+      online: 0,
+      degraded: 0,
+      unavailable: 0,
+      ready: 0,
+      armed: 0,
+    };
+
+    drones.forEach((drone) => {
+      const runtimeStatus = getDroneRuntimeStatus(drone, Date.now());
+      const readiness = getDroneReadinessModel(drone, runtimeStatus);
+
+      if (runtimeStatus.level === 'online') {
+        summary.online += 1;
+      } else if (runtimeStatus.level === 'degraded') {
+        summary.degraded += 1;
+      } else {
+        summary.unavailable += 1;
+      }
+
+      if (readiness.isReady) {
+        summary.ready += 1;
+      }
+
+      if (drone?.[FIELD_NAMES.IS_ARMED]) {
+        summary.armed += 1;
+      }
+    });
+
+    return summary;
+  }, [drones]);
+
+  const swarmAssignments = React.useMemo(
+    () => unwrapSwarmConfigPayload(swarmDataFetched),
+    [swarmDataFetched]
+  );
+
+  const swarmViewModel = React.useMemo(
+    () => buildSwarmViewModel(swarmAssignments, drones),
+    [drones, swarmAssignments]
+  );
+  const clusterScopeOptions = React.useMemo(
+    () => buildClusterScopeOptions(swarmViewModel?.clusters || [], drones.length),
+    [drones.length, swarmViewModel?.clusters]
+  );
+  const visibleClusters = React.useMemo(
+    () => filterClustersByScope(swarmViewModel?.clusters || [], clusterScope),
+    [clusterScope, swarmViewModel?.clusters]
+  );
+  const visibleClusterHwIds = React.useMemo(() => {
+    if (clusterScope === 'all') {
+      return null;
+    }
+
+    return new Set(
+      visibleClusters.flatMap((cluster) => cluster.drones.map((drone) => normalizeComparableId(drone.hw_id)))
+    );
+  }, [clusterScope, visibleClusters]);
+
+  const filteredDrones = React.useMemo(() => {
+    const nowMs = Date.now();
+
+    return drones.filter((drone) => {
+      const hwId = normalizeComparableId(drone?.[FIELD_NAMES.HW_ID] || drone?.hw_ID);
+      if (visibleClusterHwIds && !visibleClusterHwIds.has(hwId)) {
+        return false;
+      }
+
+      if (!matchesDroneSearchQuery(drone, droneQuery)) {
+        return false;
+      }
+
+      const runtimeStatus = getDroneRuntimeStatus(drone, nowMs);
+      const readiness = getDroneReadinessModel(drone, runtimeStatus);
+
+      switch (cardFilter) {
+        case 'attention':
+          return runtimeStatus.level !== 'online' || !readiness.isReady;
+        case 'ready':
+          return readiness.isReady;
+        case 'armed':
+          return Boolean(drone?.[FIELD_NAMES.IS_ARMED]);
+        case 'online':
+          return runtimeStatus.level === 'online';
+        default:
+          return true;
+      }
+    });
+  }, [cardFilter, droneQuery, drones, visibleClusterHwIds]);
+
   return (
     <div className="overview-container">
+      <header className="overview-header">
+        <div className="overview-header__copy">
+          <p className="overview-eyebrow">Operations dashboard</p>
+          <h1>Fleet Command Overview</h1>
+          <p className="overview-description">
+            Live aircraft status, command dispatch, and launch readiness for the active control session.
+          </p>
+        </div>
+        <div className="overview-summary-grid" role="list" aria-label="Fleet overview">
+          <article className="overview-summary-card" role="listitem">
+            <span className="overview-summary-card__label">Visible drones</span>
+            <strong>{fleetSummary.total}</strong>
+            <small>Telemetry-valid cards in view</small>
+          </article>
+          <article className="overview-summary-card" role="listitem">
+            <span className="overview-summary-card__label">Online link</span>
+            <strong>{fleetSummary.online}</strong>
+            <small>{fleetSummary.degraded} delayed, {fleetSummary.unavailable} unavailable</small>
+          </article>
+          <article className="overview-summary-card" role="listitem">
+            <span className="overview-summary-card__label">Ready status</span>
+            <strong>{fleetSummary.ready}</strong>
+            <small>{fleetSummary.total - fleetSummary.ready} need review or are blocked</small>
+          </article>
+          <article className="overview-summary-card" role="listitem">
+            <span className="overview-summary-card__label">Armed aircraft</span>
+            <strong>{fleetSummary.armed}</strong>
+            <small>{Math.max(fleetSummary.total - fleetSummary.armed, 0)} disarmed</small>
+          </article>
+        </div>
+      </header>
+
       <div className="mission-trigger-section">
-        <CommandSender drones={drones} />
+        <CommandSender drones={drones} swarmData={swarmAssignments} />
       </div>
 
-      <h2 className="connected-drones-header">Connected Drones</h2>
+      <div className="connected-drones-header">
+        <div>
+          <h2>Connected Drones</h2>
+          <p>Filter the card wall without changing dispatch scope in Command Control.</p>
+        </div>
+        <span className="connected-drones-count">
+          {filteredDrones.length}/{fleetSummary.total} card{fleetSummary.total === 1 ? '' : 's'} visible
+        </span>
+      </div>
+
+      <div className="overview-fleet-toolbar">
+        <label className="overview-fleet-toolbar__search">
+          <span>Search fleet</span>
+          <input
+            type="search"
+            value={droneQuery}
+            onChange={(event) => setDroneQuery(event.target.value)}
+            placeholder={DRONE_SEARCH_PLACEHOLDER}
+            aria-label="Search fleet cards by position, hardware ID, or callsign"
+          />
+        </label>
+        <div className="overview-fleet-toolbar__filters" role="tablist" aria-label="Fleet card filters">
+          {[
+            ['all', 'All'],
+            ['attention', 'Attention'],
+            ['ready', 'Ready'],
+            ['online', 'Online'],
+            ['armed', 'Armed'],
+          ].map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={`overview-fleet-toolbar__filter ${cardFilter === value ? 'active' : ''}`}
+              onClick={() => setCardFilter(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {clusterScopeOptions.length > 1 && (
+          <ClusterScopeBar
+            label="Cluster scope"
+            options={clusterScopeOptions}
+            selectedId={clusterScope}
+            onSelect={setClusterScope}
+            summary="Top-leader scopes keep large fleets readable. Card-wall filters never change command scope."
+          />
+        )}
+        <p className="overview-fleet-toolbar__note">
+          Card-wall filters never change dispatch scope inside Command Control. Examples: {DRONE_SEARCH_HELP_TEXT}
+        </p>
+      </div>
 
       {notification && <div className="notification">{notification}</div>}
       {error && <div className="error-message">{error}</div>}
 
       <div className="drone-list">
-        {drones.length === 0 && !error && <p>No valid drone data available.</p>}
-        {drones.map((drone) => (
+        {drones.length === 0 && !error && (
+          <div className="overview-empty-state">
+            <strong>No valid drone data is available.</strong>
+            <span>When telemetry resumes, aircraft cards will populate here automatically.</span>
+          </div>
+        )}
+        {drones.length > 0 && filteredDrones.length === 0 && !error && (
+          <div className="overview-empty-state">
+            <strong>No drones match the current filters.</strong>
+            <span>Search supports free text and scoped queries like pos 1-5 or hw 2,4.</span>
+          </div>
+        )}
+        {filteredDrones.map((drone) => (
           <div
             key={drone.hw_ID}
+            className="drone-list__item"
             ref={(el) => droneRefs.current[drone.hw_ID] = el}
           >
             <DroneWidget

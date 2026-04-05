@@ -27,34 +27,55 @@ import {
   COMMAND_SCHEDULE_MODES,
   formatDateTimeLocalInput,
 } from '../utilities/commandScheduling';
+import {
+  getActionExecutionPolicy,
+  isSchedulableActionKey,
+} from '../utilities/commandExecutionPolicy';
 import '../styles/DroneActions.css';
 
 const ACTION_SECTIONS = [
   {
     key: 'routine',
-    title: 'Routine Flight Control',
-    description: 'Normal airborne overrides and rehearsal tools.',
+    title: 'Flight',
+    description: 'Launch, hold, land, recover.',
     actions: ['TAKE_OFF', 'HOVER_TEST', 'HOLD', 'LAND', 'RETURN_RTL'],
   },
   {
     key: 'test',
-    title: 'Bench & Visual Tests',
-    description: 'Non-mission checks before a live operation.',
+    title: 'Checks',
+    description: 'Bench and rehearsal checks.',
     actions: ['TEST', 'TEST_LED'],
   },
   {
     key: 'maintenance',
-    title: 'System Maintenance',
-    description: 'Repo, parameters, and reboot operations for recovery or servicing.',
+    title: 'Service',
+    description: 'Repo, identity, restart.',
     actions: ['UPDATE_CODE', 'INIT_SYSID', 'APPLY_COMMON_PARAMS', 'REBOOT_FC', 'REBOOT_SYS'],
   },
   {
     key: 'danger',
-    title: 'Danger Zone',
-    description: 'Only use if the aircraft must be forced out of normal behavior immediately.',
+    title: 'Emergency',
+    description: 'Last-resort stop.',
     actions: ['DISARM', 'KILL_TERMINATE'],
   },
 ];
+
+const ACTION_SHORT_LABELS = {
+  TAKE_OFF: 'Take Off',
+  LAND: 'Land',
+  HOLD: 'Hold',
+  RETURN_RTL: 'RTL',
+  DISARM: 'Disarm',
+  KILL_TERMINATE: 'Kill',
+  TEST: 'Bench Test',
+  TEST_LED: 'LED Test',
+  HOVER_TEST: 'Hover',
+  REBOOT_FC: 'Reboot PX4',
+  REBOOT_SYS: 'Reboot System',
+  UPDATE_CODE: 'Update Repo',
+  INIT_SYSID: 'Init SysID',
+  APPLY_COMMON_PARAMS: 'Apply Params',
+};
 
 const ACTION_ICONS = {
   TAKE_OFF: FaPlaneDeparture,
@@ -74,31 +95,21 @@ const ACTION_ICONS = {
 };
 
 const ACTION_DESCRIPTIONS = {
-  TAKE_OFF: 'Climb every target to the configured takeoff altitude.',
-  LAND: 'Land the targeted drones immediately.',
+  TAKE_OFF: 'Climb to the configured takeoff altitude.',
+  LAND: 'Land the selected aircraft now.',
   HOLD: 'Freeze current motion and hold position.',
-  RETURN_RTL: 'Return the targeted drones to launch.',
-  DISARM: 'Disarm motors. Use only when safe to do so.',
-  KILL_TERMINATE: 'Emergency motor stop. Use only as a last resort.',
-  TEST: 'Run the generic test routine.',
-  TEST_LED: 'Run the light-show test pattern.',
-  HOVER_TEST: 'Quick lift, hover, and land rehearsal.',
-  REBOOT_FC: 'Restart PX4 or the flight-controller side.',
-  REBOOT_SYS: 'Restart the companion computer container/system.',
-  UPDATE_CODE: 'Pull the configured repo/branch and restart services if needed.',
-  INIT_SYSID: 'Reapply system ID / identity setup.',
-  APPLY_COMMON_PARAMS: 'Apply the common PX4 parameter set and reboot.',
+  RETURN_RTL: 'Return the selected aircraft to launch.',
+  DISARM: 'Disarm motors when the airframe is safe.',
+  KILL_TERMINATE: 'Emergency motor stop.',
+  TEST: 'Run the generic bench test.',
+  TEST_LED: 'Run the light-pattern test.',
+  HOVER_TEST: 'Lift, hover briefly, then land.',
+  REBOOT_FC: 'Restart PX4 and flight-control services.',
+  REBOOT_SYS: 'Restart the companion computer or container.',
+  UPDATE_CODE: 'Pull the repo and refresh services.',
+  INIT_SYSID: 'Reapply system identity.',
+  APPLY_COMMON_PARAMS: 'Apply the common PX4 params.',
 };
-
-const SCHEDULABLE_ACTIONS = new Set([
-  'TAKE_OFF',
-  'HOVER_TEST',
-  'HOLD',
-  'LAND',
-  'RETURN_RTL',
-  'TEST',
-  'TEST_LED',
-]);
 
 const DroneActions = ({
   actionTypes,
@@ -111,6 +122,7 @@ const DroneActions = ({
   const [scheduleMode, setScheduleMode] = useState(COMMAND_SCHEDULE_MODES.NOW);
   const [timeDelay, setTimeDelay] = useState(30);
   const [selectedDateTime, setSelectedDateTime] = useState(() => formatDateTimeLocalInput(referenceNowMs + 60_000));
+  const [scheduleOpen, setScheduleOpen] = useState(false);
 
   const actionSchedule = useMemo(() => buildCommandSchedule({
     scheduleMode,
@@ -120,7 +132,7 @@ const DroneActions = ({
   }), [referenceNowMs, scheduleMode, selectedDateTime, timeDelay]);
 
   const handleActionClick = (actionKey, extraData = {}) => {
-    const supportsScheduling = SCHEDULABLE_ACTIONS.has(actionKey);
+    const supportsScheduling = isSchedulableActionKey(actionKey);
     if (supportsScheduling && actionSchedule.error) {
       toast.error(actionSchedule.error);
       return;
@@ -154,28 +166,40 @@ const DroneActions = ({
             value: `${altitude} m`,
           }]
           : []),
+        {
+          label: 'Execution policy',
+          value: getActionExecutionPolicy({
+            actionKey,
+            isImmediate: supportsScheduling ? actionSchedule.isImmediate : true,
+          }),
+        },
       ],
     };
 
     onSendCommand(commandData);
   };
 
-  const renderActionButton = (actionKey) => {
+  const renderActionButton = (actionKey, sectionKey) => {
     const Icon = ACTION_ICONS[actionKey];
     const actionTypeValue = actionTypes[actionKey];
-    const label = DRONE_ACTION_NAMES[actionTypeValue];
+    const label = ACTION_SHORT_LABELS[actionKey] || DRONE_ACTION_NAMES[actionTypeValue];
+    const fullLabel = DRONE_ACTION_NAMES[actionTypeValue];
     const isDanger = actionKey === 'KILL_TERMINATE' || actionKey === 'DISARM';
+    const isCritical = actionKey === 'KILL_TERMINATE';
 
     return (
       <button
         key={actionKey}
-        className={`action-button ${actionKey.toLowerCase().replace(/_/g, '-').replace('return-rtl', 'rtl').replace('kill-terminate', 'kill')} ${isDanger ? 'danger' : ''}`}
+        className={`action-button action-button--${sectionKey}${isDanger ? ' action-button--danger' : ''}${isCritical ? ' action-button--critical' : ''}`}
         onClick={() => handleActionClick(actionKey, actionKey === 'APPLY_COMMON_PARAMS' ? { reboot_after: true } : {})}
-        title={ACTION_DESCRIPTIONS[actionKey]}
-        aria-label={`${label}. ${ACTION_DESCRIPTIONS[actionKey]}`}
+        title={`${fullLabel}. ${ACTION_DESCRIPTIONS[actionKey]}`}
+        aria-label={`${fullLabel}. ${ACTION_DESCRIPTIONS[actionKey]}`}
       >
         <span className="action-button__icon"><Icon className="action-icon" /></span>
-        <span className="action-button__title">{label}</span>
+        <span className="action-button__content">
+          <span className="action-button__title">{label}</span>
+          <small className="action-button__summary">{ACTION_DESCRIPTIONS[actionKey]}</small>
+        </span>
       </button>
     );
   };
@@ -185,7 +209,7 @@ const DroneActions = ({
       <div className="action-parameter-bar">
         <div>
           <h3>Action Overrides</h3>
-          <p>Direct fleet interventions outside the mission scheduler.</p>
+          <p>Direct flight, service, and recovery commands.</p>
         </div>
         <div className="action-parameter-bar__meta">
           <span>{targetCount} targeted drone{targetCount === 1 ? '' : 's'}</span>
@@ -208,7 +232,11 @@ const DroneActions = ({
           <span className="takeoff-section__hint">Used by Take Off only.</span>
         </div>
 
-        <details className="action-schedule">
+        <details
+          className="action-schedule"
+          open={scheduleOpen}
+          onToggle={(event) => setScheduleOpen(event.currentTarget.open)}
+        >
           <summary>
             <FaClock aria-hidden="true" />
             <span>Execution Timing</span>
@@ -280,7 +308,7 @@ const DroneActions = ({
             )}
 
             <p className="action-schedule__note">
-              Flight and test actions may be scheduled. Maintenance and danger actions still dispatch immediately.
+              Flight and test actions may be queued. Maintenance and emergency actions still dispatch immediately.
               {clockOffsetLabel ? ` ${clockOffsetLabel}.` : ' Scheduler uses the GCS clock.'}
             </p>
           </div>
@@ -294,9 +322,10 @@ const DroneActions = ({
         >
           <div className="action-group__header">
             <h2>{section.title}</h2>
+            <p>{section.description}</p>
           </div>
           <div className="action-buttons">
-            {section.actions.map((actionKey) => renderActionButton(actionKey))}
+            {section.actions.map((actionKey) => renderActionButton(actionKey, section.key))}
           </div>
         </div>
       ))}

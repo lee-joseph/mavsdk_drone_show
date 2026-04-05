@@ -2,9 +2,11 @@ import React, { useMemo } from 'react';
 import PropTypes from 'prop-types';
 
 import useNormalizedTelemetry from '../hooks/useNormalizedTelemetry';
+import { GCS_ROUTE_KEYS } from '../services/gcsApiService';
 import { getDroneRuntimeStatus } from '../utilities/droneRuntimeStatus';
 import { getDroneReadinessModel } from '../utilities/droneReadiness';
 import { areGitRevisionsEquivalent } from '../utilities/missionIdentityUtils';
+import { getDroneDisplayIdentity } from '../utilities/dronePresentation';
 import { FIELD_NAMES } from '../constants/fieldMappings';
 import '../styles/CommandSender.css';
 
@@ -15,20 +17,22 @@ function normalizeId(value) {
 const CommandPreflightSummary = ({
   drones = [],
   targetMode = 'all',
-  selectedDrones = [],
+  targetDroneIds = [],
+  targetSummaryLabel = '',
   referenceNowMs = Date.now(),
   clockOffsetLabel = null,
 }) => {
-  const { data: gitStatusResponse, loading: gitLoading } = useNormalizedTelemetry('/git-status', 15000);
+  const { data: gitStatusResponse, loading: gitLoading } = useNormalizedTelemetry(GCS_ROUTE_KEYS.gitStatus, 15000);
 
   const summary = useMemo(() => {
-    const selectedLookup = new Set(selectedDrones.map((value) => normalizeId(value)).filter(Boolean));
-    const targetDrones = targetMode === 'selected'
-      ? drones.filter((drone) => selectedLookup.has(normalizeId(drone?.[FIELD_NAMES.HW_ID])))
+    const scopedLookup = new Set(targetDroneIds.map((value) => normalizeId(value)).filter(Boolean));
+    const isScopedTarget = targetMode !== 'all';
+    const targetDrones = isScopedTarget
+      ? drones.filter((drone) => scopedLookup.has(normalizeId(drone?.[FIELD_NAMES.HW_ID])))
       : drones;
 
     const counts = {
-      configured: targetMode === 'selected' ? selectedLookup.size : drones.length,
+      configured: isScopedTarget ? scopedLookup.size : drones.length,
       online: 0,
       degraded: 0,
       unavailable: 0,
@@ -68,12 +72,41 @@ const CommandPreflightSummary = ({
     let gitInSync = 0;
     let gitUnknown = 0;
     let gitMismatch = 0;
+    const exceptions = [];
 
     targetDrones.forEach((drone) => {
+      const identity = getDroneDisplayIdentity(drone);
       const hwId = normalizeId(drone?.[FIELD_NAMES.HW_ID]);
       const droneGitStatus = gitStatusByDrone[hwId];
+      const runtimeStatus = getDroneRuntimeStatus(drone, referenceNowMs);
+      const readiness = getDroneReadinessModel(drone, runtimeStatus);
+
+      if (runtimeStatus.level !== 'online') {
+        exceptions.push({
+          key: `runtime-${hwId}`,
+          label: identity.primary,
+          detail: runtimeStatus.label,
+          state: runtimeStatus.level === 'offline' ? 'danger' : 'warning',
+        });
+      }
+
+      if (!readiness.isReady) {
+        exceptions.push({
+          key: `readiness-${hwId}`,
+          label: identity.primary,
+          detail: readiness.statusLabel,
+          state: readiness.status === 'blocked' ? 'danger' : 'warning',
+        });
+      }
+
       if (!droneGitStatus?.commit || !gcsGitStatus?.commit) {
         gitUnknown += 1;
+        exceptions.push({
+          key: `git-unknown-${hwId}`,
+          label: identity.primary,
+          detail: 'Git status unavailable',
+          state: 'warning',
+        });
         return;
       }
 
@@ -81,6 +114,12 @@ const CommandPreflightSummary = ({
         gitInSync += 1;
       } else {
         gitMismatch += 1;
+        exceptions.push({
+          key: `git-mismatch-${hwId}`,
+          label: identity.primary,
+          detail: 'Git mismatch',
+          state: 'danger',
+        });
       }
     });
 
@@ -91,9 +130,10 @@ const CommandPreflightSummary = ({
         unknown: gitUnknown,
         mismatch: gitMismatch,
       },
+      exceptions: exceptions.slice(0, 8),
       gcsBranch: gcsGitStatus?.branch || gcsGitStatus?.current_branch || '',
     };
-  }, [drones, gitStatusResponse, referenceNowMs, selectedDrones, targetMode]);
+  }, [drones, gitStatusResponse, referenceNowMs, targetDroneIds, targetMode]);
 
   const gitReadyCount = summary.counts.configured - summary.git.unknown;
   const gitStatusLabel = !gitStatusResponse
@@ -103,16 +143,6 @@ const CommandPreflightSummary = ({
       : `${summary.git.inSync}/${summary.counts.configured} match GCS`;
 
   const metrics = [
-    {
-      key: 'targets',
-      label: 'Targets',
-      value: summary.counts.configured,
-      detail: targetMode === 'selected' ? 'Selected drones' : 'All configured drones',
-      state: 'neutral',
-      tooltip: targetMode === 'selected'
-        ? `${summary.counts.configured} selected drones are in scope for the next command.`
-        : `${summary.counts.configured} configured drones are in scope for the next command.`,
-    },
     {
       key: 'link',
       label: 'Live Link',
@@ -153,8 +183,8 @@ const CommandPreflightSummary = ({
     <section className="command-preflight" aria-label="Command preflight summary">
       <div className="command-preflight__header">
         <div>
-          <h3>Preflight Review</h3>
-          <p>Scope, live link, readiness, and repo state for the current target set.</p>
+          <h3>Preflight Snapshot</h3>
+          <p>Live link, readiness, armed state, and repo sync for {targetSummaryLabel || 'the current scope'}.</p>
         </div>
         <div className="command-preflight__clock">
           <span className="command-preflight__clock-label">Scheduler clock</span>
@@ -175,14 +205,32 @@ const CommandPreflightSummary = ({
           </div>
         ))}
       </div>
+
+      {summary.exceptions.length > 0 && (
+        <details className="command-preflight__exceptions">
+          <summary>Review exceptions ({summary.exceptions.length})</summary>
+          <div className="command-preflight__exception-list">
+            {summary.exceptions.map((exception) => (
+              <div
+                key={exception.key}
+                className={`command-preflight__exception command-preflight__exception--${exception.state}`}
+              >
+                <strong>{exception.label}</strong>
+                <span>{exception.detail}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </section>
   );
 };
 
 CommandPreflightSummary.propTypes = {
   drones: PropTypes.array,
-  targetMode: PropTypes.oneOf(['all', 'selected']),
-  selectedDrones: PropTypes.array,
+  targetMode: PropTypes.oneOf(['all', 'selected', 'cluster']),
+  targetDroneIds: PropTypes.array,
+  targetSummaryLabel: PropTypes.string,
   referenceNowMs: PropTypes.number,
   clockOffsetLabel: PropTypes.string,
 };

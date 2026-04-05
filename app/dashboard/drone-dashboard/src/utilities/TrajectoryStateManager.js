@@ -1,5 +1,4 @@
 // src/utilities/TrajectoryStateManager.js
-// PHASE 2: Professional undo/redo state management for trajectory operations
 
 /**
  * Action types for trajectory operations
@@ -69,28 +68,28 @@ export const ACTION_TYPES = {
       
       switch (actionType) {
         case ACTION_TYPES.ADD_WAYPOINT:
-          this.currentState.waypoints = [...this.currentState.waypoints, payload.waypoint];
+          this.currentState.waypoints = payload.waypoints || [...this.currentState.waypoints, payload.waypoint];
           this.currentState.selectedWaypointId = payload.waypoint.id;
           break;
           
         case ACTION_TYPES.UPDATE_WAYPOINT:
-          this.currentState.waypoints = this.currentState.waypoints.map(wp =>
-            wp.id === payload.id ? { ...wp, ...payload.updates } : wp
+          this.currentState.waypoints = payload.waypoints || this.currentState.waypoints.map((wp) =>
+            wp.id === (payload.waypointId || payload.id) ? { ...wp, ...payload.updates } : wp
           );
           break;
           
         case ACTION_TYPES.DELETE_WAYPOINT:
-          this.currentState.waypoints = this.currentState.waypoints.filter(
-            wp => wp.id !== payload.id
+          this.currentState.waypoints = payload.waypoints || this.currentState.waypoints.filter(
+            (wp) => wp.id !== (payload.waypointId || payload.id)
           );
-          if (this.currentState.selectedWaypointId === payload.id) {
+          if (this.currentState.selectedWaypointId === (payload.waypointId || payload.id)) {
             this.currentState.selectedWaypointId = null;
           }
           break;
           
         case ACTION_TYPES.MOVE_WAYPOINT:
-          this.currentState.waypoints = this.currentState.waypoints.map(wp =>
-            wp.id === payload.id 
+          this.currentState.waypoints = payload.waypoints || this.currentState.waypoints.map((wp) =>
+            wp.id === (payload.waypointId || payload.id)
               ? { ...wp, latitude: payload.latitude, longitude: payload.longitude }
               : wp
           );
@@ -111,6 +110,9 @@ export const ACTION_TYPES = {
           this.currentState.selectedWaypointId = payload.selectedWaypointId !== undefined 
             ? payload.selectedWaypointId 
             : this.currentState.selectedWaypointId;
+          break;
+
+        default:
           break;
       }
       
@@ -385,7 +387,6 @@ export const ACTION_TYPES = {
       // Validate imported state
       const validation = this.validateState();
       if (!validation.valid) {
-        console.warn('Imported state has issues:', validation.issues);
         // Reset to safe state if validation fails
         this.setInitialState({ waypoints: [], selectedWaypointId: null });
       }

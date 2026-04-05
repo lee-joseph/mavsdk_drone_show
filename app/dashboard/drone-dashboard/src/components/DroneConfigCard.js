@@ -19,6 +19,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import {
   buildKnownPositionIds,
+  formatCompactDroneIdentity,
   formatDroneLabel,
   formatShowSlotLabel,
   findDuplicatePositionAssignment,
@@ -41,6 +42,7 @@ import {
   serializeMissionConfigFormState,
   validateMissionCustomFields,
 } from '../utilities/missionConfigFields';
+import { buildMissionSlotStatusPresentation } from '../utilities/missionSlotStatus';
 import '../styles/DroneConfigCard.css';
 
 const SERIAL_PORT_OPTIONS = [
@@ -57,51 +59,6 @@ const BAUDRATE_OPTIONS = [
   { value: '115200', label: '115200 (High Speed)' },
   { value: '921600', label: '921600 (Very High Speed)' },
 ];
-
-/**
- * Compare config, assigned, and auto-detected pos_ids to decide how to display them.
- */
-function determinePositionIdStatus(configPosId, assignedPosId, autoPosId) {
-  const configStr = normalizeComparableId(configPosId);
-  const assignedStr = normalizeComparableId(assignedPosId);
-  const autoStr = normalizeComparableId(autoPosId);
-
-  // Flag if auto is "0" => effectively no auto detection
-  const noAutoDetection = autoStr === '0' || !autoStr;
-
-  // Drone has no heartbeat if there's no assigned pos_id AND no auto pos_id
-  // (i.e. both assignedStr and autoStr are empty).
-  const noHeartbeatData = !assignedStr && !autoStr;
-
-  // Check if all three match
-  const allMatch =
-    configStr &&
-    assignedStr &&
-    configStr === assignedStr &&
-    assignedStr === autoStr;
-
-  // 2 match (config=assigned), but auto detection not available or zero
-  const configAssignedMatchNoAuto =
-    configStr && assignedStr && configStr === assignedStr && noAutoDetection;
-
-  // Any mismatch
-  const anyMismatch =
-    !allMatch &&
-    !configAssignedMatchNoAuto &&
-    !noHeartbeatData &&
-    (configStr !== assignedStr || configStr !== autoStr || assignedStr !== autoStr);
-
-  return {
-    configStr,
-    assignedStr,
-    autoStr,
-    noAutoDetection,
-    noHeartbeatData,
-    allMatch,
-    configAssignedMatchNoAuto,
-    anyMismatch,
-  };
-}
 
 function getCustomFieldValuePreview(field) {
   if (!field) {
@@ -133,17 +90,7 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
   onAcceptConfigFromAuto,
   onAcceptConfigFromHb,
 }) {
-  // Decide how to interpret the various pos_id values
-  const {
-    configStr,
-    assignedStr,
-    autoStr,
-    noAutoDetection,
-    noHeartbeatData,
-    allMatch,
-    configAssignedMatchNoAuto,
-    anyMismatch,
-  } = determinePositionIdStatus(configPosId, assignedPosId, autoPosId);
+  const slotPresentation = buildMissionSlotStatusPresentation(configPosId, assignedPosId, autoPosId);
 
   /**
    * Returns the correct heartbeat status icon based on `heartbeatStatus`.
@@ -238,114 +185,76 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
    * Render the show-slot section with logic for no heartbeat, mismatch, etc.
    */
   const renderPositionIdInfo = () => {
-    // 0) If there's no heartbeat data at all => just show config pos_id in a neutral status
-    if (noHeartbeatData) {
-      return (
-        <div className="position-status match">
-          <div className="position-values">
-            <div className="position-value">Configured Slot: {configStr || 'N/A'}</div>
+    return (
+      <div className={`position-status ${slotPresentation.tone}`}>
+        <div className="position-summary">
+          <div>
+            <div className="position-headline">{slotPresentation.headline}</div>
+            <p className="position-detail">{slotPresentation.detail}</p>
           </div>
-          <small>No heartbeat data available yet</small>
+          {slotPresentation.tone === 'verified' && (
+            <FontAwesomeIcon
+              icon={faCheckCircle}
+              className="status-icon all-good"
+              title="Mission slot sources are aligned"
+            />
+          )}
         </div>
-      );
-    }
 
-    // 1) ALL MATCH => single line, green check
-    if (allMatch) {
-      return (
-        <div className="position-status match">
-          <span>All Show Slot Sources Match: {configStr}</span>
-          <FontAwesomeIcon
-            icon={faCheckCircle}
-            className="status-icon all-good"
-            title="Configured, heartbeat-assigned, and auto-detected show slots all agree"
-          />
-          <div className="position-values">
-            <div className="position-value">Configured Slot: {configStr}</div>
-            <div className="position-value">Heartbeat Slot: {assignedStr}</div>
-            <div className="position-value">Auto-detected Slot: {autoStr}</div>
-          </div>
+        <div className="position-source-list">
+          {slotPresentation.chips.map((chip) => (
+            <div
+              key={`${chip.label}-${chip.rawValue || 'missing'}`}
+              className={`position-source-chip ${chip.tone}`}
+              title={`${chip.label === 'Cfg' ? 'Configured slot' : chip.label === 'HB' ? 'Heartbeat slot' : 'Auto-detected slot'}: ${chip.value}`}
+            >
+              <span className="position-source-chip-label">{chip.label}</span>
+              <span className="position-source-chip-value">{chip.value}</span>
+            </div>
+          ))}
         </div>
-      );
-    }
 
-    // 2) config=assigned, but no auto detection => single line, with a yellow icon
-    if (configAssignedMatchNoAuto) {
-      return (
-        <div className="position-status match">
-          <span>Configured Slot Confirmed: {configStr}</span>
-          <FontAwesomeIcon
-            icon={faCheckCircle}
-            className="status-icon all-good"
-            title="Configured and heartbeat-assigned show slots match."
-          />
-          <div className="position-values">
-            <div className="position-value">Configured Slot: {configStr}</div>
-            <div className="position-value">Heartbeat Slot: {assignedStr}</div>
-          </div>
-          <small>Auto-detection unavailable</small>
-        </div>
-      );
-    }
-
-    // 3) ANY mismatch => show each ID, highlight differences, show accept buttons
-    if (anyMismatch) {
-      return (
-        <div className="position-status mismatch">
-          <span>Show Slot Mismatch Detected</span>
-          <small>Review the configured, heartbeat, and detected slot values before flight.</small>
-          <div className="position-values">
-            <div className="position-value">Configured Slot: {configStr || 'N/A'}</div>
-            <div className="position-value">Heartbeat Slot: {assignedStr || 'N/A'}</div>
-            <div className="position-value">Auto-detected Slot: {autoStr || 'N/A'}</div>
-          </div>
-
+        {(slotPresentation.actions.acceptAutoValue || slotPresentation.actions.acceptAssignedValue) && (
           <div className="accept-buttons">
-            {/* If auto != config, show Accept from Auto */}
-            {autoStr && autoStr !== '0' && autoStr !== configStr && (
+            {slotPresentation.actions.acceptAutoValue && (
               <button
                 type="button"
                 className="accept-button"
-                onClick={() => onAcceptConfigFromAuto?.(autoStr)}
+                onClick={() => onAcceptConfigFromAuto?.(slotPresentation.actions.acceptAutoValue)}
                 title="Accept auto-detected show slot"
                 aria-label="Accept auto-detected show slot"
               >
                 <FontAwesomeIcon icon={faCheckCircle} />
-                Accept Auto ({autoStr})
+                Use Auto {`P${slotPresentation.actions.acceptAutoValue}`}
               </button>
             )}
-            {/* If assigned != config, show Accept from HB assigned */}
-            {assignedStr && assignedStr !== configStr && (
+            {slotPresentation.actions.acceptAssignedValue && (
               <button
                 type="button"
                 className="accept-button accept-assigned-btn"
-                onClick={() => onAcceptConfigFromHb?.(assignedStr)}
+                onClick={() => onAcceptConfigFromHb?.(slotPresentation.actions.acceptAssignedValue)}
                 title="Accept heartbeat-assigned show slot"
                 aria-label="Accept heartbeat-assigned show slot"
               >
                 <FontAwesomeIcon icon={faCheckCircle} />
-                Accept Assigned ({assignedStr})
+                Use HB {`P${slotPresentation.actions.acceptAssignedValue}`}
               </button>
             )}
           </div>
+        )}
 
-          {noAutoDetection && (
-            <small>Auto-detection is not available</small>
-          )}
-        </div>
-      );
-    }
-
-    // Fallback: show config if none of the above scenarios match
-    return (
-      <div className="position-status match">
-        <span>Show Slot: {configStr || 'N/A'}</span>
+        {slotPresentation.footnote && (
+          <small className="position-footnote">{slotPresentation.footnote}</small>
+        )}
       </div>
     );
   };
 
   const normalizedHwId = normalizeComparableId(drone.hw_id);
   const normalizedPosId = normalizeComparableId(drone.pos_id, normalizedHwId);
+  const compactIdentity = formatCompactDroneIdentity(normalizedPosId, normalizedHwId, 'Unassigned');
+  const compactHwId = normalizedHwId ? `H${normalizedHwId}` : 'H?';
+  const compactPosId = normalizedPosId ? `P${normalizedPosId}` : 'P?';
   const isRoleSwap = normalizedHwId !== normalizedPosId;
   const serialPortLabel = drone.serial_port ? drone.serial_port : 'SITL / none';
   const baudrateLabel = drone.baudrate === '0' || drone.baudrate === 0 ? '0 (SITL / no serial)' : (drone.baudrate || '57600');
@@ -356,6 +265,22 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
     : customFieldEntries;
   const visibleCustomFieldEntries = secondaryCustomFieldEntries.slice(0, 3);
   const hiddenCustomFieldCount = Math.max(secondaryCustomFieldEntries.length - visibleCustomFieldEntries.length, 0);
+  const normalizedHeartbeatIp = normalizeRuntimeIp(heartbeatIP);
+  const wifiSsid = typeof networkInfo?.wifi?.ssid === 'string' ? networkInfo.wifi.ssid.trim() : '';
+  const ethernetInterface = typeof networkInfo?.ethernet?.interface === 'string'
+    ? networkInfo.ethernet.interface.trim()
+    : '';
+  const wifiSignalStrength = Number(networkInfo?.wifi?.signal_strength_percent);
+  const hasWifiSignal = Number.isFinite(wifiSignalStrength);
+  const hasRuntimeConnectivity = Boolean(wifiSsid || ethernetInterface || hasWifiSignal);
+  const isSitlProfile = !drone.serial_port && ['', '0'].includes(String(drone.baudrate ?? '0'));
+  const showSimulatedNetworkFallback = isSitlProfile && !hasRuntimeConnectivity;
+  const assignmentSummary = isRoleSwap
+    ? `Mapped to ${compactPosId}`
+    : 'Native slot alignment';
+  const trajectorySourceLabel = normalizedPosId
+    ? `Source Drone ${normalizedPosId}.csv`
+    : 'Source file pending';
 
   return (
     <>
@@ -368,18 +293,14 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
       {/* Card Header */}
       <div className="drone-card-header">
         <div className="drone-id-section">
-          <div className="identity-kicker">Mission Assignment</div>
+          <div className="identity-kicker">{formatDroneLabel(normalizedHwId)}</div>
           <div className="drone-title-row">
-            <h3 className="drone-title">{formatDroneLabel(normalizedHwId)}</h3>
+            <h3 className="drone-title">{compactIdentity}</h3>
             <span className={`assignment-badge ${isRoleSwap ? 'role-swap' : 'default'}`}>
               {isRoleSwap ? 'Slot swap' : 'Own slot'}
             </span>
           </div>
-          <p className="assignment-summary">
-            {isRoleSwap
-              ? `Swapped to ${formatShowSlotLabel(normalizedPosId)}`
-              : `${formatShowSlotLabel(normalizedPosId)} (own slot)`}
-          </p>
+          <p className="assignment-summary">{assignmentSummary}</p>
           {promotedField && (
             <div className="promoted-field-chip">
               <span className="promoted-field-label">{promotedField.label}</span>
@@ -400,14 +321,14 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
       <div className="drone-content">
         <div className="identity-strip">
           <div className="identity-tile">
-            <span className="identity-label">Hardware ID</span>
-            <span className="identity-value">{formatDroneLabel(normalizedHwId)}</span>
+            <span className="identity-label">Hardware / runtime</span>
+            <span className="identity-value">{compactHwId}</span>
             <small>Physical drone and runtime identity</small>
           </div>
           <div className="identity-tile">
-            <span className="identity-label">Position ID</span>
-            <span className="identity-value">{formatShowSlotLabel(normalizedPosId)}</span>
-            <small>{`Trajectory source: Drone ${normalizedPosId}.csv`}</small>
+            <span className="identity-label">Mission slot</span>
+            <span className="identity-value">{compactPosId}</span>
+            <small>{trajectorySourceLabel}</small>
           </div>
         </div>
 
@@ -482,13 +403,31 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
       <div className="network-section">
         <div className="network-header">
           <FontAwesomeIcon icon={faSignal} />
-          Network Information
+          Runtime Connectivity
         </div>
         <div className="network-content">
-          {networkInfo ? (
+          {showSimulatedNetworkFallback ? (
             <>
               <div className="network-row">
-                <span className="network-label">Wi-Fi Network:</span>
+                <span className="network-label">Runtime mode</span>
+                <span className="network-value">
+                  SITL / simulated
+                  <span className="network-status simulated">Expected</span>
+                </span>
+              </div>
+              <div className="network-row">
+                <span className="network-label">Telemetry path</span>
+                <span className="network-value">{normalizedHeartbeatIp || drone.ip || 'Mission-config runtime path'}</span>
+              </div>
+              <div className="network-row">
+                <span className="network-label">Physical links</span>
+                <span className="network-value">Wi-Fi and Ethernet telemetry are not reported in SITL.</span>
+              </div>
+            </>
+          ) : networkInfo ? (
+            <>
+              <div className="network-row">
+                <span className="network-label">Wi-Fi network</span>
                 <span className="network-value">
                   {networkInfo?.wifi?.ssid || 'N/A'}
                   <span className={`network-status ${networkInfo?.wifi?.ssid ? 'connected' : 'disconnected'}`}>
@@ -497,14 +436,14 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
                 </span>
               </div>
               <div className="network-row">
-                <span className="network-label">Signal:</span>
+                <span className="network-label">Signal</span>
                 <span className="network-value">
                   {networkInfo?.wifi?.signal_strength_percent ?? 'N/A'}%
                   {getWifiIcon(networkInfo?.wifi?.signal_strength_percent)}
                 </span>
               </div>
               <div className="network-row">
-                <span className="network-label">Ethernet:</span>
+                <span className="network-label">Ethernet</span>
                 <span className="network-value">
                   {networkInfo?.ethernet?.interface || 'N/A'}
                   <span className={`network-status ${networkInfo?.ethernet?.interface ? 'connected' : 'unknown'}`}>
@@ -515,10 +454,10 @@ const DroneReadOnlyView = memo(function DroneReadOnlyView({
             </>
           ) : (
             <div className="network-row">
-              <span className="network-label">Status:</span>
+              <span className="network-label">Status</span>
               <span className="network-value">
-                Network data unavailable
-                <span className="network-status unknown">Offline</span>
+                Runtime network telemetry unavailable
+                <span className="network-status unknown">Unknown</span>
               </span>
             </div>
           )}

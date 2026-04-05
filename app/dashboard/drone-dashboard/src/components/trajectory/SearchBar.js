@@ -1,8 +1,8 @@
 // src/components/trajectory/SearchBar.js
-// PHASE 2 ENHANCEMENTS: Real geocoding search with location suggestions
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import PropTypes from 'prop-types';
+import { TRAJECTORY_ALTITUDE_POLICY } from '../../constants/trajectoryMissionPolicy';
 import '../../styles/SearchBar.css';
 
 // Module-level geocode result cache (max 50 entries)
@@ -22,7 +22,6 @@ const SearchBar = ({ onLocationSelect }) => {
   const debounceRef = useRef(null);
   const lastRequestTimeRef = useRef(0);
 
-  // PHASE 2: Enhanced geocoding with multiple providers
   const geocodeLocation = async (query) => {
     try {
       setError('');
@@ -75,8 +74,6 @@ const SearchBar = ({ onLocationSelect }) => {
       }));
 
     } catch (error) {
-      console.warn('Geocoding error:', error);
-      
       // Fallback to coordinate parsing with error handling
       const coordFallback = query.match(/(-?\d+\.?\d+)[\s,]+(-?\d+\.?\d+)/);
       if (coordFallback) {
@@ -169,7 +166,7 @@ const SearchBar = ({ onLocationSelect }) => {
     setSelectedIndex(-1);
     
     // Default altitude for search results (can be edited later)
-    const defaultAltitude = 100; // MSL meters
+    const defaultAltitude = TRAJECTORY_ALTITUDE_POLICY.DEFAULT_MSL;
     onLocationSelect(suggestion.longitude, suggestion.latitude, defaultAltitude);
   };
 
@@ -183,7 +180,7 @@ const SearchBar = ({ onLocationSelect }) => {
     try {
       const results = await geocodeLocation(searchTerm.trim());
       if (results.length > 0) {
-        const defaultAltitude = 100; // MSL meters
+        const defaultAltitude = TRAJECTORY_ALTITUDE_POLICY.DEFAULT_MSL;
         onLocationSelect(results[0].longitude, results[0].latitude, defaultAltitude);
       } else {
         setError('No locations found. Try entering coordinates as "latitude, longitude"');

@@ -88,6 +88,14 @@ class TestGcsLoggingImports:
 
         assert get_logger.__module__ == 'mds_logging.server'
 
+    def test_launch_missions_require_live_armability_probe(self):
+        from command import mission_requires_launch_armability_probe
+        from src.enums import Mission
+
+        assert mission_requires_launch_armability_probe(Mission.TAKE_OFF) is True
+        assert mission_requires_launch_armability_probe(Mission.SWARM_TRAJECTORY) is True
+        assert mission_requires_launch_armability_probe(Mission.SMART_SWARM) is False
+
 
 # ============================================================================
 # CommandTracker Tests
@@ -123,6 +131,64 @@ class TestCommandTracker:
         assert status['phase'] == 'awaiting_ack'
         assert status['outcome'] is None
         assert status['acks']['expected'] == 3
+
+    @pytest.mark.asyncio
+    async def test_create_or_replay_command_reuses_existing_command_for_same_idempotency_key(self, tracker):
+        from command_tracker import CommandTracker
+
+        fingerprint = CommandTracker.build_request_fingerprint(
+            {
+                "mission_type": 10,
+                "trigger_time": 0,
+                "target_drone_ids": ["2", "1"],
+            }
+        )
+        first = await tracker.create_or_replay_command(
+            mission_type=10,
+            target_drones=["1", "2"],
+            params={"trigger_time": 0},
+            idempotency_key="retry-123",
+            request_fingerprint=fingerprint,
+        )
+        second = await tracker.create_or_replay_command(
+            mission_type=10,
+            target_drones=["1", "2"],
+            params={"trigger_time": 0},
+            idempotency_key="retry-123",
+            request_fingerprint=fingerprint,
+        )
+
+        assert first.replayed is False
+        assert second.replayed is True
+        assert second.command_id == first.command_id
+
+        status = await tracker.get_status(first.command_id)
+        assert status["idempotency_key"] == "retry-123"
+
+    @pytest.mark.asyncio
+    async def test_create_or_replay_command_rejects_conflicting_payload_for_same_idempotency_key(self, tracker):
+        from command_tracker import CommandIdempotencyConflictError, CommandTracker
+
+        await tracker.create_or_replay_command(
+            mission_type=10,
+            target_drones=["1"],
+            params={"trigger_time": 0},
+            idempotency_key="retry-123",
+            request_fingerprint=CommandTracker.build_request_fingerprint(
+                {"mission_type": 10, "trigger_time": 0}
+            ),
+        )
+
+        with pytest.raises(CommandIdempotencyConflictError):
+            await tracker.create_or_replay_command(
+                mission_type=101,
+                target_drones=["1"],
+                params={"trigger_time": 0},
+                idempotency_key="retry-123",
+                request_fingerprint=CommandTracker.build_request_fingerprint(
+                    {"mission_type": 101, "trigger_time": 0}
+                ),
+            )
 
     @pytest.mark.asyncio
     async def test_record_ack_accepted(self, tracker):
@@ -205,6 +271,87 @@ class TestCommandTracker:
         assert status['status'] == 'completed'
         assert status['phase'] == 'terminal'
         assert status['outcome'] == 'completed'
+        assert status['progress']['stage'] == 'completed'
+
+    @pytest.mark.asyncio
+    async def test_progress_stage_marks_future_trigger_as_scheduled(self, tracker):
+        """Pending execution with a future trigger should report a scheduled stage."""
+        future_trigger = int(time.time()) + 120
+        command_id = await tracker.create_command(
+            mission_type=10,
+            target_drones=['1', '2'],
+            params={'triggerTime': future_trigger},
+        )
+
+        await tracker.record_ack(command_id, hw_id='1', category='accepted')
+        await tracker.record_ack(command_id, hw_id='2', category='accepted')
+
+        status = await tracker.get_status(command_id)
+        assert status['phase'] == 'pending_execution'
+        assert status['progress']['stage'] == 'scheduled'
+        assert status['progress']['scheduled_trigger_time'] == future_trigger * 1000
+
+    @pytest.mark.asyncio
+    async def test_progress_stage_marks_finishing_when_some_drones_complete(self, tracker):
+        """In-progress commands should surface a finishing stage once some drones complete."""
+        command_id = await tracker.create_command(
+            mission_type=4,
+            target_drones=['1', '2'],
+        )
+
+        await tracker.record_ack(command_id, hw_id='1', category='accepted')
+        await tracker.record_ack(command_id, hw_id='2', category='accepted')
+        await tracker.record_execution_start(command_id, hw_id='1')
+        await tracker.record_execution_start(command_id, hw_id='2')
+        await tracker.record_execution(command_id, hw_id='1', success=True, duration_ms=5000)
+
+        status = await tracker.get_status(command_id)
+        assert status['phase'] == 'in_progress'
+        assert status['progress']['stage'] == 'finishing'
+        assert status['progress']['completed'] == 1
+        assert status['progress']['remaining'] == 1
+
+    @pytest.mark.asyncio
+    async def test_execution_start_promotes_missing_ack_to_accepted(self, tracker):
+        """Execution-start should count as acceptance proof if the HTTP ACK was lost."""
+        command_id = await tracker.create_command(
+            mission_type=10,
+            target_drones=['1'],
+        )
+
+        await tracker.record_execution_start(command_id, hw_id='1')
+
+        status = await tracker.get_status(command_id)
+        assert status['acks']['received'] == 1
+        assert status['acks']['accepted'] == 1
+        assert status['acks']['details']['1']['category'] == 'accepted'
+        assert 'execution-start' in status['acks']['details']['1']['message']
+        assert status['phase'] == 'in_progress'
+        assert status['progress']['active'] == 1
+
+    @pytest.mark.asyncio
+    async def test_execution_result_upgrades_offline_ack_to_accepted(self, tracker):
+        """Execution-result must override an earlier offline ACK classification."""
+        command_id = await tracker.create_command(
+            mission_type=10,
+            target_drones=['1'],
+        )
+
+        await tracker.record_ack(command_id, hw_id='1', category='offline', message='Timed out')
+        await tracker.record_execution(command_id, hw_id='1', success=True, duration_ms=5000)
+
+        status = await tracker.get_status(command_id)
+        assert status['acks']['offline'] == 0
+        assert status['acks']['accepted'] == 1
+        assert status['acks']['details']['1']['category'] == 'accepted'
+        assert 'execution-result' in status['acks']['details']['1']['message']
+        assert status['status'] == 'completed'
+        assert status['phase'] == 'terminal'
+        assert status['outcome'] == 'completed'
+
+        stats = await tracker.get_statistics()
+        assert stats['failed_commands'] == 0
+        assert stats['successful_commands'] == 1
 
     @pytest.mark.asyncio
     async def test_partial_success(self, tracker):
@@ -279,6 +426,70 @@ class TestCommandTracker:
         assert status['phase'] == 'terminal'
         assert status['outcome'] == 'superseded'
         assert status['error_summary'] == 'Superseded by newer command on all 2 drones'
+
+    @pytest.mark.asyncio
+    async def test_late_execution_after_timeout_does_not_mutate_terminal_outcome(self, tracker):
+        """Late execution evidence should be stored without resurrecting a timed-out command."""
+        from schemas import CommandStatusResponse
+
+        command_id = await tracker.create_command(
+            mission_type=4,
+            target_drones=['1'],
+            timeout_ms=1,
+        )
+
+        await tracker.record_ack(command_id, hw_id='1', category='accepted')
+        await asyncio.sleep(0.01)
+        timed_out = await tracker.check_timeouts()
+
+        assert command_id in timed_out
+
+        await tracker.record_execution(command_id, hw_id='1', success=True, duration_ms=5000)
+
+        status = await tracker.get_status(command_id)
+        validated = CommandStatusResponse.model_validate(status)
+
+        assert validated.status.value == 'timeout'
+        assert validated.phase.value == 'terminal'
+        assert validated.outcome.value == 'timeout'
+        assert validated.executions.received == 0
+        assert validated.executions.succeeded == 0
+        assert validated.late_reports.executions.received == 1
+        assert validated.late_reports.executions.succeeded == 1
+        assert validated.late_reports.execution_starts.received == 1
+        assert validated.late_reports.executions.details['1'].duration_ms == 5000
+
+    @pytest.mark.asyncio
+    async def test_late_ack_after_timeout_does_not_change_terminal_counts(self, tracker):
+        """Late ACKs should remain diagnostic evidence only once a command is terminal."""
+        command_id = await tracker.create_command(
+            mission_type=4,
+            target_drones=['1'],
+            timeout_ms=1,
+        )
+
+        await asyncio.sleep(0.01)
+        timed_out = await tracker.check_timeouts()
+
+        assert command_id in timed_out
+
+        await tracker.record_ack(
+            command_id,
+            hw_id='1',
+            category='accepted',
+            message='Late ACK after timeout',
+        )
+
+        status = await tracker.get_status(command_id)
+
+        assert status['status'] == 'timeout'
+        assert status['phase'] == 'terminal'
+        assert status['outcome'] == 'timeout'
+        assert status['acks']['received'] == 0
+        assert status['acks']['accepted'] == 0
+        assert status['late_reports']['acks']['received'] == 1
+        assert status['late_reports']['acks']['accepted'] == 1
+        assert status['late_reports']['acks']['details']['1']['message'] == 'Late ACK after timeout'
 
     @pytest.mark.asyncio
     async def test_cancel_command(self, tracker):
@@ -431,8 +642,97 @@ class TestGcsCommandDistribution:
         assert success is True
         assert error == ""
         assert category == 'accepted'
-        assert mock_post.call_args.kwargs['json']['missionType'] == str(Mission.RETURN_RTL.value)
-        assert mock_post.call_args.kwargs['json']['triggerTime'] == '0'
+        assert mock_post.call_args.kwargs['json']['mission_type'] == Mission.RETURN_RTL.value
+        assert mock_post.call_args.kwargs['json']['trigger_time'] == 0
+
+    def test_send_command_to_drone_aborts_after_sync_dispatch_window_expires(self):
+        """Synchronized missions should not be retried once the safe queue window has passed."""
+        from command import send_command_to_drone
+        from src.enums import Mission
+
+        drone = {'hw_id': 1, 'ip': '172.18.0.2'}
+        command_data = {
+            'missionType': str(Mission.SWARM_TRAJECTORY.value),
+            'triggerTime': '205',
+        }
+
+        with patch('command.time.time', return_value=201.0):
+            with patch('command.requests.post') as mock_post:
+                success, error, category = send_command_to_drone(drone, command_data, timeout=5, retries=3)
+
+        assert success is False
+        assert category == 'error'
+        assert 'Missed synchronized dispatch window' in error
+        mock_post.assert_not_called()
+
+    def test_send_command_to_drone_applies_sync_window_to_hover_test(self):
+        """HOVER_TEST must follow the same strict synchronized queue window as other offboard rehearsal modes."""
+        from command import send_command_to_drone
+        from src.enums import Mission
+
+        drone = {'hw_id': 1, 'ip': '172.18.0.2'}
+        command_data = {
+            'missionType': str(Mission.HOVER_TEST.value),
+            'triggerTime': '205',
+        }
+
+        with patch('command.time.time', return_value=201.0):
+            with patch('command.requests.post') as mock_post:
+                success, error, category = send_command_to_drone(drone, command_data, timeout=5, retries=3)
+
+        assert success is False
+        assert category == 'error'
+        assert 'Missed synchronized dispatch window' in error
+        mock_post.assert_not_called()
+
+    def test_send_command_to_drone_does_not_apply_sync_window_to_takeoff(self):
+        """Standalone TAKEOFF should still dispatch even if the trigger timestamp is already near/past the strict-sync window."""
+        from command import send_command_to_drone
+        from src.enums import Mission
+
+        drone = {'hw_id': 1, 'ip': '172.18.0.2'}
+        command_data = {
+            'missionType': str(Mission.TAKE_OFF.value),
+            'triggerTime': '205',
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {'status': 'accepted'}
+
+        with patch('command.time.time', return_value=201.0):
+            with patch('command.requests.post', return_value=mock_response) as mock_post:
+                success, error, category = send_command_to_drone(drone, command_data, timeout=5, retries=1)
+
+        assert success is True
+        assert error == ""
+        assert category == 'accepted'
+        mock_post.assert_called_once()
+        assert mock_post.call_args.kwargs['timeout'] == 5
+
+    def test_send_command_to_drone_caps_timeout_to_remaining_sync_window(self):
+        """Last-chance synchronized dispatch attempts should not wait longer than the remaining safe window."""
+        from command import send_command_to_drone
+        from src.enums import Mission
+
+        drone = {'hw_id': 1, 'ip': '172.18.0.2'}
+        command_data = {
+            'missionType': str(Mission.SWARM_TRAJECTORY.value),
+            'triggerTime': '204',
+        }
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {'status': 'accepted'}
+
+        with patch('command.time.time', return_value=198.5):
+            with patch('command.requests.post', return_value=mock_response) as mock_post:
+                success, error, category = send_command_to_drone(drone, command_data, timeout=5, retries=1)
+
+        assert success is True
+        assert error == ""
+        assert category == 'accepted'
+        assert mock_post.call_args.kwargs['timeout'] == pytest.approx(0.5, abs=1e-6)
 
     def test_send_commands_to_all_normalizes_rejected_drone_ids(self):
         """Rejected/error logging should not crash when config uses integer hw_id values."""
@@ -512,6 +812,52 @@ class TestGcsCommandDistribution:
         assert results['success'] == 2
         assert results['offline'] == 0
         assert mock_send.call_count == 2
+
+    def test_probe_live_armability_for_drones_collects_blocked_and_unavailable(self):
+        from command import probe_live_armability_for_drones
+
+        drones = [
+            {'hw_id': 1, 'ip': '172.18.0.2'},
+            {'hw_id': 2, 'ip': '172.18.0.3'},
+            {'hw_id': 3, 'ip': '172.18.0.4'},
+        ]
+
+        with patch('command.probe_live_armability_for_drone', side_effect=[
+            {'drone_id': '1', 'category': 'ready', 'ready': True, 'summary': 'ok'},
+            {'drone_id': '2', 'category': 'blocked', 'ready': False, 'summary': 'waiting for PX4 armability'},
+            {'drone_id': '3', 'category': 'offline', 'ready': False, 'summary': 'probe unreachable'},
+        ]):
+            result = probe_live_armability_for_drones(drones)
+
+        assert result['all_ready'] is False
+        assert result['blocked_ids'] == ['2']
+        assert result['unavailable_ids'] == ['3']
+
+    def test_probe_live_armability_for_drone_uses_total_request_budget(self):
+        from command import probe_live_armability_for_drone
+        from src.mission_startup import calculate_live_armability_request_timeout
+
+        drone = {'hw_id': 3, 'ip': '172.18.0.4'}
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            'success': True,
+            'ready': True,
+            'summary': 'ready for mission startup',
+        }
+
+        params = Mock()
+        params.LIVE_ARMABILITY_PROBE_CONNECT_TIMEOUT_SEC = 5.0
+        params.LIVE_ARMABILITY_PROBE_TIMEOUT_SEC = 6.0
+        params.LIVE_ARMABILITY_PROBE_HTTP_BUFFER_SEC = 2.0
+
+        with patch('command.requests.get', return_value=response) as mock_get:
+            with patch('command.Params', params):
+                result = probe_live_armability_for_drone(drone)
+
+        expected_timeout = calculate_live_armability_request_timeout(params=params)
+        assert result['ready'] is True
+        assert mock_get.call_args.kwargs['timeout'] == pytest.approx(expected_timeout)
 
 
 # ============================================================================
@@ -657,16 +1003,31 @@ class TestSchemas:
 
         # Valid request
         request = SubmitCommandRequest(
-            missionType=10,
-            triggerTime=0,
+            mission_type=10,
+            trigger_time=0,
             takeoff_altitude=10.0
         )
-        assert request.missionType == 10
+        assert request.mission_type == 10
+        assert request.model_dump()["mission_type"] == 10
+        assert request.model_dump()["trigger_time"] == 0
+
+        legacy_request = SubmitCommandRequest(
+            missionType="TAKE_OFF",
+            triggerTime=0,
+            target_drones=["1", "2"],
+            operatorLabel="Launch now",
+            clientCommandId="retry-123",
+        )
+        assert legacy_request.mission_type == 10
+        assert legacy_request.target_drone_ids == ["1", "2"]
+        assert legacy_request.operator_label == "Launch now"
+        assert legacy_request.idempotency_key == "retry-123"
+        assert legacy_request.model_dump()["target_drone_ids"] == ["1", "2"]
 
         # Invalid altitude (negative)
         with pytest.raises(Exception):
             SubmitCommandRequest(
-                missionType=10,
+                mission_type=10,
                 takeoff_altitude=-5.0
             )
 
@@ -682,12 +1043,14 @@ class TestSchemas:
             mission_name="TAKE_OFF",
             target_drones=["1", "2"],
             submitted_count=2,
+            tracking_timeout_ms=90000,
             message="Command submitted",
             timestamp=int(time.time() * 1000)
         )
         assert response.success == True
         assert response.command_id == "abc-123"
         assert response.submitted_count == 2
+        assert response.tracking_timeout_ms == 90000
 
     def test_command_status_response(self):
         """Test CommandStatusResponse schema"""
@@ -695,6 +1058,7 @@ class TestSchemas:
             AckSummary,
             CommandOutcome,
             CommandPhase,
+            CommandProgressSummary,
             CommandStatus,
             CommandStatusResponse,
             ExecutionSummary,
@@ -715,7 +1079,18 @@ class TestSchemas:
             ),
             executions=ExecutionSummary(
                 expected=1, started=1, active=0, received=1, succeeded=1, failed=0
-            )
+            ),
+            progress=CommandProgressSummary(
+                stage="completed",
+                label="Completed",
+                message="Completed successfully on 1/1 accepted drone.",
+                ack_pending=0,
+                accepted=1,
+                execution_pending=0,
+                active=0,
+                completed=1,
+                remaining=0,
+            ),
         )
         assert response.status == CommandStatus.COMPLETED
         assert response.phase == CommandPhase.TERMINAL
@@ -756,8 +1131,8 @@ class TestCommandEndpointIntegration:
     async def test_submit_and_track_command(self, mock_config_data):
         """Test full command submission and tracking flow"""
         # This would test:
-        # 1. POST /submit_command
-        # 2. GET /command/{id}
+        # 1. POST /api/v1/commands
+        # 2. GET /api/v1/commands/{id}
         # 3. Wait for ACKs
         # 4. Verify status progression
         pass

@@ -36,6 +36,9 @@ def build_controller(mock_drone_config):
     mock_drone_config.readiness_status = "unknown"
     mock_drone_config.readiness_summary = ""
     mock_drone_config.preflight_last_update = 0
+    mock_drone_config.home_position = {"lat": 35.0, "long": 51.0, "alt": 1278.0}
+    mock_drone_config.px4_home_position_set = True
+    mock_drone_config.home_position_source = "px4"
 
     return controller
 
@@ -54,6 +57,7 @@ def test_update_pre_arm_status_reports_ready(mock_drone_config):
 def test_update_pre_arm_status_requires_home_position_before_takeoff(mock_drone_config):
     controller = build_controller(mock_drone_config)
     mock_drone_config.home_position = None
+    mock_drone_config.px4_home_position_set = False
     mock_drone_config.is_armed = False
     mock_drone_config.custom_mode = 50593792
 
@@ -69,6 +73,7 @@ def test_update_pre_arm_status_requires_home_position_before_takeoff(mock_drone_
 def test_update_pre_arm_status_allows_missing_home_when_already_airborne(mock_drone_config):
     controller = build_controller(mock_drone_config)
     mock_drone_config.home_position = None
+    mock_drone_config.px4_home_position_set = False
     mock_drone_config.is_armed = True
     mock_drone_config.custom_mode = 50593792
 
@@ -78,6 +83,29 @@ def test_update_pre_arm_status_allows_missing_home_when_already_airborne(mock_dr
     assert mock_drone_config.readiness_status == "ready"
     home_check = next(check for check in mock_drone_config.readiness_checks if check["id"] == "home")
     assert home_check["ready"] is True
+
+
+def test_update_pre_arm_status_treats_uninit_system_state_as_advisory_when_px4_health_is_good(mock_drone_config):
+    controller = build_controller(mock_drone_config)
+    mock_drone_config.system_status = 0
+    mock_drone_config.base_mode = 29
+    mock_drone_config.custom_mode = 100925440
+    mock_drone_config.home_position = {"lat": 35.0, "long": 51.0, "alt": 1278.0}
+    mock_drone_config.is_armed = False
+
+    controller._update_pre_arm_status()
+
+    assert mock_drone_config.is_ready_to_arm is True
+    assert mock_drone_config.readiness_status == "ready"
+    assert "telemetry advisory" in mock_drone_config.readiness_summary.lower()
+    assert mock_drone_config.preflight_blockers == []
+    assert any(
+        "system state reports uninit" in warning["message"].lower()
+        for warning in mock_drone_config.preflight_warnings
+    )
+    system_check = next(check for check in mock_drone_config.readiness_checks if check["id"] == "system")
+    assert system_check["ready"] is True
+    assert "treated as advisory" in system_check["detail"].lower()
 
 
 def test_process_status_text_surfaces_px4_blocker(mock_drone_config):
@@ -96,3 +124,85 @@ def test_process_status_text_surfaces_px4_blocker(mock_drone_config):
     assert mock_drone_config.preflight_blockers
     assert "ekf2 missing data" in mock_drone_config.preflight_blockers[0]["message"].lower()
     assert mock_drone_config.status_messages
+
+
+def test_open_mavlink_connection_uses_explicit_udpin(mock_drone_config, monkeypatch):
+    controller = build_controller(mock_drone_config)
+    controller.local_mavlink_port = 12550
+
+    captured = {}
+
+    def fake_connection(connection_string):
+        captured["connection_string"] = connection_string
+        return object()
+
+    monkeypatch.setattr("src.local_mavlink_controller.mavutil.mavlink_connection", fake_connection)
+
+    controller._open_mavlink_connection()
+
+    assert captured["connection_string"] == "udpin:127.0.0.1:12550"
+
+
+def test_reset_mavlink_connection_reopens_listener(mock_drone_config, monkeypatch):
+    controller = build_controller(mock_drone_config)
+    controller.local_mavlink_port = 12550
+    closed = {"called": False}
+
+    class FakeMav:
+        def close(self):
+            closed["called"] = True
+
+    controller.mav = FakeMav()
+    new_connection = object()
+    monkeypatch.setattr(controller, "_open_mavlink_connection", lambda: new_connection)
+
+    controller._reset_mavlink_connection("test")
+
+    assert closed["called"] is True
+    assert controller.mav is new_connection
+
+
+def test_process_global_position_int_sets_fallback_home_without_px4_truth(mock_drone_config):
+    controller = build_controller(mock_drone_config)
+    mock_drone_config.home_position = None
+    mock_drone_config.px4_home_position_set = False
+    mock_drone_config.home_position_source = "unknown"
+    msg = SimpleNamespace(
+        lat=int(35.123456 * 1E7),
+        lon=int(51.2721 * 1E7),
+        alt=int(1278.5 * 1E3),
+        vx=0,
+        vy=0,
+        vz=0,
+    )
+
+    controller.process_global_position_int(msg)
+
+    assert mock_drone_config.home_position == {
+        "lat": 35.123456,
+        "long": 51.2721,
+        "alt": 1278.5,
+    }
+    assert mock_drone_config.px4_home_position_set is False
+    assert mock_drone_config.home_position_source == "fallback_position"
+
+
+def test_set_home_position_marks_px4_home_truth(mock_drone_config):
+    controller = build_controller(mock_drone_config)
+    mock_drone_config.px4_home_position_set = False
+    mock_drone_config.home_position_source = "unknown"
+    msg = SimpleNamespace(
+        latitude=int(35.123456 * 1E7),
+        longitude=int(51.2721 * 1E7),
+        altitude=int(1278.5 * 1E3),
+    )
+
+    controller.set_home_position(msg)
+
+    assert mock_drone_config.home_position == {
+        "lat": 35.123456,
+        "long": 51.2721,
+        "alt": 1278.5,
+    }
+    assert mock_drone_config.px4_home_position_set is True
+    assert mock_drone_config.home_position_source == "px4"

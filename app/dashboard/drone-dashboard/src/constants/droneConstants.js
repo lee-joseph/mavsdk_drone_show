@@ -1,5 +1,9 @@
 // src/constants/droneConstants.js
-import { getCustomShowImageURL, getBackendURL } from '../utilities/utilities'; // Import utility functions
+import {
+    buildGcsUrl,
+    buildShowPlotUrl,
+    GCS_ROUTE_KEYS,
+} from '../services/gcsApiService';
 
 export const DRONE_MISSION_TYPES = {
     NONE: 0,
@@ -36,8 +40,8 @@ export const DRONE_ACTION_TYPES = {
 };
 
 export const DRONE_MISSION_IMAGES = {
-    [DRONE_MISSION_TYPES.DRONE_SHOW_FROM_CSV]: `${getBackendURL()}/get-show-plots/combined_drone_paths.jpg`,
-    [DRONE_MISSION_TYPES.CUSTOM_CSV_DRONE_SHOW]: `${getCustomShowImageURL()}`, // Use the function to get the custom show image URL
+    [DRONE_MISSION_TYPES.DRONE_SHOW_FROM_CSV]: buildShowPlotUrl('combined_drone_paths.jpg'),
+    [DRONE_MISSION_TYPES.CUSTOM_CSV_DRONE_SHOW]: buildGcsUrl(GCS_ROUTE_KEYS.customShowImage),
 };
 
 export const DRONE_MISSION_NAMES = {
@@ -68,15 +72,15 @@ export const DRONE_ACTION_NAMES = {
 export const getMissionDescription = (missionType) => {
     switch (missionType) {
         case DRONE_MISSION_TYPES.DRONE_SHOW_FROM_CSV:
-            return 'Executes a fully synchronized drone show using pre-processed Skybrush CSV data. This mission coordinates multiple drones autonomously, leveraging MAVSDK to maintain precision in complex aerial maneuvers.';
+            return 'Launch the active SkyBrush package with synchronized timing and optional launch correction.';
         case DRONE_MISSION_TYPES.CUSTOM_CSV_DRONE_SHOW:
-            return 'Initiates a custom drone show sequence from a user-defined CSV file. This mission allows for flexibility in the drone choreography, utilizing MAVSDK for offboard control to follow intricate trajectories specified in the CSV.';
+            return 'Replay the active custom protocol CSV relative to each launch point.';
         case DRONE_MISSION_TYPES.SMART_SWARM:
-            return 'Implements a live smart swarm formation with leader-follower dynamics, runtime role changes, and configurable geographic or body-frame offsets. Use it when multiple drones must maintain formation while operators adjust the cluster in flight.';
+            return 'Start the published leader-follower topology for live formation flight.';
         case DRONE_MISSION_TYPES.SWARM_TRAJECTORY:
-            return 'Executes coordinated swarm trajectories where leaders follow uploaded waypoint paths and followers maintain formation using configured offsets. Each drone follows a time-synchronized global trajectory with precise positioning and formation integrity.';
+            return 'Dispatch the processed leader-route package across the selected cluster.';
         case DRONE_MISSION_TYPES.NONE:
-            return 'Immediately cancels any active mission, bringing all drones back to their default state.';
+            return 'Cancel the active mission for the current target scope immediately.';
         default:
             return '';
     }

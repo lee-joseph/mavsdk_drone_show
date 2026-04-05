@@ -45,6 +45,9 @@ const ThemeToggle = ({ variant = 'button', showLabel = true, className = '' }) =
   ];
 
   const currentThemeOption = themeOptions.find(option => option.value === themePreference);
+  const effectiveThemeLabel = themePreference === THEMES.AUTO
+    ? `Auto (${isDark ? 'Dark' : 'Light'})`
+    : (currentThemeOption?.label || getThemeLabel());
 
   const handleThemeSelect = (theme) => {
     setTheme(theme);
@@ -65,8 +68,8 @@ const ThemeToggle = ({ variant = 'button', showLabel = true, className = '' }) =
       <button
         className={`theme-toggle-simple ${className}`}
         onClick={toggleTheme}
-        title={`Switch to ${isDark ? 'light' : 'dark'} theme`}
-        aria-label={`Switch to ${isDark ? 'light' : 'dark'} theme`}
+        title={`Display theme: ${effectiveThemeLabel}. Switch to ${isDark ? 'light' : 'dark'} theme`}
+        aria-label={`Display theme: ${effectiveThemeLabel}. Switch to ${isDark ? 'light' : 'dark'} theme`}
       >
         <FontAwesomeIcon
           icon={isDark ? faSun : faMoon}
@@ -76,21 +79,45 @@ const ThemeToggle = ({ variant = 'button', showLabel = true, className = '' }) =
     );
   }
 
+  if (variant === 'segmented') {
+    return (
+      <div
+        className={`theme-toggle-segmented ${className}`}
+        role="group"
+        aria-label="Display theme selector"
+      >
+        {themeOptions.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            className={`theme-segment ${themePreference === option.value ? 'active' : ''}`}
+            onClick={() => handleThemeSelect(option.value)}
+            title={option.description}
+            aria-pressed={themePreference === option.value}
+          >
+            <FontAwesomeIcon icon={option.icon} className="theme-icon" />
+            {showLabel && <span className="theme-label">{option.label}</span>}
+          </button>
+        ))}
+      </div>
+    );
+  }
+
   // Cycle button variant (cycles through all themes)
   if (variant === 'cycle') {
     return (
       <button
         className={`theme-toggle-cycle ${className}`}
         onClick={cycleTheme}
-        title={getThemeLabel()}
-        aria-label={`Current theme: ${getThemeLabel()}. Click to cycle themes.`}
+        title={`Display theme: ${effectiveThemeLabel}`}
+        aria-label={`Display theme: ${effectiveThemeLabel}. Click to cycle themes.`}
       >
         <FontAwesomeIcon
           icon={currentThemeOption?.icon || faCircleHalfStroke}
           className="theme-icon"
         />
         {showLabel && (
-          <span className="theme-label">{currentThemeOption?.label}</span>
+          <span className="theme-label">{effectiveThemeLabel}</span>
         )}
       </button>
     );
@@ -105,14 +132,15 @@ const ThemeToggle = ({ variant = 'button', showLabel = true, className = '' }) =
           onClick={handleToggleClick}
           aria-expanded={isDropdownOpen}
           aria-haspopup="true"
-          title="Select theme"
+          title={`Display theme: ${effectiveThemeLabel}`}
+          aria-label={`Display theme: ${effectiveThemeLabel}. Choose light, dark, or automatic theme.`}
         >
           <FontAwesomeIcon
             icon={currentThemeOption?.icon || faCircleHalfStroke}
             className="theme-icon"
           />
           {showLabel && (
-            <span className="theme-label">{currentThemeOption?.label}</span>
+            <span className="theme-label">{effectiveThemeLabel}</span>
           )}
           <FontAwesomeIcon
             icon={faChevronDown}
@@ -147,15 +175,15 @@ const ThemeToggle = ({ variant = 'button', showLabel = true, className = '' }) =
     <button
       className={`theme-toggle-button ${className}`}
       onClick={handleToggleClick}
-      title={getThemeLabel()}
-      aria-label={`Current theme: ${getThemeLabel()}`}
+      title={`Display theme: ${effectiveThemeLabel}`}
+      aria-label={`Display theme: ${effectiveThemeLabel}`}
     >
       <FontAwesomeIcon
         icon={currentThemeOption?.icon || faCircleHalfStroke}
         className="theme-icon"
       />
       {showLabel && (
-        <span className="theme-label">{getThemeLabel()}</span>
+        <span className="theme-label">{effectiveThemeLabel}</span>
       )}
     </button>
   );

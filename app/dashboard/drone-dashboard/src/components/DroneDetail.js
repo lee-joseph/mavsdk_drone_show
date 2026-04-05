@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
 import { Marker } from 'react-leaflet';
 import { FaMapMarkerAlt, FaWifi, FaClock, FaBatteryFull, FaCompass, FaSatellite, FaPlane, FaCog, FaNetworkWired } from 'react-icons/fa';
 import 'leaflet/dist/leaflet.css';
@@ -7,10 +6,9 @@ import L from 'leaflet';
 import LeafletMapBase from './map/LeafletMapBase';
 import DroneReadinessReport from './DroneReadinessReport';
 import '../styles/DroneDetail.css';
-import { getBackendURL } from '../utilities/utilities';
 import { getFlightModeTitle, getSystemStatusTitle, getFlightModeCategory } from '../utilities/flightModeUtils';
 import { getDroneShowStateName } from '../constants/droneStates';
-import { getFriendlyMissionName } from '../utilities/missionUtils';
+import { getMissionDisplayContext } from '../utilities/missionUtils';
 import {
   FIELD_NAMES,
   attachDroneRuntimeClock,
@@ -19,6 +17,8 @@ import {
 } from '../constants/fieldMappings';
 import { getDroneRuntimeStatus } from '../utilities/droneRuntimeStatus';
 import { getDroneReadinessModel } from '../utilities/droneReadiness';
+import { getDroneDisplayIdentity } from '../utilities/dronePresentation';
+import { getFleetTelemetryResponse, unwrapFleetTelemetryPayload } from '../services/gcsApiService';
 
 const POLLING_RATE_HZ = 2;
 
@@ -34,20 +34,20 @@ const droneIcon = new L.Icon({
 const DroneDetail = ({ drone, isAccordionView }) => {
   const [detailedDrone, setDetailedDrone] = useState(drone);
   const [activeTab, setActiveTab] = useState('overview');
+  const droneId = drone[FIELD_NAMES.HW_ID];
 
   useEffect(() => {
-    const backendURL = getBackendURL();
-    const url = `${backendURL}/telemetry`;
     const fetchData = () => {
-      axios.get(url).then((response) => {
-        const droneData = response.data[drone[FIELD_NAMES.HW_ID]];
+      getFleetTelemetryResponse().then((response) => {
+        const telemetry = unwrapFleetTelemetryPayload(response.data);
+        const droneData = telemetry[droneId];
         if (droneData) {
           const clockMeta = {
             receivedAtMs: Date.now(),
             serverNowMs: extractServerNowMs(response.headers),
           };
           setDetailedDrone(attachDroneRuntimeClock({
-            hw_ID: drone[FIELD_NAMES.HW_ID],
+            hw_ID: droneId,
             ...normalizeDroneData(droneData),
           }, clockMeta));
         }
@@ -60,35 +60,35 @@ const DroneDetail = ({ drone, isAccordionView }) => {
     return () => {
       clearInterval(pollingInterval);
     };
-  }, [drone[FIELD_NAMES.HW_ID]]);
+  }, [droneId]);
 
   const getBatteryStatus = (voltage) => {
-    if (voltage >= 16.0) return { class: 'excellent', color: '#38a169', label: 'Excellent' };
-    if (voltage >= 15.5) return { class: 'good', color: '#68d391', label: 'Good' };
-    if (voltage >= 14.5) return { class: 'warning', color: '#f6ad55', label: 'Warning' };
-    return { class: 'critical', color: '#e53e3e', label: 'Critical' };
+    if (voltage >= 16.0) return { class: 'excellent', color: 'var(--color-success)', tone: 'good', label: 'Excellent' };
+    if (voltage >= 15.5) return { class: 'good', color: 'var(--color-success)', tone: 'good', label: 'Good' };
+    if (voltage >= 14.5) return { class: 'warning', color: 'var(--color-warning)', tone: 'warning', label: 'Warning' };
+    return { class: 'critical', color: 'var(--color-danger)', tone: 'danger', label: 'Critical' };
   };
 
-  const getGpsStatus = (fixType, hdop, satellites) => {
-    if (fixType >= 5) return { class: 'rtk', color: '#805ad5', label: 'RTK' };
-    if (fixType === 4) return { class: 'dgps', color: '#3182ce', label: 'DGPS' };
-    if (fixType === 3 && hdop <= 1.0) return { class: 'good', color: '#38a169', label: '3D Fix (Good)' };
-    if (fixType === 3) return { class: 'fair', color: '#f6ad55', label: '3D Fix (Fair)' };
-    if (fixType === 2) return { class: 'poor', color: '#e53e3e', label: '2D Fix' };
-    return { class: 'none', color: '#a0aec0', label: 'No Fix' };
+  const getGpsStatus = (fixType, hdop) => {
+    if (fixType >= 5) return { class: 'rtk', color: 'var(--color-primary)', tone: 'primary', label: 'RTK' };
+    if (fixType === 4) return { class: 'dgps', color: 'var(--color-info)', tone: 'info', label: 'DGPS' };
+    if (fixType === 3 && hdop <= 1.0) return { class: 'good', color: 'var(--color-success)', tone: 'good', label: '3D Fix (Good)' };
+    if (fixType === 3) return { class: 'fair', color: 'var(--color-warning)', tone: 'warning', label: '3D Fix (Fair)' };
+    if (fixType === 2) return { class: 'poor', color: 'var(--color-danger)', tone: 'danger', label: '2D Fix' };
+    return { class: 'none', color: 'var(--color-text-tertiary)', tone: 'muted', label: 'No Fix' };
   };
 
   const getConnectionStatus = (runtimeStatus) => {
     if (runtimeStatus.level === 'online') {
-      return { class: 'excellent', color: '#38a169', label: runtimeStatus.label };
+      return { class: 'excellent', color: 'var(--color-success)', tone: 'good', label: runtimeStatus.label };
     }
     if (runtimeStatus.level === 'degraded') {
-      return { class: 'good', color: '#f6ad55', label: runtimeStatus.label };
+      return { class: 'good', color: 'var(--color-warning)', tone: 'warning', label: runtimeStatus.label };
     }
     if (runtimeStatus.level === 'offline') {
-      return { class: 'poor', color: '#e53e3e', label: runtimeStatus.label };
+      return { class: 'poor', color: 'var(--color-danger)', tone: 'danger', label: runtimeStatus.label };
     }
-    return { class: 'none', color: '#a0aec0', label: runtimeStatus.label };
+    return { class: 'none', color: 'var(--color-text-tertiary)', tone: 'muted', label: runtimeStatus.label };
   };
 
   const formatTime = (timestamp) => {
@@ -110,18 +110,21 @@ const DroneDetail = ({ drone, isAccordionView }) => {
   const flightModeCategory = getFlightModeCategory(detailedDrone[FIELD_NAMES.FLIGHT_MODE]);
   const systemStatusName = getSystemStatusTitle(detailedDrone[FIELD_NAMES.SYSTEM_STATUS]);
   const missionStateName = getDroneShowStateName(detailedDrone[FIELD_NAMES.STATE]);
-  const friendlyMissionName = getFriendlyMissionName(detailedDrone[FIELD_NAMES.LAST_MISSION]);
+  const missionDisplay = getMissionDisplayContext(
+    detailedDrone[FIELD_NAMES.MISSION],
+    detailedDrone[FIELD_NAMES.LAST_MISSION]
+  );
 
   const isArmed = detailedDrone[FIELD_NAMES.IS_ARMED] || false;
   const batteryStatus = getBatteryStatus(detailedDrone[FIELD_NAMES.BATTERY_VOLTAGE] || 0);
   const gpsStatus = getGpsStatus(
     detailedDrone[FIELD_NAMES.GPS_FIX_TYPE] || 0,
-    detailedDrone[FIELD_NAMES.HDOP] || 99.99,
-    detailedDrone[FIELD_NAMES.SATELLITES_VISIBLE] || 0
+    detailedDrone[FIELD_NAMES.HDOP] || 99.99
   );
   const runtimeStatus = getDroneRuntimeStatus(detailedDrone);
   const readiness = getDroneReadinessModel(detailedDrone, runtimeStatus);
   const connectionStatus = getConnectionStatus(runtimeStatus);
+  const displayIdentity = getDroneDisplayIdentity(detailedDrone);
 
   // Calculate uptime
   const firstSeen = detailedDrone[FIELD_NAMES.HEARTBEAT_FIRST_SEEN] || 0;
@@ -138,8 +141,8 @@ const DroneDetail = ({ drone, isAccordionView }) => {
       {/* Status Dashboard */}
       <div className="status-dashboard">
         <div className="status-card">
-          <div className="status-icon">
-            <FaPlane style={{ color: isArmed ? '#e53e3e' : '#38a169' }} />
+          <div className={`status-icon status-icon--${isArmed ? 'danger' : 'good'}`}>
+            <FaPlane />
           </div>
           <div className="status-info">
             <div className="status-label">Armed Status</div>
@@ -153,39 +156,39 @@ const DroneDetail = ({ drone, isAccordionView }) => {
         </div>
 
         <div className="status-card">
-          <div className="status-icon">
-            <FaBatteryFull style={{ color: batteryStatus.color }} />
+          <div className={`status-icon status-icon--${batteryStatus.tone}`}>
+            <FaBatteryFull />
           </div>
           <div className="status-info">
             <div className="status-label">Battery</div>
             <div className="status-value">{(detailedDrone[FIELD_NAMES.BATTERY_VOLTAGE] || 0).toFixed(1)}V</div>
-            <div className="status-sub" style={{ color: batteryStatus.color }}>
+            <div className={`status-sub status-sub--${batteryStatus.tone}`}>
               {batteryStatus.label}
             </div>
           </div>
         </div>
 
         <div className="status-card">
-          <div className="status-icon">
-            <FaSatellite style={{ color: gpsStatus.color }} />
+          <div className={`status-icon status-icon--${gpsStatus.tone}`}>
+            <FaSatellite />
           </div>
           <div className="status-info">
             <div className="status-label">GPS Status</div>
             <div className="status-value">{detailedDrone[FIELD_NAMES.SATELLITES_VISIBLE] || 0} Sats</div>
-            <div className="status-sub" style={{ color: gpsStatus.color }}>
+            <div className={`status-sub status-sub--${gpsStatus.tone}`}>
               {gpsStatus.label}
             </div>
           </div>
         </div>
 
         <div className="status-card">
-          <div className="status-icon">
-            <FaWifi style={{ color: connectionStatus.color }} />
+          <div className={`status-icon status-icon--${connectionStatus.tone}`}>
+            <FaWifi />
           </div>
           <div className="status-info">
             <div className="status-label">Connection</div>
             <div className="status-value">{detailedDrone[FIELD_NAMES.IP] || 'N/A'}</div>
-            <div className="status-sub" style={{ color: connectionStatus.color }}>
+            <div className={`status-sub status-sub--${connectionStatus.tone}`}>
               {connectionStatus.label}
             </div>
           </div>
@@ -216,11 +219,11 @@ const DroneDetail = ({ drone, isAccordionView }) => {
           </div>
           <div className="detail-item">
             <label>Current Mission</label>
-            <span>{detailedDrone[FIELD_NAMES.MISSION] || 'None'}</span>
+            <span>{missionDisplay.currentMissionName}</span>
           </div>
           <div className="detail-item">
             <label>Last Mission</label>
-            <span>{friendlyMissionName}</span>
+            <span>{missionDisplay.lastMissionName}</span>
           </div>
           <div className="detail-item">
             <label>Follow Mode</label>
@@ -402,7 +405,13 @@ const DroneDetail = ({ drone, isAccordionView }) => {
       {!isAccordionView && (
         <div className="detail-header">
           <h1>
-            <FaPlane /> Drone {detailedDrone[FIELD_NAMES.HW_ID]} - Detailed View
+            <span className="detail-header__title">
+              <FaPlane />
+              <span>
+                {displayIdentity.primary}
+                <small>{displayIdentity.secondary || 'Detailed telemetry view'}</small>
+              </span>
+            </span>
             <div className="connection-indicator">
               <span
                 className="status-dot"

@@ -31,7 +31,7 @@ Do not mix these mentally. The standard Drone Show path is the normal operator w
 
 ## Import Pipeline
 
-`POST /import-show` now stages the incoming ZIP before replacing the live show folders. That means:
+`POST /api/v1/shows/skybrush/import` now stages the incoming ZIP before replacing the live show folders. That means:
 
 - nested ZIP layouts are accepted
 - duplicate drone CSV basenames are rejected
@@ -51,7 +51,7 @@ The official stock SITL package ships with one tracked demo default origin:
 - `data/origin.sitl.default.json`
 - current location: **Azadi Stadium**
 
-Fresh SITL uses that file only as a fallback seed so first-time testers get a consistent launch-reference baseline without a manual `/set-origin`.
+Fresh SITL uses that file only as a fallback seed so first-time testers get a consistent launch-reference baseline without a manual `PUT /api/v1/origin`.
 
 Important distinction:
 
@@ -139,6 +139,12 @@ Operational guidance:
 - rehearse the actual delay window you intend to use
 - verify the fleet is already `READY` before scheduling the trigger
 - if the browser and GCS clocks diverge materially, the dashboard warns about the offset, but scheduling still follows the GCS clock
+- offboard startup now also waits for MAVSDK/PX4 armability before arming, so transient pre-arm blockers are retried locally instead of immediately failing the mission start
+- GCS launch dispatch now also performs a live per-drone MAVSDK armability probe for launch-from-ground missions, so passive telemetry alone cannot falsely clear a drone that PX4 would still refuse to arm
+- strict synchronized missions now expose the same fail-closed doctrine in-page and in the confirmation dialog: if dispatch or startup slips beyond the safe pre-trigger / late-start window, they abort instead of pretending the choreography stayed in sync
+- telemetry launch-readiness now treats `home_position_set` as actual PX4 HOME_POSITION truth, not just "a GPS position sample was seen once", so origin / takeoff readiness no longer gets falsely cleared by a fallback position cache
+- `Command Control` now keeps a persistent live command monitor showing the normalized lifecycle stages (`awaiting_ack`, `scheduled`, `pending_execution`, `executing`, `finishing`, terminal outcome), the current acceptance/error counts, a same-target `Cancel Mission` path when operators need to abort before trigger time or stop a live mission cleanly, and a recent-command strip so a newer dispatch does not silently erase the previous command snapshot from view
+- that command monitor now also rehydrates from the backend command history endpoints after a dashboard refresh/navigation event, and the same shared lifecycle stream now accepts updates from `Command Control`, per-drone airborne overrides, and `Smart Swarm Runtime`, so operators do not lose command context just because they changed route or used a different control surface
 
 ## Launch Readiness
 
@@ -154,6 +160,14 @@ Warnings remain visible for:
 - GPS-quality concerns
 - manual-placement assumptions
 - non-critical placement drift
+
+Validator note:
+
+- the acceptance validator can target a live subset with `--drone-ids`, so offline config slots outside that selected subset do not fail the run by themselves
+- that same validator still treats selected `status=error` deviation rows as launch blockers, matching the operator launch-readiness doctrine above
+- the validator now re-checks selected-drone launch geometry immediately before each show/custom-show dispatch, so an idle-but-displaced fleet fails fast instead of launching from a bad staging state
+- if you chain Smart Swarm or Swarm Trajectory drills before Drone Show validation on the same SITL fleet, recreate or otherwise restage the fleet on the show launch slots first
+- `--expected-show-count` still refers to the imported Drone Show package size, not the selected live validation subset
 
 That keeps the operator signal focused on actual launch blockers instead of generic page state.
 
@@ -177,7 +191,10 @@ Operational dashboard note:
 - the per-drone override strip on each overview card is intentionally treated as an airborne intervention surface
 - when a drone is still disarmed, the controls stay visibly unavailable instead of pretending they are useful on the ground
 - when telemetry is unavailable, the card tells the operator to recover link authority before attempting a per-drone override
+- the per-drone `Mission` badge now reflects the live/current mission field; if the drone is idle the badge falls back to `No Mission`, and the last mission remains secondary history context instead of replacing the live label
 - the overview Actions tab now keeps flight/test overrides compact by default, while still allowing optional GCS-clock scheduling for those actions when operators need a delayed takeoff or rehearsal start
+- standalone `TAKEOFF` now reuses the same bounded PX4 armability retry gate as the synchronized mission launchers, so operators get the same "retry briefly, then fail loudly" startup posture instead of a one-shot arm attempt
+- those standalone scheduled actions remain best-effort after acceptance; they do not inherit the strict offboard fail-closed queue window used by Drone Show / Custom CSV / Swarm Trajectory
 - maintenance and danger actions remain immediate so recovery operations do not silently inherit a delayed trigger
 
 ## Read-only Demo and Tester Setups

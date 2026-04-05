@@ -13,8 +13,10 @@ Welcome to the MAVSDK Drone Show documentation! This index will help you find th
 | I want to... | Start with... |
 |--------------|---------------|
 | get a working SITL demo fast | [SITL Comprehensive Guide](guides/sitl-comprehensive.md) |
+| run reusable end-to-end SITL regression suites | [SITL Validation Platform](guides/sitl-validation-platform.md) |
 | fly a Drone Show from the dashboard | [Drone Show Guide](features/drone-show.md) |
 | run Smart Swarm from the dashboard | [Smart Swarm Guide](features/smart-swarm.md) |
+| author, process, and launch a Swarm Trajectory mission | [Swarm Trajectory Guide](features/swarm-trajectory.md) |
 | point MDS at a customer/private repo | [Custom Repo Workflow](guides/custom-repo-workflow.md) |
 | install a GCS | [GCS Setup Guide](guides/gcs-setup.md) |
 | deploy Raspberry Pi hardware | [MDS Init Setup](guides/mds-init-setup.md) |
@@ -28,6 +30,7 @@ Welcome to the MAVSDK Drone Show documentation! This index will help you find th
 | Tester / pilot / evaluator | [SITL Comprehensive Guide](guides/sitl-comprehensive.md) |
 | Drone Show operator | [Drone Show Guide](features/drone-show.md) |
 | Smart Swarm operator | [Smart Swarm Guide](features/smart-swarm.md) |
+| Swarm Trajectory operator | [Swarm Trajectory Guide](features/swarm-trajectory.md) |
 | Deployment engineer | [GCS Setup Guide](guides/gcs-setup.md) and [MDS Init Setup](guides/mds-init-setup.md) |
 | Customer maintainer | [Custom Repo Workflow](guides/custom-repo-workflow.md) |
 | SITL release maintainer | [SITL Custom Release Workflow](guides/sitl-custom-release-workflow.md) |
@@ -38,6 +41,7 @@ Welcome to the MAVSDK Drone Show documentation! This index will help you find th
 - **[Repo Agent Operating Spec](../AGENTS.md)** - canonical machine-oriented operating loop for terminal AI agents; root vendor shims (`CLAUDE.md`, `GEMINI.md`) stay thin and point here
 - **[AI Agent Context Index](superpowers/README.md)** - index for machine-oriented specs and plans without cluttering the normal operator docs
 - **[AI Agent SITL Audit Loop](superpowers/specs/2026-03-26-ai-agent-sitl-audit-loop.md)** - deeper agent-only execution contract for reproduce, patch, validate, package, and handoff phases
+- **[SITL Validation Platform](guides/sitl-validation-platform.md)** - canonical reusable runtime-acceptance suite for maintainers, CI, and AI agents across same-host and split-root validation layouts
 
 ### Project Videos
 
@@ -46,6 +50,8 @@ Welcome to the MAVSDK Drone Show documentation! This index will help you find th
 ### Core Secondary Guides
 
 - **[Advanced SITL Guide](guides/advanced-sitl.md)** - custom runtime env vars, debug-oriented SITL tuning, and mutable boot-sync behavior
+- **[SITL Validation Platform](guides/sitl-validation-platform.md)** - reusable end-to-end validation templates, plan files, and artifacts
+- **`tools/sitl_plans/`** - checked-in named SITL scenario library for maintainers, CI, and AI agents
 - **[QuickScout Guide](quickscout.md)** - SAR / recon workflows
 - **[Versioning Guide](VERSIONING.md)** - release flow and version management
 - **[Python Compatibility](guides/python-compatibility.md)** - supported Python versions
@@ -59,6 +65,7 @@ Welcome to the MAVSDK Drone Show documentation! This index will help you find th
 | Guide | Description | Audience |
 |-------|-------------|----------|
 | **[SITL Comprehensive](guides/sitl-comprehensive.md)** | Complete SITL setup from scratch | Beginners |
+| **[SITL Validation Platform](guides/sitl-validation-platform.md)** | Reusable end-to-end SITL regression templates, plans, and artifacts | Maintainers / CI / AI agents |
 | **[Custom Repo Workflow](guides/custom-repo-workflow.md)** | Customer repo/branch selection across GCS, drones, and SITL | Advanced users |
 | **[Advanced SITL](guides/advanced-sitl.md)** | Custom configuration, environment variables, production deployments | Advanced users |
 | **[SITL Custom Release Workflow](guides/sitl-custom-release-workflow.md)** | Fork maintenance, clean image rebuilds, package/archive distribution | Advanced users |
@@ -81,7 +88,7 @@ Detailed documentation for MDS features:
 |---------|-------------|
 | **[Drone Show](features/drone-show.md)** | SkyBrush ZIP import, control-mode selection, trigger timing, custom CSV distinction, and launch-readiness workflow |
 | **[Smart Swarm](features/smart-swarm.md)** | Live leader-follower formations, runtime controls, failover behavior, first SITL flow, and validator tool |
-| **[Swarm Trajectory](features/swarm-trajectory.md)** | Processed cluster trajectories, leader-follow offsets, plotting, and KML export |
+| **[Swarm Trajectory](features/swarm-trajectory.md)** | Swarm Design -> Trajectory Planning -> Swarm Trajectory -> Dashboard mission workflow for processed leader/follower trajectories |
 | **[QuickScout](quickscout.md)** | Cooperative SAR/recon coverage planning, mission execution, and monitoring |
 | **[Logging System](guides/logging-system.md)** | Unified logging, Log Viewer workflow, export, and operator/developer modes |
 | **[Origin System](features/origin-system.md)** | Coordinate system implementation and global positioning |

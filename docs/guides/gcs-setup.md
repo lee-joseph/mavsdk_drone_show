@@ -121,7 +121,7 @@ For a full customer repo decision tree, see [Custom Repo Workflow](custom-repo-w
 - **Architecture:** x86_64 or arm64/aarch64
 - **RAM:** Minimum 2GB, **Recommended 4GB+**
   > ⚠️ Systems with <4GB RAM may encounter npm "JavaScript heap out of memory" errors.
-  > **Solution:** Add swap space or set `export NODE_OPTIONS='--max-old-space-size=1536'`
+  > The dashboard `npm run build` script now sets a 4GB Node heap budget automatically and disables production sourcemaps to keep Hetzner/CI builds stable. Systems with <4GB RAM may still need swap.
 - **Disk Space:** Minimum 5GB free
 - **Network:** Internet access for package downloads
 - **Privileges:** Root or sudo access
@@ -452,6 +452,7 @@ After successful installation, start the dashboard:
 cd ~/mavsdk_drone_show/app
 
 # SITL mode (simulation) - development mode, runs in tmux by default
+# React hot-reloads; backend stays single-process unless you explicitly enable MDS_GCS_BACKEND_RELOAD=true
 ./linux_dashboard_start.sh --sitl
 
 # Real mode (hardware drones)
@@ -487,7 +488,10 @@ cd ~/mavsdk_drone_show/app
 ./linux_dashboard_start.sh --status
 ```
 
-Production note: the FastAPI backend currently keeps heartbeats, command tracking, and background pollers in process memory, so `--prod` intentionally runs a single Gunicorn worker. This is by design for correctness, not a misconfiguration.
+Operational note: the FastAPI backend currently keeps heartbeats, command tracking, telemetry polling, and other live runtime state in process memory. For that reason:
+- `--prod` intentionally runs a single Gunicorn worker
+- `--sitl` / `--dev` now keep the backend single-process by default as well
+- backend auto-reload is an explicit debug override only: `export MDS_GCS_BACKEND_RELOAD=true`
 
 ### Managing the Services
 
@@ -506,7 +510,7 @@ tmux kill-session -t MDS-GCS
 After starting:
 - **React Dashboard:** http://YOUR_SERVER_IP:3030
 - **GCS API Server:** http://YOUR_SERVER_IP:5000
-- **API Health Check:** http://YOUR_SERVER_IP:5000/health
+- **API Health Check:** http://YOUR_SERVER_IP:5000/api/v1/system/health
 
 ---
 

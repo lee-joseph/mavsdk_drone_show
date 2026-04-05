@@ -1,7 +1,6 @@
 // src/components/trajectory/TrajectoryToolbar.js
-// PHASE 2 ENHANCEMENTS: Undo/redo, save/load, enhanced controls
 
-import React from 'react';
+import React, { useState } from 'react';
 import PropTypes from 'prop-types';
 import '../../styles/TrajectoryToolbar.css';
 
@@ -14,8 +13,8 @@ const TrajectoryToolbar = ({
   onToggleTerrain,
   sceneMode,
   onSceneModeChange,
+  terrainControlsAvailable = true,
   waypointCount,
-  // PHASE 2: Enhanced props
   canUndo = false,
   canRedo = false,
   undoDescription = '',
@@ -24,9 +23,28 @@ const TrajectoryToolbar = ({
   onRedo,
   onSave,
   onLoad,
-  saveStatus = { saved: true, autoSaveTime: null },
-  trajectoryName = ''
+  onImport,
+  onSendToSwarm,
+  saveStatus = { dirty: false, autoSaveTime: null, persistedAt: null },
+  trajectoryName = '',
+  canSendToSwarm = false,
+  missionReadiness = {
+    posture: {
+      tone: 'neutral',
+      label: 'Not ready',
+      summary: 'Add waypoints before assigning this route to a cluster.',
+      transferLabel: 'Assign to Cluster',
+    },
+  },
 }) => {
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const isDirty = typeof saveStatus?.dirty === 'boolean' ? saveStatus.dirty : !saveStatus?.saved;
+  const handoffPosture = missionReadiness?.posture || {};
+  const handoffTone = handoffPosture.tone || 'neutral';
+  const handoffLabel = handoffPosture.label || 'Not ready';
+  const handoffSummary = handoffPosture.summary || 'Add waypoints before assigning this route to a cluster.';
+  const handoffActionLabel = handoffPosture.transferLabel || 'Assign to Cluster';
+
   // Format auto-save time for display
   const formatAutoSaveTime = (timestamp) => {
     if (!timestamp) return '';
@@ -41,7 +59,6 @@ const TrajectoryToolbar = ({
 
   return (
     <div className="trajectory-toolbar">
-      {/* PHASE 2: Primary Actions Group */}
       <div className="toolbar-group toolbar-primary">
         <button 
           className={`toolbar-btn ${isAddingWaypoint ? 'active' : ''}`}
@@ -54,7 +71,6 @@ const TrajectoryToolbar = ({
         
         <div className="toolbar-separator" />
         
-        {/* PHASE 2: Undo/Redo controls */}
         <button 
           className={`toolbar-btn undo-btn ${!canUndo ? 'disabled' : ''}`}
           onClick={onUndo}
@@ -76,7 +92,6 @@ const TrajectoryToolbar = ({
         </button>
       </div>
 
-      {/* PHASE 2: File Operations Group */}
       <div className="toolbar-group toolbar-file">
         <button 
           className="toolbar-btn save-btn"
@@ -85,7 +100,7 @@ const TrajectoryToolbar = ({
         >
           <span className="btn-icon">💾</span>
           <span className="btn-text">Save</span>
-          {!saveStatus.saved && <span className="unsaved-indicator">●</span>}
+          {isDirty && <span className="unsaved-indicator">●</span>}
         </button>
         
         <button 
@@ -96,15 +111,34 @@ const TrajectoryToolbar = ({
           <span className="btn-icon">📂</span>
           <span className="btn-text">Load</span>
         </button>
+
+        <button
+          className="toolbar-btn import-btn"
+          onClick={onImport}
+          title="Import a leader-route CSV or planner JSON"
+        >
+          <span className="btn-icon">📥</span>
+          <span className="btn-text">Import</span>
+        </button>
         
         <button 
           className={`toolbar-btn export-btn ${waypointCount === 0 ? 'disabled' : ''}`}
           onClick={onExportTrajectory} 
           disabled={waypointCount === 0}
-          title="Export Trajectory"
+          title="Export the current leader route"
         >
           <span className="btn-icon">📤</span>
           <span className="btn-text">Export</span>
+        </button>
+
+        <button
+          className={`toolbar-btn primary-btn ${!canSendToSwarm ? 'disabled' : ''}`}
+          onClick={onSendToSwarm}
+          disabled={!canSendToSwarm}
+          title={canSendToSwarm ? `${handoffActionLabel}. ${handoffSummary}` : 'Add at least one waypoint before assigning a leader path to a cluster'}
+        >
+          <span className="btn-icon">🧭</span>
+          <span className="btn-text">{handoffActionLabel}</span>
         </button>
         
         <button 
@@ -118,34 +152,52 @@ const TrajectoryToolbar = ({
         </button>
       </div>
       
-      {/* PHASE 2: View Controls Group */}
       <div className="toolbar-group toolbar-view">
-        <button 
-          className={`toolbar-btn terrain-btn ${showTerrain ? 'active' : ''}`}
-          onClick={onToggleTerrain}
-          title="Toggle 3D Terrain"
-        >
-          <span className="btn-icon">🏔️</span>
-          <span className="btn-text">Terrain</span>
-        </button>
-        
-        <div className="view-mode-selector">
-          <label className="view-mode-label">View:</label>
-          <select 
-            value={sceneMode} 
-            onChange={(e) => onSceneModeChange(e.target.value)}
-            className="view-mode-select"
-            title="Change View Mode"
+        {terrainControlsAvailable ? (
+          <>
+            <button
+              className={`toolbar-btn terrain-btn ${showTerrain ? 'active' : ''}`}
+              onClick={onToggleTerrain}
+              title="Toggle 3D Terrain"
+            >
+              <span className="btn-icon">🏔️</span>
+              <span className="btn-text">Terrain</span>
+            </button>
+
+            <div className="view-mode-selector">
+              <label className="view-mode-label">View:</label>
+              <select
+                value={sceneMode}
+                onChange={(e) => onSceneModeChange(e.target.value)}
+                className="view-mode-select"
+                title="Change View Mode"
+              >
+                <option value="3D">3D</option>
+                <option value="2D">2D</option>
+                <option value="Columbus">Columbus</option>
+              </select>
+            </div>
+          </>
+        ) : (
+          <div
+            className="trajectory-map-fallback-note"
+            title="Mapbox 3D terrain controls are unavailable in the Leaflet fallback map. Authoring remains available in 2D."
           >
-            <option value="3D">3D</option>
-            <option value="2D">2D</option>
-            <option value="Columbus">Columbus</option>
-          </select>
-        </div>
+            <span className="trajectory-map-fallback-note__label">Map</span>
+            <strong className="trajectory-map-fallback-note__value">2D fallback</strong>
+          </div>
+        )}
       </div>
       
-      {/* PHASE 2: Status Information */}
       <div className="toolbar-group toolbar-status">
+        <div
+          className={`trajectory-handoff-status trajectory-handoff-status--${handoffTone}`}
+          title={handoffSummary}
+        >
+          <span className="trajectory-handoff-status__label">Handoff</span>
+          <strong className="trajectory-handoff-status__value">{handoffLabel}</strong>
+        </div>
+
         {/* Trajectory name display */}
         {trajectoryName && (
           <div className="trajectory-name-display">
@@ -162,10 +214,24 @@ const TrajectoryToolbar = ({
         
         {/* Save status */}
         <div className="save-status">
-          {!saveStatus.saved ? (
-            <span className="status-unsaved" title="Trajectory has unsaved changes">
+          {isDirty ? (
+            <span
+              className="status-unsaved"
+              title={saveStatus.autoSaveTime
+                ? `Working draft auto-saved at ${new Date(saveStatus.autoSaveTime).toLocaleTimeString()}`
+                : 'Trajectory draft has unsaved library changes'}
+            >
               <span className="status-indicator">●</span>
-              <span className="status-text">Unsaved</span>
+              <span className="status-text">
+                {saveStatus.autoSaveTime
+                  ? `Draft auto-saved ${formatAutoSaveTime(saveStatus.autoSaveTime)}`
+                  : 'Unsaved draft'}
+              </span>
+            </span>
+          ) : saveStatus.persistedAt ? (
+            <span className="status-saved" title={`Saved at ${new Date(saveStatus.persistedAt).toLocaleTimeString()}`}>
+              <span className="status-indicator">✓</span>
+              <span className="status-text">Saved</span>
             </span>
           ) : saveStatus.autoSaveTime ? (
             <span className="status-saved" title={`Auto-saved at ${new Date(saveStatus.autoSaveTime).toLocaleTimeString()}`}>
@@ -181,29 +247,41 @@ const TrajectoryToolbar = ({
         </div>
       </div>
 
-      {/* PHASE 2: Keyboard shortcuts help (collapsible) */}
       <div className="toolbar-group toolbar-help">
         <button 
           className="toolbar-btn help-btn"
-          title="Keyboard Shortcuts"
-          onClick={() => {
-            const shortcuts = `
-Keyboard Shortcuts:
-• A - Toggle Add Waypoint mode
-• Ctrl+Z - Undo last action
-• Ctrl+Y - Redo last action  
-• Ctrl+S - Save trajectory
-• Ctrl+O - Load trajectory
-• Delete - Delete selected waypoint
-• Escape - Cancel current operation
-• Enter - Confirm waypoint creation
-• Click any value - Edit inline
-• Drag waypoints - Reposition`;
-            alert(shortcuts);
-          }}
+          title="Show planner shortcuts"
+          aria-label="Show planner shortcuts"
+          aria-expanded={showShortcutHelp}
+          onClick={() => setShowShortcutHelp((prev) => !prev)}
         >
           <span className="btn-icon">⌨️</span>
         </button>
+        {showShortcutHelp && (
+          <div className="toolbar-shortcut-popover" role="dialog" aria-label="Planner shortcuts">
+            <div className="toolbar-shortcut-popover__header">
+              <strong>Planner shortcuts</strong>
+              <button
+                type="button"
+                className="toolbar-shortcut-popover__close"
+                onClick={() => setShowShortcutHelp(false)}
+                aria-label="Close planner shortcuts"
+              >
+                ✕
+              </button>
+            </div>
+            <ul className="toolbar-shortcut-popover__list">
+              <li><kbd>A</kbd> Toggle Add Waypoint mode</li>
+              <li><kbd>Ctrl</kbd> + <kbd>Z</kbd> Undo last action</li>
+              <li><kbd>Ctrl</kbd> + <kbd>Y</kbd> Redo last action</li>
+              <li><kbd>Ctrl</kbd> + <kbd>S</kbd> Save trajectory</li>
+              <li><kbd>Ctrl</kbd> + <kbd>O</kbd> Load trajectory</li>
+              <li><kbd>Delete</kbd> Delete selected waypoint</li>
+              <li><kbd>Esc</kbd> Cancel current operation</li>
+              <li><kbd>Enter</kbd> Save inline field edit</li>
+            </ul>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -219,9 +297,9 @@ TrajectoryToolbar.propTypes = {
   onToggleTerrain: PropTypes.func.isRequired,
   sceneMode: PropTypes.string.isRequired,
   onSceneModeChange: PropTypes.func.isRequired,
+  terrainControlsAvailable: PropTypes.bool,
   waypointCount: PropTypes.number.isRequired,
   
-  // PHASE 2: Enhanced props
   canUndo: PropTypes.bool,
   canRedo: PropTypes.bool,
   undoDescription: PropTypes.string,
@@ -230,9 +308,22 @@ TrajectoryToolbar.propTypes = {
   onRedo: PropTypes.func,
   onSave: PropTypes.func,
   onLoad: PropTypes.func,
+  onImport: PropTypes.func,
+  onSendToSwarm: PropTypes.func,
+  canSendToSwarm: PropTypes.bool,
+  missionReadiness: PropTypes.shape({
+    posture: PropTypes.shape({
+      tone: PropTypes.string,
+      label: PropTypes.string,
+      summary: PropTypes.string,
+      transferLabel: PropTypes.string,
+    }),
+  }),
   saveStatus: PropTypes.shape({
+    dirty: PropTypes.bool,
     saved: PropTypes.bool,
-    autoSaveTime: PropTypes.number
+    autoSaveTime: PropTypes.number,
+    persistedAt: PropTypes.number,
   }),
   trajectoryName: PropTypes.string
 };

@@ -22,6 +22,7 @@ MDS combines the drone-side runtime, GCS/backend services, and React operator da
 | run the first demo quickly | [SITL Comprehensive Guide](docs/guides/sitl-comprehensive.md) |
 | import and launch a drone show | [Drone Show Guide](docs/features/drone-show.md) |
 | run Smart Swarm from the dashboard | [Smart Swarm Guide](docs/features/smart-swarm.md) |
+| author, process, and launch a Swarm Trajectory mission | [Swarm Trajectory Guide](docs/features/swarm-trajectory.md) |
 | point MDS at a customer/private repo | [Custom Repo Workflow](docs/guides/custom-repo-workflow.md) |
 | install a GCS on a VPS or Ubuntu box | [GCS Setup Guide](docs/guides/gcs-setup.md) |
 | deploy real drone hardware | [MDS Init Setup Guide](docs/guides/mds-init-setup.md) |
@@ -43,6 +44,8 @@ bash app/linux_dashboard_start.sh --sitl
 ```
 
 Then open `http://<host>:3030`.
+
+`bash app/linux_dashboard_start.sh --sitl` now keeps the FastAPI backend single-process by default, even in development mode, so telemetry, heartbeats, command tracking, and other in-memory operational state stay coherent during live SITL runs. Only enable backend auto-reload for backend code editing with `MDS_GCS_BACKEND_RELOAD=true`.
 
 For the stock official SITL package, Mission Config starts from the tracked Azadi Stadium demo origin in `data/origin.sitl.default.json`. If you later set a different origin in the dashboard or via the API, MDS writes a local runtime override to `data/origin.json` on that server. Remove that local file when you want the stock Azadi default to apply again.
 

@@ -3,22 +3,24 @@
 Drone API Server - FastAPI Implementation
 ==========================================
 Modern async API server for drone-side HTTP and WebSocket communication.
-Migrated from Flask with 100% backward compatibility + WebSocket streaming.
+Uses canonical `/api/v1/...` HTTP routes plus a dedicated WebSocket stream.
 
 HTTP REST Endpoints:
-- GET  /get_drone_state          - Get current drone state (snapshot)
-- POST /api/send-command          - Receive command from GCS
-- GET  /get-home-pos              - Get home position
-- GET  /get-gps-global-origin     - Get GPS global origin
-- GET  /get-git-status            - Get drone git status
-- GET  /ping                      - Health check
-- GET  /get-position-deviation    - Calculate position deviation
-- GET  /get-network-status        - Get network information
-- GET  /get-swarm-data            - Get swarm configuration
-- GET  /get-local-position-ned    - Get LOCAL_POSITION_NED data
+- GET  /api/v1/drone/state                    - Get current drone state (snapshot)
+- GET  /api/v1/preflight/armability           - Probe live launch readiness
+- POST /api/v1/drone/commands                 - Receive command from GCS
+- GET  /api/v1/navigation/home                - Get home position
+- GET  /api/v1/navigation/global-origin       - Get GPS global origin
+- GET  /api/v1/git/status                     - Get drone git status
+- GET  /api/v1/system/health                  - Versioned health probe
+- GET  /ping                                  - Stable operational health probe
+- GET  /api/v1/navigation/position-deviation  - Calculate position deviation
+- GET  /api/v1/network/status                 - Get network information
+- GET  /api/v1/swarm/config                   - Get swarm configuration
+- GET  /api/v1/telemetry/local-position       - Get LOCAL_POSITION_NED data
 
 WebSocket Endpoints:
-- WS   /ws/drone-state            - Real-time drone state streaming (efficient)
+- WS   /ws/drone-state                          - Real-time drone state streaming
 
 API Documentation:
 - Interactive Docs: http://drone-ip:7070/docs
@@ -29,6 +31,7 @@ import math
 import os
 import time
 import subprocess
+import socket
 from typing import Dict, Any, Optional, List
 
 # FastAPI imports
@@ -40,6 +43,7 @@ import uvicorn
 import requests
 import asyncio
 import json
+from mavsdk.system import System
 
 from mds_logging import get_logger
 
@@ -47,8 +51,29 @@ logger = get_logger("drone_api")
 
 # Project imports
 from src.drone_config import DroneConfig
+from src.constants import NetworkDefaults
 from src.coordinate_utils import latlon_to_ne, get_expected_position_from_trajectory
-from functions.data_utils import safe_float, safe_get
+from src.command_contract import DroneCommandRequest
+from src.drone_api_routes import (
+    DRONE_COMMANDS_ROUTE,
+    DRONE_GIT_STATUS_ROUTE,
+    DRONE_LIVE_ARMABILITY_ROUTE,
+    DRONE_LOCAL_POSITION_ROUTE,
+    DRONE_NAVIGATION_GLOBAL_ORIGIN_ROUTE,
+    DRONE_NAVIGATION_HOME_ROUTE,
+    DRONE_NETWORK_STATUS_ROUTE,
+    DRONE_POSITION_DEVIATION_ROUTE,
+    DRONE_STATE_ROUTE,
+    DRONE_SWARM_CONFIG_ROUTE,
+    DRONE_SYSTEM_HEALTH_ROUTE,
+    DRONE_WS_STATE_ROUTE,
+)
+from src.gcs_api_routes import (
+    GCS_COMMAND_REPORT_EXECUTION_RESULT_ROUTE,
+    GCS_ORIGIN_BOOTSTRAP_ROUTE,
+)
+from src.mission_startup import probe_offboard_armability
+from functions.data_utils import safe_float, safe_get, safe_int
 from functions.file_utils import load_csv, get_trajectory_first_position
 from src import __version__ as MDS_VERSION
 from src.params import Params
@@ -72,14 +97,6 @@ ERROR_SYMBOL = RED + "❌" + RESET
 # ============================================================================
 # Pydantic Models for Request/Response Validation
 # ============================================================================
-
-class CommandRequest(BaseModel):
-    """Command request from GCS"""
-    model_config = ConfigDict(extra='allow')  # Allow additional fields for flexibility
-
-    missionType: str = Field(..., description="Mission type")
-    triggerTime: Optional[str] = Field("0", description="Trigger time")
-
 
 class ReadinessCheckResponse(BaseModel):
     id: str
@@ -110,9 +127,10 @@ class DroneStateResponse(BaseModel):
     velocity_down: float
     yaw: float
     battery_voltage: float
-    follow_mode: Any
-    update_time: Any
+    follow_mode: Any = None
+    update_time: Any = None
     timestamp: int
+    server_time: int = 0
     flight_mode: Any
     base_mode: Any
     system_status: Any
@@ -152,6 +170,95 @@ class CommandAckResponse(BaseModel):
     error_code: Optional[str] = Field(None, description="Error code (e.g., E100, E201)")
     error_detail: Optional[str] = Field(None, description="Detailed error information")
     timestamp: int = Field(..., description="Response timestamp in milliseconds")
+
+
+class LiveArmabilityResponse(BaseModel):
+    success: bool = True
+    ready: bool
+    summary: str
+    blockers: List[str] = Field(default_factory=list)
+    armable: bool = False
+    global_position_ok: bool = False
+    home_position_ok: bool = False
+    local_position_ok: bool = False
+    gyro_ok: bool = False
+    accel_ok: bool = False
+    mag_ok: bool = False
+    timed_out: bool = False
+    elapsed_sec: float = 0.0
+    require_global_position: bool = True
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
+    probe_error: Optional[str] = None
+
+
+class DroneHealthResponse(BaseModel):
+    status: str
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
+    version: str
+
+
+class HomePositionResponse(BaseModel):
+    latitude: float
+    longitude: float
+    altitude: float
+    timestamp: int
+
+
+class GPSGlobalOriginResponse(BaseModel):
+    latitude: float
+    longitude: float
+    altitude: float
+    origin_time_usec: Optional[int] = None
+    timestamp: int
+
+
+class DroneGitStatusResponse(BaseModel):
+    branch: str
+    commit: str
+    author_name: str
+    author_email: str
+    commit_date: str
+    commit_message: str
+    remote_url: Optional[str] = None
+    tracking_branch: Optional[str] = None
+    status: str
+    uncommitted_changes: List[str] = Field(default_factory=list)
+    commits_ahead: int = 0
+    commits_behind: int = 0
+
+
+class PositionDeviationResponse(BaseModel):
+    deviation_north: float
+    deviation_east: float
+    total_deviation: float
+    within_acceptable_range: bool
+
+
+class WifiStatusResponse(BaseModel):
+    ssid: str
+    signal_strength_percent: Any
+
+
+class EthernetStatusResponse(BaseModel):
+    interface: str
+    connection_name: str
+
+
+class NetworkStatusResponse(BaseModel):
+    wifi: Optional[WifiStatusResponse] = None
+    ethernet: Optional[EthernetStatusResponse] = None
+    timestamp: int
+
+
+class LocalPositionNEDResponse(BaseModel):
+    time_boot_ms: int
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+    timestamp: int
 
 
 # ============================================================================
@@ -207,6 +314,7 @@ class DroneAPIServer:
         # WebSocket connection management
         self.active_websockets: List[WebSocket] = []
         self.last_state_hash = None  # Track state changes
+        self._live_probe_lock = asyncio.Lock()
 
         self.setup_routes()
 
@@ -214,18 +322,196 @@ class DroneAPIServer:
         """Setter for injecting the DroneCommunicator dependency after initialization."""
         self.drone_communicator = drone_communicator
 
+    def _resolve_live_probe_connection(self) -> tuple[int, str]:
+        """Mirror the runtime MAVSDK wiring used by mission/action execution."""
+        grpc_port = getattr(
+            self.params,
+            "DEFAULT_GRPC_PORT",
+            NetworkDefaults.GRPC_BASE_PORT,
+        )
+        mavlink_port = safe_int(getattr(self.params, "mavsdk_port", 14540), 14540)
+        return grpc_port, f"udp://:{mavlink_port}"
+
+    @staticmethod
+    def _port_is_open(port: int, host: str = "127.0.0.1", timeout: float = 0.2) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((host, int(port))) == 0
+
+    @staticmethod
+    def _find_mavsdk_server_binary() -> str:
+        env_path = os.environ.get("MAVSDK_SERVER_PATH")
+        candidates = [
+            env_path,
+            os.path.join(BASE_DIR, "mavsdk_server"),
+            os.path.join(os.path.dirname(BASE_DIR), "mavsdk_server"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError("mavsdk_server binary not found")
+
+    async def _ensure_live_probe_server(self, grpc_port: int, udp_port: int):
+        """Start a short-lived mavsdk_server only when the local port is idle."""
+        if self._port_is_open(grpc_port):
+            return None, False
+
+        mavsdk_server_path = self._find_mavsdk_server_binary()
+        process = subprocess.Popen(
+            [mavsdk_server_path, "-p", str(grpc_port), f"udp://:{udp_port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        deadline = time.monotonic() + safe_float(
+            getattr(self.params, "LIVE_ARMABILITY_PROBE_CONNECT_TIMEOUT_SEC", 5.0),
+            5.0,
+        )
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("mavsdk_server exited before the probe connection was ready.")
+            if self._port_is_open(grpc_port):
+                return process, True
+            await asyncio.sleep(0.1)
+
+        process.terminate()
+        raise TimeoutError("Timed out waiting for temporary mavsdk_server to start.")
+
+    @staticmethod
+    def _stop_live_probe_server(process: Optional[subprocess.Popen]) -> None:
+        if not process or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    async def _wait_for_mavsdk_connection(self, drone: System) -> None:
+        connect_timeout = safe_float(
+            getattr(self.params, "LIVE_ARMABILITY_PROBE_CONNECT_TIMEOUT_SEC", 5.0),
+            5.0,
+        )
+        deadline = time.monotonic() + connect_timeout
+        connection_iter = drone.core.connection_state().__aiter__()
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for local MAVSDK connection.")
+
+            try:
+                state = await asyncio.wait_for(connection_iter.__anext__(), timeout=min(1.0, remaining))
+            except asyncio.TimeoutError:
+                continue
+            except StopAsyncIteration as exc:
+                raise RuntimeError("MAVSDK connection stream ended before connection was confirmed.") from exc
+
+            if state.is_connected:
+                return
+
+    async def _probe_live_armability(self, require_global_position: bool = True) -> Dict[str, Any]:
+        probe_timeout = safe_float(
+            getattr(self.params, "LIVE_ARMABILITY_PROBE_TIMEOUT_SEC", 6.0),
+            6.0,
+        )
+        connect_timeout = safe_float(
+            getattr(self.params, "LIVE_ARMABILITY_PROBE_CONNECT_TIMEOUT_SEC", 5.0),
+            5.0,
+        )
+
+        try:
+            async with self._live_probe_lock:
+                grpc_port, system_address = self._resolve_live_probe_connection()
+                udp_port = safe_int(getattr(self.params, "mavsdk_port", 14540), 14540)
+                mavsdk_server, started_server = await self._ensure_live_probe_server(grpc_port, udp_port)
+                try:
+                    drone = System(
+                        mavsdk_server_address="127.0.0.1",
+                        port=grpc_port,
+                    )
+                    await asyncio.wait_for(
+                        drone.connect(system_address=system_address),
+                        timeout=connect_timeout,
+                    )
+                    await self._wait_for_mavsdk_connection(drone)
+                    result = await probe_offboard_armability(
+                        drone,
+                        require_global_position=require_global_position,
+                        timeout=probe_timeout,
+                        logger=logger,
+                    )
+                finally:
+                    if started_server:
+                        self._stop_live_probe_server(mavsdk_server)
+            return {
+                "success": True,
+                **result,
+                "timestamp": int(time.time() * 1000),
+                "probe_error": None,
+            }
+        except Exception as exc:
+            timed_out = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+            return {
+                "success": False,
+                "ready": False,
+                "summary": (
+                    f"Timed out waiting for live armability probe: {exc}"
+                    if timed_out
+                    else f"Live armability probe unavailable: {exc}"
+                ),
+                "blockers": (
+                    ["live armability probe timed out"]
+                    if timed_out
+                    else ["live armability probe unavailable"]
+                ),
+                "armable": False,
+                "global_position_ok": False,
+                "home_position_ok": False,
+                "local_position_ok": False,
+                "gyro_ok": False,
+                "accel_ok": False,
+                "mag_ok": False,
+                "timed_out": timed_out,
+                "elapsed_sec": 0.0,
+                "require_global_position": require_global_position,
+                "timestamp": int(time.time() * 1000),
+                "probe_error": str(exc),
+            }
+
+    @staticmethod
+    def _serialize_drone_state_payload(drone_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize raw communicator state into the canonical HTTP/WebSocket payload shape."""
+        payload = dict(drone_state)
+        server_time_ms = int(time.time() * 1000)
+        raw_update_time = payload.get('update_time')
+        try:
+            numeric_update_time = float(raw_update_time)
+        except (TypeError, ValueError):
+            numeric_update_time = 0.0
+
+        if numeric_update_time > 0:
+            if numeric_update_time < 1_000_000_000_000:
+                payload['timestamp'] = int(numeric_update_time * 1000)
+            else:
+                payload['timestamp'] = int(numeric_update_time)
+        else:
+            payload['timestamp'] = server_time_ms
+
+        payload['server_time'] = server_time_ms
+        return DroneStateResponse.model_validate(payload).model_dump()
+
     def setup_routes(self):
         """Define all API routes (same as Flask version)"""
 
-        @self.app.get(f"/{Params.get_drone_state_URI}")
+        @self.app.get(DRONE_STATE_ROUTE, response_model=DroneStateResponse)
         async def get_drone_state():
             """Endpoint to retrieve the current state of the drone."""
             try:
                 drone_state = self.drone_communicator.get_drone_state()
                 if drone_state:
-                    # Add timestamp
-                    drone_state['timestamp'] = int(time.time() * 1000)
-                    return drone_state
+                    return self._serialize_drone_state_payload(drone_state)
                 else:
                     raise HTTPException(status_code=404, detail="Drone State not found")
             except HTTPException:
@@ -233,8 +519,14 @@ class DroneAPIServer:
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"error_in_get_drone_state: {str(e)}")
 
-        @self.app.post(f"/{Params.send_drone_command_URI}", response_model=CommandAckResponse)
-        async def send_drone_command(command: CommandRequest) -> CommandAckResponse:
+        @self.app.get(DRONE_LIVE_ARMABILITY_ROUTE, response_model=LiveArmabilityResponse)
+        async def get_live_armability(require_global_position: bool = True):
+            """Run an on-demand MAVSDK launch-readiness probe."""
+            result = await self._probe_live_armability(require_global_position=require_global_position)
+            return LiveArmabilityResponse(**result)
+
+        @self.app.post(DRONE_COMMANDS_ROUTE, response_model=CommandAckResponse)
+        async def send_drone_command(command: DroneCommandRequest) -> CommandAckResponse:
             """
             Endpoint to send a command to the drone.
 
@@ -247,7 +539,7 @@ class DroneAPIServer:
             current_state = int(self.drone_config.state)
 
             try:
-                command_data = command.dict()
+                command_data = command.model_dump(exclude_none=True)
                 command_id = command_data.get('command_id')
 
                 # Validate command structure
@@ -267,8 +559,49 @@ class DroneAPIServer:
                     )
 
                 # Parse mission type for response
-                mission_type = int(command_data['missionType'])
-                trigger_time = int(command_data.get('triggerTime', 0))
+                mission_type = int(command_data["mission_type"])
+                trigger_time = int(command_data.get("trigger_time", 0))
+                known_command = self._find_active_command_by_id(command_id)
+                if known_command is not None:
+                    known_mission_type = int(known_command['mission_type'])
+                    if known_mission_type == mission_type:
+                        try:
+                            mission_name = Mission(mission_type).name
+                        except ValueError:
+                            mission_name = f"MISSION_{mission_type}"
+
+                        return CommandAckResponse(
+                            status="accepted",
+                            command_id=command_id,
+                            hw_id=hw_id,
+                            pos_id=pos_id,
+                            current_state=current_state,
+                            new_state=int(known_command['state']),
+                            mission_type=mission_type,
+                            trigger_time=int(known_command.get('trigger_time', trigger_time)),
+                            message=self._build_idempotent_acceptance_message(
+                                mission_name=mission_name,
+                                phase=str(known_command.get('phase', 'active')),
+                            ),
+                            timestamp=timestamp,
+                        )
+
+                    return CommandAckResponse(
+                        status="rejected",
+                        command_id=command_id,
+                        hw_id=hw_id,
+                        pos_id=pos_id,
+                        current_state=current_state,
+                        mission_type=mission_type,
+                        trigger_time=trigger_time,
+                        message="Command ID is already active for a different mission on this drone",
+                        error_code=CommandErrorCode.INVALID_FORMAT.value,
+                        error_detail=(
+                            f"Existing mission type={known_mission_type}, requested mission type={mission_type}"
+                        ),
+                        timestamp=timestamp,
+                    )
+
                 previous_command_id = getattr(self.drone_config, 'current_command_id', None)
                 superseded_pending_command = (
                     current_state == State.MISSION_READY.value
@@ -295,17 +628,46 @@ class DroneAPIServer:
                         timestamp=timestamp
                     )
 
+                if mission_type == Mission.NONE.value:
+                    had_active_command = current_state in {
+                        State.MISSION_READY.value,
+                        State.MISSION_EXECUTING.value,
+                    }
+                    if current_state == State.MISSION_READY.value and previous_command_id and previous_command_id != command_id:
+                        await self._report_pending_command_superseded(
+                            command_id=previous_command_id,
+                            override_mission_type=mission_type,
+                        )
+
+                    self.drone_config.current_command_id = command_id
+                    new_state, cancel_message = await self._cancel_active_or_pending_command(
+                        had_active_command=had_active_command,
+                    )
+                    logger.info(f"Command accepted: CANCEL (trigger: {trigger_time})")
+                    return CommandAckResponse(
+                        status="accepted",
+                        command_id=command_id,
+                        hw_id=hw_id,
+                        pos_id=pos_id,
+                        current_state=current_state,
+                        new_state=new_state,
+                        mission_type=mission_type,
+                        trigger_time=trigger_time,
+                        message=cancel_message,
+                        timestamp=timestamp,
+                    )
+
+                # Process command
+                self.drone_communicator.process_command(command_data)
+
                 if superseded_pending_command:
                     await self._report_pending_command_superseded(
                         command_id=previous_command_id,
                         override_mission_type=mission_type,
                     )
 
-                # Store command_id for execution tracking
+                # Store command_id for execution tracking only after the command is installed
                 self.drone_config.current_command_id = command_id
-
-                # Process command
-                self.drone_communicator.process_command(command_data)
 
                 # Get mission name for message
                 try:
@@ -384,7 +746,7 @@ class DroneAPIServer:
                     timestamp=timestamp
                 )
 
-        @self.app.get('/get-home-pos')
+        @self.app.get(DRONE_NAVIGATION_HOME_ROUTE, response_model=HomePositionResponse)
         async def get_home_pos():
             """
             Endpoint to retrieve the home position of the drone.
@@ -410,7 +772,7 @@ class DroneAPIServer:
                 logger.error(f"Error retrieving home position: {e}")
                 raise HTTPException(status_code=500, detail="Failed to retrieve home position")
 
-        @self.app.get('/get-gps-global-origin')
+        @self.app.get(DRONE_NAVIGATION_GLOBAL_ORIGIN_ROUTE, response_model=GPSGlobalOriginResponse)
         async def get_gps_global_origin():
             """
             Endpoint to retrieve the GPS global origin from the drone configuration.
@@ -437,7 +799,7 @@ class DroneAPIServer:
                 logger.error(f"Error retrieving GPS global origin: {e}")
                 raise HTTPException(status_code=500, detail="Failed to retrieve GPS global origin")
 
-        @self.app.get('/get-git-status')
+        @self.app.get(DRONE_GIT_STATUS_ROUTE, response_model=DroneGitStatusResponse)
         async def get_git_status():
             """
             Endpoint to retrieve the current Git status of the drone.
@@ -489,12 +851,17 @@ class DroneAPIServer:
             except subprocess.CalledProcessError as e:
                 raise HTTPException(status_code=500, detail=f"Git command failed: {str(e)}")
 
+        @self.app.get(DRONE_SYSTEM_HEALTH_ROUTE, response_model=DroneHealthResponse)
+        async def ping_v1():
+            """Canonical v1 health endpoint with timestamp and version metadata."""
+            return DroneHealthResponse(status="ok", version=MDS_VERSION)
+
         @self.app.get('/ping')
         async def ping():
             """Simple endpoint to confirm connectivity."""
             return {"status": "ok"}
 
-        @self.app.get(f"/{Params.get_position_deviation_URI}")
+        @self.app.get(DRONE_POSITION_DEVIATION_ROUTE, response_model=PositionDeviationResponse)
         async def get_position_deviation():
             """Endpoint to calculate the drone's position deviation from its intended initial position."""
             try:
@@ -551,7 +918,7 @@ class DroneAPIServer:
                 logger.error(f"Error in get_position_deviation: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-        @self.app.get("/get-network-status")
+        @self.app.get(DRONE_NETWORK_STATUS_ROUTE, response_model=NetworkStatusResponse)
         async def get_network_info():
             """
             Endpoint to retrieve current network information.
@@ -569,7 +936,7 @@ class DroneAPIServer:
                 logger.error(f"Error in network-info endpoint: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-        @self.app.get('/get-swarm-data')
+        @self.app.get(DRONE_SWARM_CONFIG_ROUTE, response_model=List[Dict[str, Any]])
         async def get_swarm():
             """Get swarm configuration data"""
             logger.info("Swarm data requested")
@@ -579,7 +946,7 @@ class DroneAPIServer:
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error loading swarm data: {e}")
 
-        @self.app.get('/get-local-position-ned')
+        @self.app.get(DRONE_LOCAL_POSITION_ROUTE, response_model=LocalPositionNEDResponse)
         async def get_local_position_ned():
             """
             Endpoint to retrieve the LOCAL_POSITION_NED data from MAVLink.
@@ -622,7 +989,7 @@ class DroneAPIServer:
         # WebSocket Endpoint for Real-Time Telemetry Streaming
         # ====================================================================
 
-        @self.app.websocket("/ws/drone-state")
+        @self.app.websocket(DRONE_WS_STATE_ROUTE)
         async def websocket_drone_state(websocket: WebSocket):
             """
             WebSocket endpoint for real-time drone state streaming.
@@ -665,11 +1032,8 @@ class DroneAPIServer:
                     drone_state = self.drone_communicator.get_drone_state()
 
                     if drone_state:
-                        # Add timestamp
-                        drone_state['timestamp'] = int(time.time() * 1000)
-
                         # Send state to client
-                        await websocket.send_json(drone_state)
+                        await websocket.send_json(self._serialize_drone_state_payload(drone_state))
                     else:
                         # Send error message if state not available
                         await websocket.send_json({
@@ -757,25 +1121,28 @@ class DroneAPIServer:
 
         Returns dict with 'valid', 'message', 'error_code', and optionally 'detail'.
         """
-        # Check required field: missionType
-        if 'missionType' not in command_data:
+        mission_key = 'mission_type' if 'mission_type' in command_data else 'missionType'
+        trigger_key = 'trigger_time' if 'trigger_time' in command_data else 'triggerTime'
+
+        # Check required field: mission_type
+        if mission_key not in command_data:
             return {
                 'valid': False,
-                'message': 'Missing required field: missionType',
+                'message': 'Missing required field: mission_type',
                 'error_code': CommandErrorCode.MISSING_MISSION_TYPE.value
             }
 
-        # Check required field: triggerTime
-        if 'triggerTime' not in command_data:
+        # Check required field: trigger_time
+        if trigger_key not in command_data:
             return {
                 'valid': False,
-                'message': 'Missing required field: triggerTime',
+                'message': 'Missing required field: trigger_time',
                 'error_code': CommandErrorCode.MISSING_TRIGGER_TIME.value
             }
 
-        # Validate missionType format and value
+        # Validate mission_type format and value
         try:
-            mission_type = int(command_data['missionType'])
+            mission_type = int(command_data[mission_key])
             if mission_type not in Mission._value2member_map_:
                 return {
                     'valid': False,
@@ -786,24 +1153,24 @@ class DroneAPIServer:
         except (ValueError, TypeError) as e:
             return {
                 'valid': False,
-                'message': f'Invalid missionType format: {command_data["missionType"]}',
+                'message': f'Invalid mission_type format: {command_data[mission_key]}',
                 'error_code': CommandErrorCode.INVALID_FORMAT.value,
                 'detail': str(e)
             }
 
-        # Validate triggerTime format
+        # Validate trigger_time format
         try:
-            trigger_time = int(command_data['triggerTime'])
+            trigger_time = int(command_data[trigger_key])
             if trigger_time < 0:
                 return {
                     'valid': False,
-                    'message': 'triggerTime must be non-negative',
+                    'message': 'trigger_time must be non-negative',
                     'error_code': CommandErrorCode.INVALID_TRIGGER_TIME.value
                 }
         except (ValueError, TypeError) as e:
             return {
                 'valid': False,
-                'message': f'Invalid triggerTime format: {command_data["triggerTime"]}',
+                'message': f'Invalid trigger_time format: {command_data[trigger_key]}',
                 'error_code': CommandErrorCode.INVALID_TRIGGER_TIME.value,
                 'detail': str(e)
             }
@@ -889,11 +1256,67 @@ class DroneAPIServer:
     def _allowed_override_missions() -> set[int]:
         """Commands that are allowed to replace a queued or executing mission."""
         return {
+            Mission.NONE.value,
             Mission.KILL_TERMINATE.value,
             Mission.LAND.value,
             Mission.HOLD.value,
             Mission.RETURN_RTL.value,
         }
+
+    def _find_active_command_by_id(self, command_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return known active command metadata for duplicate-delivery idempotency."""
+        if not command_id:
+            return None
+
+        current_command_id = getattr(self.drone_config, 'current_command_id', None)
+        if current_command_id == command_id:
+            return {
+                'mission_type': int(self.drone_config.mission),
+                'trigger_time': int(getattr(self.drone_config, 'trigger_time', 0) or 0),
+                'state': int(self.drone_config.state),
+                'phase': 'pending',
+            }
+
+        drone_setup = getattr(self.drone_config, 'drone_setup', None)
+        running_processes = getattr(drone_setup, 'running_processes', None) if drone_setup else None
+        if not isinstance(running_processes, dict):
+            running_processes = {}
+
+        for record in running_processes.values():
+            if getattr(record, 'command_id', None) == command_id:
+                return {
+                    'mission_type': int(self.drone_config.mission),
+                    'trigger_time': 0,
+                    'state': int(self.drone_config.state),
+                    'phase': 'executing',
+                }
+
+        get_recent_command_record = getattr(drone_setup, 'get_recent_command_record', None) if drone_setup else None
+        if callable(get_recent_command_record):
+            recent_record = get_recent_command_record(command_id)
+            if isinstance(recent_record, dict):
+                return recent_record
+
+        return None
+
+    async def _cancel_active_or_pending_command(self, *, had_active_command: bool) -> tuple[int, str]:
+        """Clear the current mission state and report a successful cancel command."""
+        message = (
+            "Cancel command accepted; active mission cleared."
+            if had_active_command
+            else "Cancel command accepted; there was no active mission to clear."
+        )
+        drone_setup = getattr(self.drone_config, 'drone_setup', None)
+
+        if drone_setup and hasattr(drone_setup, 'cancel_active_command'):
+            await drone_setup.cancel_active_command(message)
+        else:
+            self.drone_config.mission = Mission.NONE.value
+            self.drone_config.state = State.IDLE.value
+            self.drone_config.trigger_time = 0
+            self.drone_config.current_command_id = None
+
+        return State.IDLE.value, message
 
     def _build_acceptance_message(
         self,
@@ -913,6 +1336,18 @@ class DroneAPIServer:
 
         return message
 
+    @staticmethod
+    def _build_idempotent_acceptance_message(mission_name: str, phase: str) -> str:
+        if phase == "executing":
+            return f"Command {mission_name} was already active on this drone; returning idempotent ACK while execution continues"
+        if phase == "completed":
+            return f"Command {mission_name} already completed on this drone; returning idempotent ACK without re-executing it"
+        if phase == "failed":
+            return f"Command {mission_name} already reached a terminal failure on this drone; returning idempotent ACK without re-executing it"
+        if phase == "superseded":
+            return f"Command {mission_name} was already superseded on this drone; returning idempotent ACK without re-executing it"
+        return f"Command {mission_name} was already queued on this drone; returning idempotent ACK"
+
     async def _report_pending_command_superseded(
         self,
         command_id: str,
@@ -922,25 +1357,35 @@ class DroneAPIServer:
         if not command_id:
             return
 
+        try:
+            mission_name = Mission(override_mission_type).name
+        except ValueError:
+            mission_name = f"MISSION_{override_mission_type}"
+
+        drone_setup = getattr(self.drone_config, 'drone_setup', None)
+        if drone_setup and hasattr(drone_setup, '_report_execution_to_gcs'):
+            await drone_setup._report_execution_to_gcs(
+                command_id=command_id,
+                success=False,
+                error_message=f"Superseded by a newer command ({mission_name}) before execution started",
+                duration_ms=0,
+            )
+            return
+
         gcs_ip = self.params.GCS_IP
         if not isinstance(gcs_ip, str) or not gcs_ip:
             logger.warning("GCS_IP not configured, cannot report superseded pending command")
             return
 
         try:
-            try:
-                mission_name = Mission(override_mission_type).name
-            except ValueError:
-                mission_name = f"MISSION_{override_mission_type}"
-
             payload = {
                 'command_id': command_id,
                 'hw_id': str(self.drone_config.hw_id),
                 'success': False,
-                'error_message': f"Superseded by override command {mission_name} before execution started",
+                'error_message': f"Superseded by a newer command ({mission_name}) before execution started",
                 'duration_ms': 0,
             }
-            url = f"http://{gcs_ip}:{self.params.gcs_api_port}/command/execution-result"
+            url = f"http://{gcs_ip}:{self.params.gcs_api_port}{GCS_COMMAND_REPORT_EXECUTION_RESULT_ROUTE}"
             response = await asyncio.to_thread(requests.post, url, json=payload, timeout=5)
             if response.status_code == 200:
                 logger.info(f"Reported superseded pending command {command_id[:8]}...")
@@ -968,7 +1413,7 @@ class DroneAPIServer:
             gcs_port = self.params.gcs_api_port
             gcs_url = f"http://{gcs_ip}:{gcs_port}"
 
-            response = requests.get(f"{gcs_url}/get-origin", timeout=5)
+            response = requests.get(f"{gcs_url}{GCS_ORIGIN_BOOTSTRAP_ROUTE}", timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 if 'lat' in data and 'lon' in data:

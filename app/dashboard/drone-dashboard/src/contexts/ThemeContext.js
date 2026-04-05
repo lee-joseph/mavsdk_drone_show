@@ -1,5 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 
+const DARK_THEME_COLOR = '#09111c';
+const LIGHT_THEME_COLOR = '#f8fbfd';
+
 // Theme types
 export const THEMES = {
   LIGHT: 'light',
@@ -22,7 +25,19 @@ export const useTheme = () => {
 // Utility functions
 const getSystemTheme = () => {
   if (typeof window !== 'undefined') {
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? THEMES.DARK : THEMES.LIGHT;
+    const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const lightQuery = window.matchMedia('(prefers-color-scheme: light)');
+
+    if (darkQuery.matches) {
+      return THEMES.DARK;
+    }
+
+    if (lightQuery.matches) {
+      return THEMES.LIGHT;
+    }
+
+    // When the browser does not expose a clear preference, default to dark for operator safety.
+    return THEMES.DARK;
   }
   return THEMES.DARK; // Default fallback
 };
@@ -44,6 +59,7 @@ const setStoredTheme = (theme) => {
 const applyTheme = (theme) => {
   if (typeof document !== 'undefined') {
     const root = document.documentElement;
+    const body = document.body;
 
     // Remove existing theme classes
     root.classList.remove('theme-light', 'theme-dark');
@@ -53,13 +69,28 @@ const applyTheme = (theme) => {
 
     // Set data attribute for CSS selectors
     root.setAttribute('data-theme', theme);
+    root.style.colorScheme = theme;
+    root.style.backgroundColor = theme === THEMES.DARK ? DARK_THEME_COLOR : LIGHT_THEME_COLOR;
+
+    if (body) {
+      body.classList.remove('theme-light', 'theme-dark');
+      body.classList.add(`theme-${theme}`);
+      body.setAttribute('data-theme', theme);
+      body.style.colorScheme = theme;
+      body.style.backgroundColor = theme === THEMES.DARK ? DARK_THEME_COLOR : LIGHT_THEME_COLOR;
+    }
 
     // Update meta theme-color for mobile browsers
     const metaThemeColor = document.querySelector('meta[name="theme-color"]');
     if (metaThemeColor) {
       metaThemeColor.setAttribute('content',
-        theme === THEMES.DARK ? '#1f2128' : '#ffffff'
+        theme === THEMES.DARK ? DARK_THEME_COLOR : LIGHT_THEME_COLOR
       );
+    }
+
+    const metaColorScheme = document.querySelector('meta[name="color-scheme"]');
+    if (metaColorScheme) {
+      metaColorScheme.setAttribute('content', theme === THEMES.DARK ? 'dark' : 'light');
     }
   }
 };
@@ -75,13 +106,27 @@ export const ThemeProvider = ({ children }) => {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    const handleChange = (e) => {
-      setSystemTheme(e.matches ? THEMES.DARK : THEMES.LIGHT);
+    const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const lightQuery = window.matchMedia('(prefers-color-scheme: light)');
+    const handleChange = () => {
+      setSystemTheme(getSystemTheme());
     };
 
-    mediaQuery.addEventListener('change', handleChange);
-    return () => mediaQuery.removeEventListener('change', handleChange);
+    if (typeof darkQuery.addEventListener === 'function') {
+      darkQuery.addEventListener('change', handleChange);
+      lightQuery.addEventListener('change', handleChange);
+      return () => {
+        darkQuery.removeEventListener('change', handleChange);
+        lightQuery.removeEventListener('change', handleChange);
+      };
+    }
+
+    darkQuery.addListener(handleChange);
+    lightQuery.addListener(handleChange);
+    return () => {
+      darkQuery.removeListener(handleChange);
+      lightQuery.removeListener(handleChange);
+    };
   }, []);
 
   // Apply theme when it changes

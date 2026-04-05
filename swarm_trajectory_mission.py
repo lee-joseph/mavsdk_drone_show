@@ -10,14 +10,14 @@ Based on: drone_show.py v2.6.0
 ----------------------------------------
 
 Description:
-    Executes individual drone trajectories from shapes[_sitl]/trajectory/processed/Drone {pos_id}.csv
+    Executes individual drone trajectories from shapes[_sitl]/swarm_trajectory/processed/Drone {pos_id}.csv
     files using the proven drone_show.py architecture. Designed for swarm operations where each
     drone follows its own pre-planned trajectory with global GPS positioning and synchronized timing.
 
 Key Features:
   • Global Offboard Control  
     – Always uses `PositionGlobalYaw` for GPS-based precise positioning
-    – Real-time NED to LLA conversion using PyMap3D
+    – Maintains global-route execution while preserving local NED velocity semantics
 
   • Position ID Based Execution
     – Automatically loads trajectory files: Drone {position_id}.csv
@@ -86,6 +86,7 @@ import sys
 import time
 import asyncio
 import csv
+import math
 import subprocess
 import logging
 import socket
@@ -104,12 +105,20 @@ from mavsdk.offboard import (
     AccelerationNed,
     OffboardError,
 )
-from mavsdk.telemetry import LandedState
+from mavsdk.telemetry import FlightMode, LandedState
 from mavsdk.action import ActionError
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from src.led_controller import LEDController
+from src.flight_timeout_utils import (
+    calculate_controlled_landing_timeout,
+    calculate_land_disarm_timeout,
+    calculate_swarm_rtl_completion_timeout,
+)
+from src.drone_api_routes import DRONE_LOCAL_POSITION_ROUTE, DRONE_STATE_ROUTE
+from src.mission_startup import arm_with_preflight_gate
 from src.params import Params
+from src.synchronized_start import evaluate_synchronized_start, resolve_requested_start_time
 
 from drone_show_src.utils import (
     read_hw_id,
@@ -202,7 +211,7 @@ def read_config(filename: str) -> Drone:
                     trajectory_file = os.path.join(
                         os.path.dirname(__file__),  # Project root
                         base_dir,
-                        'swarm',
+                        'swarm_trajectory',
                         'processed',
                         f"Drone {pos_id}.csv"
                     )
@@ -403,7 +412,7 @@ def read_swarm_trajectory_file(position_id: int) -> list:
 async def perform_swarm_trajectory(
     drone: System,
     waypoints: list,
-    home_position,
+    global_reference,
     start_time: float,
     launch_lat: float,
     launch_lon: float,
@@ -417,7 +426,9 @@ async def perform_swarm_trajectory(
     Args:
         drone: MAVSDK drone system instance
         waypoints: List of trajectory waypoints
-        home_position: Home position data
+        global_reference: Launch-time global execution reference from pre-flight
+            checks. This supports readiness and recovery semantics only; it does
+            not alter the authored global route.
         start_time: Mission start time
         launch_lat: Launch latitude
         launch_lon: Launch longitude  
@@ -440,11 +451,16 @@ async def perform_swarm_trajectory(
     mission_completed = False
     led_controller = LEDController.get_instance()
 
-    # Initial climb state tracking for velocity-based climb control
-    in_initial_climb = True
     initial_climb_completed = False
     initial_climb_start_time = time.time()
-    climb_target_reached = False
+    initial_climb_timeout = max(
+        float(Params.SWARM_TRAJECTORY_INITIAL_CLIMB_TIME),
+        float(getattr(Params, "TAKEOFF_ALTITUDE_CONFIRM_TIMEOUT_SEC", 60)),
+    )
+    climb_log_period_sec = float(
+        getattr(Params, "SWARM_TRAJECTORY_INITIAL_CLIMB_LOG_PERIOD_SEC", 2.0)
+    )
+    last_climb_log_time = initial_climb_start_time - climb_log_period_sec
 
     # Time step between CSV rows (for drift‐skip calculations)
     csv_step = (waypoints[1][0] - waypoints[0][0]) \
@@ -458,6 +474,17 @@ async def perform_swarm_trajectory(
     # Main Trajectory Execution Loop
     # -----------------------------------
     last_velocity = None  # Track last velocity for continue_heading behavior
+    progress_milestones = (
+        (0.25, None),
+        (0.50, "*** 50% TRAJECTORY COMPLETED ***"),
+        (0.75, None),
+        (0.90, "*** 90% TRAJECTORY COMPLETED - APPROACHING END ***"),
+    )
+    logged_milestones: set[float] = set()
+    progress_log_interval = max(
+        1,
+        int(getattr(Params, "SWARM_TRAJECTORY_PROGRESS_LOG_INTERVAL_WAYPOINTS", 200)),
+    )
 
     while waypoint_index < total_waypoints:
         try:
@@ -487,20 +514,39 @@ async def perform_swarm_trajectory(
                     altitude_condition = time_in_climb >= Params.SWARM_TRAJECTORY_INITIAL_CLIMB_TIME
                     height_condition = (time_in_climb * Params.SWARM_TRAJECTORY_INITIAL_CLIMB_SPEED) >= Params.SWARM_TRAJECTORY_INITIAL_CLIMB_HEIGHT
 
-                    # Additional safety check: verify actual altitude if possible
-                    actual_altitude_ok = True
-                    try:
-                        async for position in drone.telemetry.position():
-                            current_alt = position.relative_altitude_m
-                            if current_alt >= Params.SWARM_TRAJECTORY_INITIAL_CLIMB_HEIGHT * 0.8:  # 80% of target
-                                actual_altitude_ok = True
-                            break
-                    except Exception:
-                        pass  # Continue with time-based climb if altitude unavailable
+                    # Confirm climb from telemetry using relative altitude when available,
+                    # with an absolute-altitude fallback anchored to the captured launch altitude.
+                    climb_sample = await _get_initial_climb_altitude_sample(
+                        drone,
+                        launch_altitude_m=launch_alt,
+                    )
+                    actual_altitude_ok = _climb_altitude_gate_satisfied(
+                        climb_sample,
+                        Params.SWARM_TRAJECTORY_INITIAL_CLIMB_HEIGHT * 0.8,
+                    )
 
-                    in_initial_climb = not (altitude_condition and height_condition and actual_altitude_ok)
+                    if (
+                        altitude_condition
+                        and height_condition
+                        and actual_altitude_ok
+                    ):
+                        initial_climb_completed = True
+                        logger.info(
+                            "Enhanced initial climb completed after %.1fs "
+                            "(relative gain=%s, absolute gain=%s) - switching to CSV trajectory",
+                            time_in_climb,
+                            _format_altitude_value(climb_sample.get("relative_altitude_m")),
+                            _format_altitude_value(climb_sample.get("absolute_altitude_gain_m")),
+                        )
+                    else:
+                        if time_in_climb > initial_climb_timeout:
+                            raise RuntimeError(
+                                "Initial climb did not achieve the required altitude gain "
+                                f"within {initial_climb_timeout:.1f}s "
+                                f"(relative gain={_format_altitude_value(climb_sample.get('relative_altitude_m'))}, "
+                                f"absolute gain={_format_altitude_value(climb_sample.get('absolute_altitude_gain_m'))})."
+                            )
 
-                    if in_initial_climb:
                         # Enhanced velocity commands for initial climb with safety limits
                         climb_vz = -min(Params.SWARM_TRAJECTORY_INITIAL_CLIMB_SPEED, 2.0)  # Cap at 2 m/s
 
@@ -519,15 +565,22 @@ async def perform_swarm_trajectory(
                         # LED white during climb
                         led_controller.set_color(255, 255, 255)
 
-                        if Params.SWARM_TRAJECTORY_VERBOSE_LOGGING and waypoint_index % 50 == 0:
-                            logger.debug(f"Enhanced climb: t={time_in_climb:.1f}s, vz={climb_vz:.1f}m/s, alt_ok={actual_altitude_ok}")
+                        if (
+                            Params.SWARM_TRAJECTORY_VERBOSE_LOGGING
+                            and (now - last_climb_log_time) >= climb_log_period_sec
+                        ):
+                            last_climb_log_time = now
+                            logger.debug(
+                                "Enhanced climb: t=%.1fs, vz=%.1fm/s, rel_gain=%s, abs_gain=%s, alt_ok=%s",
+                                time_in_climb,
+                                climb_vz,
+                                _format_altitude_value(climb_sample.get("relative_altitude_m")),
+                                _format_altitude_value(climb_sample.get("absolute_altitude_gain_m")),
+                                actual_altitude_ok,
+                            )
 
-                        waypoint_index += 1
+                        await asyncio.sleep(min(max(csv_step, 0.05), 0.2))
                         continue
-                    else:
-                        # Initial climb completed - switch to CSV trajectory following
-                        initial_climb_completed = True
-                        logger.info(f"Enhanced initial climb completed after {time_in_climb:.1f}s - switching to CSV trajectory")
 
                 # Update LED color for feedback (after climb or normal trajectory)
                 led_controller.set_color(ledr, ledg, ledb)
@@ -610,9 +663,14 @@ async def perform_swarm_trajectory(
                 # --- (5) Enhanced Progress Logging with Mission Status ---
                 time_to_end = waypoints[-1][0] - t_wp
                 prog = (waypoint_index + 1) / total_waypoints
+                milestone_hits = []
+                for threshold, marker in progress_milestones:
+                    if prog >= threshold and threshold not in logged_milestones:
+                        logged_milestones.add(threshold)
+                        milestone_hits.append(marker)
 
                 # Enhanced logging with mission status markers
-                if (waypoint_index % 50 == 0) or (prog in [0.1, 0.25, 0.5, 0.75, 0.9]):
+                if (waypoint_index % progress_log_interval == 0) or milestone_hits:
                     logger.info(
                         f"Trajectory progress: {prog:.1%} complete | "
                         f"WP {waypoint_index+1}/{total_waypoints} | "
@@ -620,11 +678,9 @@ async def perform_swarm_trajectory(
                         f"Drift: {drift_delta:.2f}s"
                     )
 
-                # Critical milestone logging
-                if prog == 0.5:
-                    logger.info("*** 50% TRAJECTORY COMPLETED ***")
-                elif prog >= 0.9:
-                    logger.info("*** 90% TRAJECTORY COMPLETED - APPROACHING END ***")
+                for marker in milestone_hits:
+                    if marker:
+                        logger.info(marker)
 
                 if Params.SWARM_TRAJECTORY_VERBOSE_LOGGING and waypoint_index % 20 == 0:
                     logger.debug(
@@ -652,11 +708,12 @@ async def perform_swarm_trajectory(
                 await asyncio.sleep(0.5)
                 continue
             except Exception:
-                break
+                logger.exception("Offboard recovery failed; aborting swarm trajectory mission.")
+                raise
         except Exception as e:
             logger.exception(f"Critical error in trajectory loop at waypoint {waypoint_index}: {e}")
             led_controller.set_color(255, 0, 0)
-            break
+            raise
 
     # -----------------------------------
     # End-of-Mission Behavior Execution
@@ -682,7 +739,27 @@ async def controlled_landing(drone: System):
     logger.info("Initiating controlled landing.")
     led_controller = LEDController.get_instance()
     landing_detected = False
-    landing_start_time = time.time()
+    landing_start_time = time.monotonic()
+
+    relative_altitude = await _get_current_relative_altitude(drone)
+    altitude_message = (
+        f"{relative_altitude:.1f}m"
+        if isinstance(relative_altitude, (int, float))
+        else "unknown"
+    )
+    precision_window = float(getattr(Params, "CONTROLLED_LANDING_ALTITUDE", 2.0))
+    if relative_altitude is None or relative_altitude > precision_window:
+        logger.info(
+            "Controlled landing requested at %s AGL; delegating to PX4 native LAND because it exceeds the %.1fm precision-descent window.",
+            altitude_message,
+            precision_window,
+        )
+        await stop_offboard_mode(drone)
+        await perform_landing(drone)
+        led_controller.set_color(0, 255, 0)
+        return
+
+    controlled_timeout = calculate_controlled_landing_timeout(relative_altitude)
 
     logger.info("Switching to controlled descent mode.")
     try:
@@ -711,11 +788,15 @@ async def controlled_landing(drone: System):
                     break
                 break
 
-            if (time.time() - landing_start_time) > Params.LANDING_TIMEOUT:
-                logger.warning("Controlled landing timed out. Initiating PX4 native landing.")
+            if (time.monotonic() - landing_start_time) > controlled_timeout:
+                logger.warning(
+                    "Controlled landing timed out after %.0fs. Initiating PX4 native landing.",
+                    controlled_timeout,
+                )
                 await stop_offboard_mode(drone)
                 await perform_landing(drone)
-                break
+                led_controller.set_color(0, 255, 0)
+                return
 
             await asyncio.sleep(0.1)
 
@@ -735,6 +816,10 @@ async def controlled_landing(drone: System):
     if landing_detected:
         await stop_offboard_mode(drone)
         await disarm_drone(drone)
+        await _wait_until_disarmed(
+            drone,
+            timeout=float(getattr(Params, "LAND_ACTION_TOUCHDOWN_DISARM_GRACE_SEC", 20)),
+        )
         logger.info("Controlled landing completed successfully.")
     else:
         logger.warning("Landing not detected. Initiating PX4 native landing as fallback.")
@@ -742,6 +827,227 @@ async def controlled_landing(drone: System):
         await perform_landing(drone)
 
     led_controller.set_color(0, 255, 0)
+
+
+async def wait_for_rtl_completion(
+    drone: System,
+    home_lat: float | None = None,
+    home_lon: float | None = None,
+):
+    """
+    Wait for an RTL handoff to finish with touchdown and disarm.
+
+    Swarm Trajectory should not report mission completion immediately after
+    issuing RTL. Operators need the command tracker to reflect the actual end of
+    the aircraft lifecycle, not only the moment PX4 accepted the mode change.
+    """
+    logger = logging.getLogger(__name__)
+    relative_altitude = await _get_current_relative_altitude(drone)
+    timeout = calculate_swarm_rtl_completion_timeout(relative_altitude)
+    disarm_grace = getattr(Params, "SWARM_TRAJECTORY_RTL_DISARM_GRACE_SEC", 15)
+    altitude_message = (
+        f"{relative_altitude:.1f}m"
+        if isinstance(relative_altitude, (int, float))
+        else "unknown"
+    )
+    logger.info(
+        "Waiting up to %.0fs for RTL completion (current relative altitude: %s).",
+        timeout,
+        altitude_message,
+    )
+    start_time = time.monotonic()
+    touchdown_since = None
+    disarm_requested = False
+    rtl_stall_since = None
+    near_ground_stall_since = None
+    rtl_stall_trigger = float(getattr(Params, "SWARM_TRAJECTORY_RTL_HOME_STALL_TRIGGER_SEC", 20))
+    rtl_stall_radius = float(getattr(Params, "SWARM_TRAJECTORY_RTL_HOME_STALL_RADIUS_M", 25.0))
+    rtl_stall_descent_eps = float(getattr(Params, "SWARM_TRAJECTORY_RTL_STALL_DESCENT_EPS_MPS", 0.3))
+    near_ground_stall_trigger = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_STALL_TRIGGER_SEC", 10.0)
+    )
+    near_ground_altitude_m = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_ALTITUDE_M", 0.75)
+    )
+    near_ground_speed_eps = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_SPEED_EPS_MPS", 0.5)
+    )
+    near_ground_release_altitude_m = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_ALTITUDE_M", max(1.5, near_ground_altitude_m * 2.0))
+    )
+    near_ground_release_speed_eps = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_SPEED_EPS_MPS", max(2.5, near_ground_speed_eps * 2.0))
+    )
+    near_ground_release_descent_eps = float(
+        getattr(Params, "SWARM_TRAJECTORY_RTL_NEAR_GROUND_RELEASE_DESCENT_EPS_MPS", max(0.6, rtl_stall_descent_eps * 2.0))
+    )
+
+    while True:
+        if time.monotonic() - start_time > timeout:
+            raise TimeoutError("RTL completion timed out before landing/disarm was confirmed")
+
+        landed_state = await _get_current_landed_state(drone)
+        is_armed = await _get_current_armed_state(drone)
+        current_relative_altitude = await _get_current_relative_altitude(drone)
+        local_state = _get_local_drone_state_snapshot(timeout=1.0)
+
+        if landed_state == LandedState.ON_GROUND:
+            if touchdown_since is None:
+                touchdown_since = time.monotonic()
+                logger.info("RTL touchdown detected; waiting for disarm confirmation.")
+
+            if is_armed is False:
+                logger.info("RTL completion confirmed: drone is on ground and disarmed.")
+                return
+
+            if is_armed and not disarm_requested and (time.monotonic() - touchdown_since) >= disarm_grace:
+                logger.warning(
+                    "Drone is on ground after RTL but still armed; issuing explicit disarm to complete mission cleanup."
+                )
+                await disarm_drone(drone)
+                disarm_requested = True
+                await _wait_until_disarmed(
+                    drone,
+                    timeout=float(getattr(Params, "LAND_ACTION_TOUCHDOWN_DISARM_GRACE_SEC", 20)),
+                )
+                logger.info("RTL completion confirmed after explicit disarm.")
+                return
+        else:
+            touchdown_since = None
+            disarm_requested = False
+            near_ground_stall_since = _update_rtl_near_ground_timer(
+                logger,
+                local_state,
+                relative_altitude_m=current_relative_altitude,
+                stall_since=near_ground_stall_since,
+                near_ground_altitude_m=near_ground_altitude_m,
+                horizontal_speed_eps_mps=near_ground_speed_eps,
+                descent_eps_mps=rtl_stall_descent_eps,
+                release_altitude_m=near_ground_release_altitude_m,
+                release_horizontal_speed_eps_mps=near_ground_release_speed_eps,
+                release_descent_eps_mps=near_ground_release_descent_eps,
+            )
+            rtl_stall_since = _update_rtl_stall_timer(
+                logger,
+                local_state,
+                home_lat=home_lat,
+                home_lon=home_lon,
+                stall_since=rtl_stall_since,
+                stall_radius_m=rtl_stall_radius,
+                descent_eps_mps=rtl_stall_descent_eps,
+            )
+            if rtl_stall_since is not None and (time.monotonic() - rtl_stall_since) >= rtl_stall_trigger:
+                logger.warning(
+                    "RTL appears stalled over home without meaningful descent; forcing PX4 LAND fallback."
+                )
+                await perform_landing(drone)
+                logger.info("RTL completion confirmed after stalled-home LAND fallback.")
+                return
+            if (
+                near_ground_stall_since is not None
+                and (time.monotonic() - near_ground_stall_since) >= near_ground_stall_trigger
+            ):
+                logger.warning(
+                    "RTL drone is near ground and nearly stationary without touchdown confirmation; "
+                    "forcing PX4 LAND fallback."
+                )
+                await perform_landing(drone)
+                logger.info("RTL completion confirmed after near-ground LAND fallback.")
+                return
+
+        await asyncio.sleep(1.0)
+
+
+async def wait_for_flight_mode(drone: System, expected_mode: FlightMode, timeout: float = 15.0):
+    """Wait until MAVSDK reports the requested PX4 flight mode."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        flight_mode_stream = drone.telemetry.flight_mode()
+        try:
+            mode = await asyncio.wait_for(
+                anext(flight_mode_stream),
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+        except (StopAsyncIteration, TimeoutError, asyncio.TimeoutError):
+            break
+        if mode == expected_mode:
+            return mode
+    raise TimeoutError(f"Timed out waiting for flight mode {expected_mode.name}")
+
+
+async def wait_for_landed_state_transition(
+    drone: System,
+    expected_states: set[LandedState],
+    timeout: float = 15.0,
+):
+    """Wait for LAND to begin transitioning instead of assuming the RPC succeeded."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        landed_state = await _get_current_landed_state(
+            drone,
+            timeout=max(0.1, deadline - time.monotonic()),
+        )
+        if landed_state in expected_states:
+            return landed_state
+    expected_names = ", ".join(sorted(state.name for state in expected_states))
+    raise TimeoutError(f"Timed out waiting for landed state transition: {expected_names}")
+
+
+async def invoke_action_with_timeout(action_awaitable, description: str, timeout: float):
+    """Bound MAVSDK action RPCs so mission cleanup cannot hang forever on a lost ACK."""
+    try:
+        return await asyncio.wait_for(action_awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{description} command timed out after {timeout:.1f}s") from exc
+
+
+def _describe_local_flight_mode(local_state: dict | None) -> str:
+    """Render local raw custom_mode values into a readable diagnostic string."""
+    if not local_state:
+        return "unknown"
+
+    mode = local_state.get("flight_mode")
+    mode_map = {
+        262147: "Hold",
+        262149: "Return",
+        262150: "Land",
+        393216: "Offboard",
+        50593792: "Hold (GPS-less)",
+    }
+    return mode_map.get(mode, str(mode))
+
+
+async def engage_rtl(drone: System) -> bool:
+    """Issue RTL and confirm PX4 actually transitions into RETURN_TO_LAUNCH."""
+    logger = logging.getLogger(__name__)
+    action_timeout = float(getattr(Params, "SWARM_TRAJECTORY_ACTION_COMMAND_TIMEOUT_SEC", 10))
+    mode_timeout = float(getattr(Params, "SWARM_TRAJECTORY_RTL_MODE_TRANSITION_TIMEOUT_SEC", 15))
+
+    try:
+        await invoke_action_with_timeout(
+            drone.action.return_to_launch(),
+            "RTL",
+            action_timeout,
+        )
+    except TimeoutError as exc:
+        logger.warning("%s Checking whether PX4 transitioned to RTL anyway.", exc)
+
+    try:
+        await wait_for_flight_mode(
+            drone,
+            FlightMode.RETURN_TO_LAUNCH,
+            timeout=mode_timeout,
+        )
+        logger.info("RTL flight mode confirmed.")
+        return True
+    except TimeoutError:
+        local_state = _get_local_drone_state_snapshot(timeout=1.0)
+        logger.warning(
+            "RTL did not engage within %.1fs. Current flight mode: %s.",
+            mode_timeout,
+            _describe_local_flight_mode(local_state),
+        )
+        return False
 
 
 async def execute_end_behavior(drone: System, behavior: str, launch_lat: float, launch_lon: float, launch_alt: float, last_velocity=None):
@@ -762,9 +1068,34 @@ async def execute_end_behavior(drone: System, behavior: str, launch_lat: float, 
         if behavior == 'return_home':
             logger.info("Executing return_home behavior - switching to PX4 RTL mode")
             await stop_offboard_mode(drone)
-            await drone.action.hold()
-            await drone.action.return_to_launch()
-            logger.info("RTL mode activated - drone will return home and land automatically")
+            await asyncio.sleep(0.5)
+
+            max_attempts = max(
+                1,
+                int(getattr(Params, "SWARM_TRAJECTORY_RTL_ENGAGE_MAX_ATTEMPTS", 2)),
+            )
+            rtl_engaged = False
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    logger.warning("Retrying RTL engagement (attempt %d/%d).", attempt, max_attempts)
+                    await asyncio.sleep(1.0)
+
+                rtl_engaged = await engage_rtl(drone)
+                if rtl_engaged:
+                    break
+
+            if not rtl_engaged:
+                logger.warning(
+                    "RTL did not engage after %d attempt(s); degrading to LAND at current position.",
+                    max_attempts,
+                )
+                await perform_landing(drone)
+                logger.info("LAND fallback completed after failed RTL engagement.")
+                return
+
+            logger.info("RTL mode activated - waiting for landing/disarm confirmation")
+            await wait_for_rtl_completion(drone, home_lat=launch_lat, home_lon=launch_lon)
+            logger.info("RTL completion confirmed")
 
         elif behavior == 'land_current':
             logger.info("Executing land_current behavior - using controlled landing")
@@ -822,6 +1153,9 @@ async def execute_end_behavior(drone: System, behavior: str, launch_lat: float, 
                 continue
         else:
             logger.critical("All recovery attempts failed!")
+            raise RuntimeError(
+                f"End behavior '{behavior}' failed and all recovery attempts were exhausted"
+            ) from e
 
 
 async def emergency_rtl_sequence(drone: System):
@@ -830,9 +1164,8 @@ async def emergency_rtl_sequence(drone: System):
     try:
         await stop_offboard_mode(drone)
         await asyncio.sleep(0.5)
-        await drone.action.hold()
-        await asyncio.sleep(0.5)
-        await drone.action.return_to_launch()
+        if not await engage_rtl(drone):
+            raise TimeoutError("Emergency RTL did not engage")
         logger.info("Emergency RTL initiated")
     except Exception as e:
         logger.error(f"Emergency RTL sequence failed: {e}")
@@ -847,9 +1180,8 @@ async def emergency_land_sequence(drone: System):
         await asyncio.sleep(0.5)
         await drone.action.hold()
         await asyncio.sleep(0.5)
-        await drone.action.land()
         logger.info("Emergency landing initiated")
-        await wait_for_landing(drone)
+        await perform_landing(drone)
     except Exception as e:
         logger.error(f"Emergency land sequence failed: {e}")
         raise
@@ -933,8 +1265,12 @@ async def initial_setup_and_connection():
 
 async def pre_flight_checks(drone: System):
     """
-    Perform pre-flight checks to ensure the drone is ready for flight.
-    (Identical to drone_show.py implementation)
+    Perform pre-flight checks and return the global execution reference.
+
+    The returned reference prefers PX4's GPS global origin, but may fall back to
+    the current global position sample if the origin RPC is unavailable. This
+    execution reference is used for launch-readiness gating and recovery logic;
+    it does not redefine the authored global route geometry.
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting pre-flight checks.")
@@ -943,7 +1279,7 @@ async def pre_flight_checks(drone: System):
     led_controller.set_color(255, 255, 0)  # Yellow = in progress
 
     start_time = time.time()
-    gps_origin = None
+    global_reference = None
     health_checks_passed = False
 
     try:
@@ -973,36 +1309,38 @@ async def pre_flight_checks(drone: System):
             if not health_checks_passed:
                 raise RuntimeError("Failed to pass health checks")
 
-            # Phase 2: Get GPS origin (with fallback)
+            # Phase 2: Get the global execution reference (with fallback)
             try:
                 origin = await drone.telemetry.get_gps_global_origin()
-                gps_origin = {
+                global_reference = {
                     'latitude': origin.latitude_deg,
                     'longitude': origin.longitude_deg,
-                    'altitude': origin.altitude_m
+                    'altitude': origin.altitude_m,
+                    'source': 'gps_global_origin',
                 }
-                logger.info(f"Retrieved GPS global origin: {gps_origin}")
+                logger.info(f"Retrieved PX4 GPS global origin reference: {global_reference}")
             except mavsdk.telemetry.TelemetryError as e:
-                logger.warning(f"GPS origin request failed: {e}, using fallback...")
+                logger.warning(f"GPS origin request failed: {e}, using current global position fallback...")
                 # Get single position update as fallback
                 async for position in drone.telemetry.position():
-                    gps_origin = {
+                    global_reference = {
                         'latitude': position.latitude_deg,
                         'longitude': position.longitude_deg,
-                        'altitude': position.absolute_altitude_m
+                        'altitude': position.absolute_altitude_m,
+                        'source': 'fallback_position',
                     }
-                    logger.info(f"Using fallback position: {gps_origin}")
+                    logger.info(f"Using fallback global position reference: {global_reference}")
                     break  # Exit after first position update
 
             # Final validation
-            if not gps_origin:
-                logger.error("Failed to obtain GPS origin")
+            if not global_reference:
+                logger.error("Failed to obtain any global execution reference")
                 led_controller.set_color(255, 0, 0)
-                raise ValueError("No GPS origin available")
+                raise ValueError("No global execution reference available")
 
             logger.info("Pre-flight checks completed successfully")
             led_controller.set_color(0, 255, 0)  # Green = success
-            return gps_origin
+            return global_reference
 
         else:
             logger.info("Skipping global position check per configuration")
@@ -1015,11 +1353,15 @@ async def pre_flight_checks(drone: System):
         raise
 
 
-@retry(stop=stop_after_attempt(Params.PREFLIGHT_MAX_RETRIES), wait=wait_fixed(2))
-async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
+async def arming_and_starting_offboard_mode(drone: System, global_reference: dict):
     """
     Arm the drone and start offboard mode.
-    (Identical to drone_show.py implementation)
+
+    Args:
+        drone: MAVSDK drone system instance.
+        global_reference: Launch-time global execution reference returned by
+            pre_flight_checks(). This is usually PX4 GPS global origin, with a
+            bounded fallback to the current global position sample if needed.
     """
     logger = logging.getLogger(__name__)
     
@@ -1031,21 +1373,34 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
 
         # Step 1: Compute initial position offset if required
         global initial_position_drift
+        initial_position_drift = None
 
-        if Params.REQUIRE_GLOBAL_POSITION and home_position:
+        if (
+            Params.REQUIRE_GLOBAL_POSITION
+            and global_reference
+            and global_reference.get("source") == "gps_global_origin"
+        ):
             logger.info("Computing initial position offset in NED coordinates.")
             initial_position_drift = await compute_position_drift()
             logger.info(f"Initial position drift computed: {initial_position_drift}")
+        elif Params.REQUIRE_GLOBAL_POSITION and global_reference:
+            logger.info(
+                "Skipping position offset computation because the execution reference source is %s, not PX4 GPS global origin.",
+                global_reference.get("source", "unknown"),
+            )
         else:
-            logger.info("Skipping position offset computation (global position check disabled or no home position).")
+            logger.info("Skipping position offset computation (global position check disabled or no global reference).")
 
         # Step 2: Set flight mode to Hold as a safety precaution
         logger.info("Setting Hold flight mode.")
         await drone.action.hold()
 
-        # Step 3: Arm the drone
-        logger.info("Arming the drone.")
-        await drone.action.arm()
+        # Step 3: Wait for PX4 armability, then arm with bounded retries.
+        await arm_with_preflight_gate(
+            drone,
+            require_global_position=bool(Params.REQUIRE_GLOBAL_POSITION and global_reference),
+            logger=logger,
+        )
 
         # Step 4: Set an initial offboard velocity setpoint
         logger.info("Setting initial velocity setpoint for offboard mode.")
@@ -1054,7 +1409,7 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
         # Step 5: Start offboard mode with retry logic
         logger.info("Starting offboard mode.")
         offboard_attempts = 0
-        max_offboard_attempts = 3
+        max_offboard_attempts = max(1, int(getattr(Params, "OFFBOARD_START_MAX_ATTEMPTS", 3)))
 
         while offboard_attempts < max_offboard_attempts:
             try:
@@ -1066,7 +1421,7 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
                 logger.warning(f"Offboard start attempt {offboard_attempts} failed: {e}")
                 if offboard_attempts >= max_offboard_attempts:
                     raise
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(float(getattr(Params, "OFFBOARD_START_RETRY_DELAY_SEC", 1.0)))
                 await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
 
         # Indicate readiness with LED color
@@ -1094,13 +1449,12 @@ async def compute_position_drift():
     (Identical to drone_show.py implementation)
     """
     logger = logging.getLogger(__name__)
-    default_drift = PositionNedYaw(0.0, 0.0, 0.0, 0.0)  # Default to no drift
-
     try:
         # Request NED data from local API endpoint
-        response = requests.get(
-            f"http://localhost:{Params.drone_api_port}/get-local-position-ned",
-            timeout=2
+        response = await asyncio.to_thread(
+            requests.get,
+            f"http://localhost:{Params.drone_api_port}{DRONE_LOCAL_POSITION_ROUTE}",
+            timeout=2,
         )
 
         if response.status_code == 200:
@@ -1135,24 +1489,82 @@ async def perform_landing(drone: System):
     """
     logger = logging.getLogger(__name__)
     try:
-        logger.info("Initiating landing.")
-        await drone.action.land()
+        relative_altitude = await _get_current_relative_altitude(drone)
+        disarm_timeout = calculate_land_disarm_timeout(relative_altitude)
+        land_command_timeout = float(
+            getattr(Params, "SWARM_TRAJECTORY_ACTION_COMMAND_TIMEOUT_SEC", 10)
+        )
+        transition_timeout = float(
+            getattr(Params, "SWARM_TRAJECTORY_LAND_TRANSITION_TIMEOUT_SEC", 15)
+        )
+        altitude_message = (
+            f"{relative_altitude:.1f}m"
+            if isinstance(relative_altitude, (int, float))
+            else "unknown"
+        )
+        logger.info(
+            "Initiating landing and waiting up to %.0fs for touchdown/disarm confirmation (relative altitude: %s).",
+            disarm_timeout,
+            altitude_message,
+        )
+        try:
+            await invoke_action_with_timeout(
+                drone.action.land(),
+                "LAND",
+                land_command_timeout,
+            )
+        except TimeoutError as exc:
+            logger.warning("%s Continuing to verify whether landing transition started anyway.", exc)
 
-        start_time = time.time()
+        await wait_for_landed_state_transition(
+            drone,
+            {LandedState.LANDING, LandedState.ON_GROUND},
+            timeout=transition_timeout,
+        )
+        start_time = time.monotonic()
+        touchdown_since = None
+        disarm_requested = False
+        touchdown_grace = float(getattr(Params, "LAND_ACTION_TOUCHDOWN_DISARM_GRACE_SEC", 20))
         while True:
-            async for landed_state in drone.telemetry.landed_state():
-                if landed_state == LandedState.ON_GROUND:
-                    logger.info("Drone has landed successfully.")
+            landed_state = await _get_current_landed_state(drone)
+            is_armed = await _get_current_armed_state(drone)
+
+            if landed_state == LandedState.ON_GROUND:
+                if touchdown_since is None:
+                    touchdown_since = time.monotonic()
+                    logger.info("Drone touchdown detected during landing.")
+
+                if is_armed is False:
+                    logger.info("Drone has landed successfully and disarmed.")
                     return
-                break
-            if time.time() - start_time > Params.LANDING_TIMEOUT:
-                logger.error("Landing confirmation timed out.")
-                break
+
+                if is_armed and not disarm_requested and (time.monotonic() - touchdown_since) >= touchdown_grace:
+                    logger.warning(
+                        "Drone is on ground but still armed; issuing explicit disarm to complete landing cleanup."
+                    )
+                    await disarm_drone(drone)
+                    disarm_requested = True
+                    await _wait_until_disarmed(drone, timeout=touchdown_grace)
+                    logger.info("Drone has landed successfully after explicit disarm.")
+                    return
+            else:
+                touchdown_since = None
+                disarm_requested = False
+
+            if time.monotonic() - start_time > disarm_timeout:
+                raise TimeoutError(
+                    f"Landing confirmation timed out after {disarm_timeout:.0f}s before touchdown/disarm was confirmed."
+                )
             await asyncio.sleep(1)
     except ActionError as e:
         logger.error(f"Action error during landing: {e}")
+        raise
+    except TimeoutError:
+        logger.exception("Landing timed out before touchdown/disarm confirmation.")
+        raise
     except Exception:
         logger.exception("Unexpected error during landing.")
+        raise
 
 
 async def wait_for_landing(drone: System):
@@ -1161,18 +1573,10 @@ async def wait_for_landing(drone: System):
     (Identical to drone_show.py implementation)
     """
     logger = logging.getLogger(__name__)
-    start_time = time.time()
     logger.info("Waiting for drone to confirm landing...")
-    while True:
-        async for landed_state in drone.telemetry.landed_state():
-            if landed_state == LandedState.ON_GROUND:
-                logger.info("Drone has landed successfully.")
-                return
-            break
-        if time.time() - start_time > Params.LANDING_TIMEOUT:
-            logger.error("Landing confirmation timed out.")
-            break
-        await asyncio.sleep(1)
+    relative_altitude = await _get_current_relative_altitude(drone)
+    disarm_timeout = calculate_land_disarm_timeout(relative_altitude)
+    await _wait_for_touchdown_and_disarm(drone, timeout=disarm_timeout)
 
 
 async def stop_offboard_mode(drone: System):
@@ -1207,6 +1611,325 @@ async def disarm_drone(drone: System):
         logger.error(f"Error disarming drone: {e}")
     except Exception:
         logger.exception("Unexpected error disarming drone.")
+        raise
+
+
+async def _get_current_relative_altitude(drone: System, timeout: float = 3.0):
+    """Capture the current relative altitude from MAVSDK telemetry."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        position_stream = drone.telemetry.position()
+        try:
+            position = await asyncio.wait_for(
+                anext(position_stream),
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+            return getattr(position, "relative_altitude_m", None)
+        except (StopAsyncIteration, TimeoutError, asyncio.TimeoutError):
+            break
+    return None
+
+
+def _format_altitude_value(value) -> str:
+    """Render altitude values consistently in mission logs."""
+    if value is None:
+        return "unknown"
+    try:
+        return f"{float(value):.2f}m"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _climb_altitude_gate_satisfied(sample: dict, minimum_relative_altitude_m: float) -> bool:
+    """Accept either MAVSDK relative altitude or launch-referenced absolute gain."""
+    relative_altitude = sample.get("relative_altitude_m")
+    if relative_altitude is not None:
+        return float(relative_altitude) >= float(minimum_relative_altitude_m)
+
+    absolute_gain = sample.get("absolute_altitude_gain_m")
+    if absolute_gain is not None:
+        return float(absolute_gain) >= float(minimum_relative_altitude_m)
+
+    # Preserve the previous fallback behavior when telemetry is unavailable.
+    return True
+
+
+async def _get_initial_climb_altitude_sample(
+    drone: System,
+    *,
+    launch_altitude_m: float | None = None,
+):
+    """Capture the best available altitude sample for initial-climb confirmation."""
+    sample = {
+        "relative_altitude_m": None,
+        "absolute_altitude_gain_m": None,
+    }
+    try:
+        async for position in drone.telemetry.position():
+            relative_altitude = getattr(position, "relative_altitude_m", None)
+            absolute_altitude = getattr(position, "absolute_altitude_m", None)
+
+            if relative_altitude is not None:
+                sample["relative_altitude_m"] = float(relative_altitude)
+
+            if absolute_altitude is not None and launch_altitude_m is not None:
+                sample["absolute_altitude_gain_m"] = float(absolute_altitude) - float(launch_altitude_m)
+
+            return sample
+    except Exception:
+        return sample
+    return sample
+
+
+async def _has_reached_initial_climb_altitude(
+    drone: System,
+    minimum_relative_altitude_m: float,
+    launch_altitude_m: float | None = None,
+) -> bool:
+    """
+    Confirm the aircraft has actually climbed before leaving the takeoff phase.
+
+    If telemetry is unavailable, fall back to the existing time-based guard.
+    If a real sample is available, it must satisfy the minimum relative altitude.
+    """
+    sample = await _get_initial_climb_altitude_sample(
+        drone,
+        launch_altitude_m=launch_altitude_m,
+    )
+    return _climb_altitude_gate_satisfied(sample, minimum_relative_altitude_m)
+
+
+def _get_local_drone_state_snapshot(timeout: float = 1.0):
+    """Read the local drone API state for mode/velocity/home-hover diagnostics."""
+    try:
+        response = requests.get(
+            f"http://127.0.0.1:{Params.drone_api_port}{DRONE_STATE_ROUTE}",
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            return response.json()
+    except requests.RequestException:
+        return None
+    return None
+
+
+def _horizontal_distance_m(lat1, lon1, lat2, lon2) -> float | None:
+    """Approximate local horizontal distance for short home-hover checks."""
+    try:
+        lat1 = float(lat1)
+        lon1 = float(lon1)
+        lat2 = float(lat2)
+        lon2 = float(lon2)
+    except (TypeError, ValueError):
+        return None
+
+    north_m = (lat1 - lat2) * 111_320.0
+    east_m = (lon1 - lon2) * 111_320.0 * math.cos(math.radians((lat1 + lat2) / 2.0))
+    return math.hypot(north_m, east_m)
+
+
+def _update_rtl_stall_timer(
+    logger: logging.Logger,
+    local_state: dict | None,
+    *,
+    home_lat: float | None,
+    home_lon: float | None,
+    stall_since,
+    stall_radius_m: float,
+    descent_eps_mps: float,
+):
+    """
+    Track whether PX4 has effectively stopped descending after returning home.
+
+    Some SITL/PX4 states can end up hovering over home in HOLD/Return instead of
+    continuing the descent. Once the drone is back over home and no longer
+    descending meaningfully, we treat that as a stalled RTL and hand off to LAND.
+    """
+    if not local_state or home_lat is None or home_lon is None:
+        return None
+
+    home_distance_m = _horizontal_distance_m(
+        local_state.get("position_lat"),
+        local_state.get("position_long"),
+        home_lat,
+        home_lon,
+    )
+    try:
+        descent_rate_mps = abs(float(local_state.get("velocity_down", 0.0)))
+    except (TypeError, ValueError):
+        descent_rate_mps = None
+
+    if (
+        home_distance_m is not None
+        and home_distance_m <= stall_radius_m
+        and descent_rate_mps is not None
+        and descent_rate_mps <= descent_eps_mps
+    ):
+        if stall_since is None:
+            logger.warning(
+                "RTL drone is within %.1fm of home but vertical descent is only %.2fm/s; starting stall timer.",
+                home_distance_m,
+                descent_rate_mps,
+            )
+            return time.monotonic()
+        return stall_since
+
+    return None
+
+
+def _update_rtl_near_ground_timer(
+    logger: logging.Logger,
+    local_state: dict | None,
+    *,
+    relative_altitude_m: float | None,
+    stall_since,
+    near_ground_altitude_m: float,
+    horizontal_speed_eps_mps: float,
+    descent_eps_mps: float,
+    release_altitude_m: float,
+    release_horizontal_speed_eps_mps: float,
+    release_descent_eps_mps: float,
+):
+    """
+    Track a near-ground, low-motion RTL state when PX4 never reports touchdown.
+
+    Some SITL cases can end up effectively landed or skimming the ground with
+    negligible motion, while landed_state never transitions to ON_GROUND. In the
+    end-behavior phase we fail safe by escalating to LAND once that condition
+    persists.
+    """
+    if not local_state or relative_altitude_m is None:
+        return None
+
+    try:
+        ground_clearance_m = abs(float(relative_altitude_m))
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        horizontal_speed_mps = math.hypot(
+            float(local_state.get("velocity_north", 0.0)),
+            float(local_state.get("velocity_east", 0.0)),
+        )
+        descent_rate_mps = abs(float(local_state.get("velocity_down", 0.0)))
+    except (TypeError, ValueError):
+        return None
+
+    if stall_since is not None:
+        if (
+            ground_clearance_m <= release_altitude_m
+            and horizontal_speed_mps <= release_horizontal_speed_eps_mps
+            and descent_rate_mps <= release_descent_eps_mps
+        ):
+            return stall_since
+        return None
+
+    if (
+        ground_clearance_m <= near_ground_altitude_m
+        and horizontal_speed_mps <= horizontal_speed_eps_mps
+        and descent_rate_mps <= descent_eps_mps
+    ):
+        logger.warning(
+            "RTL drone is near ground (%.2fm) with low motion (horizontal %.2fm/s, vertical %.2fm/s); "
+            "starting near-ground stall timer.",
+            ground_clearance_m,
+            horizontal_speed_mps,
+            descent_rate_mps,
+        )
+        return time.monotonic()
+
+    return None
+
+
+async def _get_current_landed_state(drone: System, timeout: float = 3.0):
+    """Capture a single landed-state sample."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        landed_state_stream = drone.telemetry.landed_state()
+        try:
+            return await asyncio.wait_for(
+                anext(landed_state_stream),
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+        except (StopAsyncIteration, TimeoutError, asyncio.TimeoutError):
+            break
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Landed-state sample unavailable: %s", exc)
+            break
+    return None
+
+
+async def _get_current_armed_state(drone: System, timeout: float = 3.0):
+    """Capture a single armed-state sample."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        armed_state_stream = drone.telemetry.armed()
+        try:
+            return await asyncio.wait_for(
+                anext(armed_state_stream),
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+        except (StopAsyncIteration, TimeoutError, asyncio.TimeoutError):
+            break
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Armed-state sample unavailable: %s", exc)
+            break
+    return None
+
+
+async def _wait_until_disarmed(drone: System, timeout: float, poll_interval: float = 1.0):
+    """Wait until the vehicle confirms disarm."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        is_armed = await _get_current_armed_state(drone, timeout=min(1.0, max(0.1, remaining)))
+        if is_armed is False:
+            return
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(poll_interval, max(0.1, deadline - time.monotonic())))
+    raise TimeoutError(f"Timed out waiting for drone to disarm after {timeout:.0f}s")
+
+
+async def _wait_for_touchdown_and_disarm(drone: System, timeout: float):
+    """Wait for touchdown and final disarm confirmation after LAND has been issued."""
+    logger = logging.getLogger(__name__)
+    start_time = time.monotonic()
+    touchdown_since = None
+    disarm_requested = False
+    touchdown_grace = float(getattr(Params, "LAND_ACTION_TOUCHDOWN_DISARM_GRACE_SEC", 20))
+
+    while True:
+        landed_state = await _get_current_landed_state(drone)
+        is_armed = await _get_current_armed_state(drone)
+
+        if landed_state == LandedState.ON_GROUND:
+            if touchdown_since is None:
+                touchdown_since = time.monotonic()
+                logger.info("Drone touchdown detected while waiting for landing confirmation.")
+
+            if is_armed is False:
+                logger.info("Landing confirmation complete: drone is on ground and disarmed.")
+                return
+
+            if is_armed and not disarm_requested and (time.monotonic() - touchdown_since) >= touchdown_grace:
+                logger.warning(
+                    "Drone is on ground but still armed; issuing explicit disarm to complete landing confirmation."
+                )
+                await disarm_drone(drone)
+                disarm_requested = True
+                await _wait_until_disarmed(drone, timeout=touchdown_grace)
+                logger.info("Landing confirmation complete after explicit disarm.")
+                return
+        else:
+            touchdown_since = None
+            disarm_requested = False
+
+        if time.monotonic() - start_time > timeout:
+            raise TimeoutError(
+                f"Timed out waiting for landing confirmation after {timeout:.0f}s"
+            )
+        await asyncio.sleep(1)
 
 
 # ----------------------------- #
@@ -1431,6 +2154,7 @@ async def run_swarm_trajectory_mission(
     """
     logger = logging.getLogger(__name__)
     mavsdk_server = None
+    drone = None
     
     try:
         global HW_ID, position_id
@@ -1449,7 +2173,7 @@ async def run_swarm_trajectory_mission(
         drone = await initial_setup_and_connection()
 
         # Step 3: Pre-flight Checks
-        home_position = await pre_flight_checks(drone)
+        global_reference = await pre_flight_checks(drone)
 
         # Step 4: Capture precise launch position from telemetry
         launch_lat = launch_lon = launch_alt = None
@@ -1487,22 +2211,25 @@ async def run_swarm_trajectory_mission(
             position_id = drone_config.pos_id
             logger.info(f"Using position ID from config: {position_id} (HW_ID: {HW_ID})")
 
-        # Step 6: Handle synchronized start time (exact match with drone_show.py)
-        if synchronized_start_time is None:
-            synchronized_start_time = time.time()
-            logger.info(f"No start_time provided; using now: {time.ctime(synchronized_start_time)}")
-        now = time.time()
-        if synchronized_start_time > now:
-            wait_secs = synchronized_start_time - now
-            logger.info(f"Waiting {wait_secs:.2f}s until synchronized start time.")
-            await asyncio.sleep(wait_secs)
-        elif synchronized_start_time < now:
-            logger.warning(f"Start time was {now - synchronized_start_time:.2f}s ago; starting immediately.")
+        # Step 6: Handle synchronized start time (shared policy with drone_show.py)
+        start_decision = evaluate_synchronized_start(
+            synchronized_start_time,
+            late_tolerance_sec=getattr(Params, "SYNCHRONIZED_MISSION_LATE_START_TOLERANCE_SEC", 1.0),
+        )
+        synchronized_start_time = start_decision.effective_start_time
+        if start_decision.should_abort:
+            raise RuntimeError(
+                f"Synchronized mission start is too late to execute safely. {start_decision.reason}"
+            )
+        if start_decision.should_wait:
+            logger.info(start_decision.reason)
+            await asyncio.sleep(start_decision.wait_seconds)
         else:
-            logger.info("Synchronized start time is now.")
+            log_method = logger.warning if start_decision.late_by_seconds > 0 else logger.info
+            log_method(start_decision.reason)
 
         # Step 7: Arm and enter Offboard
-        await arming_and_starting_offboard_mode(drone, home_position)
+        await arming_and_starting_offboard_mode(drone, global_reference)
 
         # Step 8: Load trajectory file with validation
         try:
@@ -1528,7 +2255,7 @@ async def run_swarm_trajectory_mission(
         await perform_swarm_trajectory(
             drone,
             waypoints,
-            home_position,
+            global_reference,
             synchronized_start_time,
             launch_lat, launch_lon, launch_alt,
             end_behavior=end_behavior_override
@@ -1539,6 +2266,17 @@ async def run_swarm_trajectory_mission(
 
     except Exception:
         logger.exception("Error running drone.")
+        if drone is not None:
+            try:
+                await stop_offboard_mode(drone)
+            except Exception:
+                logger.debug("Offboard stop during failure cleanup also failed.", exc_info=True)
+            try:
+                if await _get_current_armed_state(drone):
+                    logger.warning("Mission failed while vehicle was armed; initiating landing cleanup.")
+                    await perform_landing(drone)
+            except Exception:
+                logger.debug("Landing cleanup during mission failure also failed.", exc_info=True)
         sys.exit(1)
     finally:
         if mavsdk_server:
@@ -1576,15 +2314,7 @@ def main():
     init_drone_logging()
     logger = get_logger("swarm_trajectory")
 
-    # Get the synchronized start time (exact match with drone_show.py)
-    if args.start_time:
-        synchronized_start_time = args.start_time
-        formatted_time = time.ctime(synchronized_start_time)
-        logger.info(f"Synchronized start time provided: {formatted_time}.")
-    else:
-        synchronized_start_time = time.time()
-        formatted_time = time.ctime(synchronized_start_time)
-        logger.info(f"No synchronized start time provided. Using current time: {formatted_time}.")
+    synchronized_start_time = resolve_requested_start_time(args.start_time, logger=logger)
 
     global global_synchronized_start_time
     global_synchronized_start_time = synchronized_start_time

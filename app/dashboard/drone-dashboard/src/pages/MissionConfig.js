@@ -1,6 +1,6 @@
 // src/pages/MissionConfig.js
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import '../styles/MissionConfig.css';
 import { useSearchParams } from 'react-router-dom';
 
@@ -14,7 +14,7 @@ import GcsConfigModal from '../components/GcsConfigModal';
 import DronePositionMap from '../components/DronePositionMap';
 import SaveReviewDialog from '../components/SaveReviewDialog';
 import ReplaceDroneWizard from '../components/ReplaceDroneWizard';
-import axios from 'axios';
+import ClusterScopeBar from '../components/ClusterScopeBar';
 
 // Hooks
 import useFetch from '../hooks/useFetch';
@@ -30,6 +30,11 @@ import {
   validateConfigWithBackend,
 } from '../utilities/missionConfigUtilities';
 import {
+  DRONE_SEARCH_HELP_TEXT,
+  DRONE_SEARCH_PLACEHOLDER,
+  matchesDroneSearchQuery,
+} from '../utilities/dronePresentation';
+import {
   buildSuggestedHwIds,
   compareMissionIds,
   formatDroneLabel,
@@ -41,8 +46,20 @@ import {
   normalizeDroneConfigData,
   normalizeDroneConfigEntry,
 } from '../utilities/missionIdentityUtils';
+import {
+  buildClusterScopeOptions,
+  buildSwarmViewModel,
+  filterClustersByScope,
+} from '../utilities/swarmDesignUtils';
 import { toast } from 'react-toastify';
-import { getBackendURL } from '../utilities/utilities';
+import {
+  GCS_ROUTE_KEYS,
+  getPositionDeviationsResponse,
+  getTrajectoryFirstRowResponse,
+  saveGcsConfigResponse,
+  setOriginResponse,
+  unwrapSwarmConfigPayload,
+} from '../services/gcsApiService';
 
 // Icons
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
@@ -99,6 +116,8 @@ const MissionConfig = () => {
   const [replaceDroneModalOpen, setReplaceDroneModalOpen] = useState(false);
   const [replaceDroneTarget, setReplaceDroneTarget] = useState(null);
   const [trajectoryPositionsByPosId, setTrajectoryPositionsByPosId] = useState({});
+  const [missionConfigSearch, setMissionConfigSearch] = useState('');
+  const [clusterScope, setClusterScope] = useState('all');
   const requestedDroneId = normalizeComparableId(searchParams.get('drone'));
   const requestedEditMode = searchParams.get('edit') === '1';
 
@@ -109,15 +128,19 @@ const MissionConfig = () => {
   // -----------------------------------------------------
   // Data Fetching using custom hooks
   // -----------------------------------------------------
-  const { data: configDataFetched } = useFetch('/get-config-data');
-  const { data: originDataFetched } = useFetch('/get-origin');
-  const { data: gcsConfigFetched } = useFetch('/get-gcs-config', null);
-  const { data: deviationDataFetched } = useFetch('/get-position-deviations', originAvailable ? 5000 : null);
-  const { data: telemetryDataFetched } = useFetch('/telemetry', 2000);
-  const { data: gitStatusDataFetched } = useNormalizedTelemetry('/git-status', 20000);
-  const { data: networkInfoFetched } = useFetch('/get-network-info', 10000);
-  const { data: heartbeatsFetched } = useFetch('/get-heartbeats', 5000);
-  const { data: savedDronePositionsFetched } = useFetch('/get-drone-positions', 10000);
+  const { data: configDataFetched } = useFetch(GCS_ROUTE_KEYS.fleetConfig);
+  const { data: originDataFetched } = useFetch(GCS_ROUTE_KEYS.origin);
+  const { data: gcsConfigFetched } = useFetch(GCS_ROUTE_KEYS.gcsConfig, null);
+  const { data: deviationDataFetched } = useFetch(
+    GCS_ROUTE_KEYS.positionDeviations,
+    originAvailable ? 5000 : null
+  );
+  const { data: telemetryDataFetched } = useFetch(GCS_ROUTE_KEYS.fleetTelemetry, 2000);
+  const { data: gitStatusDataFetched } = useNormalizedTelemetry(GCS_ROUTE_KEYS.gitStatus, 20000);
+  const { data: networkInfoFetched } = useFetch(GCS_ROUTE_KEYS.networkInfo, 10000);
+  const { data: heartbeatsFetched } = useFetch(GCS_ROUTE_KEYS.fleetHeartbeats, 5000);
+  const { data: savedDronePositionsFetched } = useFetch(GCS_ROUTE_KEYS.dronePositions, 10000);
+  const { data: swarmDataFetched } = useFetch(GCS_ROUTE_KEYS.swarmConfig);
 
   // -----------------------------------------------------
   // Derived Data & Helpers
@@ -127,6 +150,14 @@ const MissionConfig = () => {
   const roleSwaps = getRoleSwaps(configData);
   const { duplicateHwIds, duplicatePosIds } = getDuplicateAssignments(configData);
   const onlineDroneCount = getOnlineDroneCount(heartbeats);
+  const swarmViewModel = useMemo(
+    () => buildSwarmViewModel(unwrapSwarmConfigPayload(swarmDataFetched), configData),
+    [configData, swarmDataFetched]
+  );
+  const clusterScopeOptions = useMemo(
+    () => buildClusterScopeOptions(swarmViewModel?.clusters || [], configData.length),
+    [configData.length, swarmViewModel?.clusters]
+  );
 
   // -----------------------------------------------------
   // Effects: Update local state when data is fetched
@@ -165,7 +196,7 @@ const MissionConfig = () => {
       if (gitStatusDataFetched.git_status) {
         setGitStatusData(gitStatusDataFetched.git_status);
       }
-      // GCS status is included in the unified /git-status response
+      // GCS status is included in the canonical /api/v1/git/status response
       if (gitStatusDataFetched.gcs_status) {
         setGcsGitStatus(gitStatusDataFetched.gcs_status);
       }
@@ -238,22 +269,18 @@ const MissionConfig = () => {
     }
 
     let cancelled = false;
-    const backendURL = getBackendURL();
-
     Promise.all(
       missingPosIds.map(async (posId) => {
         try {
-          const response = await axios.get(`${backendURL}/get-trajectory-first-row`, {
-            params: { pos_id: posId },
-          });
+          const response = await getTrajectoryFirstRowResponse(posId);
 
-          const north = Number(response.data?.north);
-          const east = Number(response.data?.east);
-          if (!Number.isFinite(north) || !Number.isFinite(east)) {
+          const x = Number(response.data?.x ?? response.data?.north);
+          const y = Number(response.data?.y ?? response.data?.east);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) {
             return [posId, null];
           }
 
-          return [posId, { pos_id: posId, x: north, y: east }];
+          return [posId, { pos_id: posId, x, y }];
         } catch (error) {
           return [posId, null];
         }
@@ -402,9 +429,7 @@ const MissionConfig = () => {
     setOriginAvailable(true);
     toast.success('Origin set successfully.');
 
-    const backendURL = getBackendURL(); // Uses REACT_APP_GCS_PORT
-    axios
-      .post(`${backendURL}/set-origin`, newOrigin)
+    setOriginResponse(newOrigin)
       .then(() => {
         toast.success('Origin saved to server.');
       })
@@ -418,10 +443,8 @@ const MissionConfig = () => {
   // GCS Configuration Modal submission
   // -----------------------------------------------------
   const handleGcsConfigSubmit = async (newGcsConfig) => {
-    const backendURL = getBackendURL(); // Uses REACT_APP_GCS_PORT
-
     try {
-      const response = await axios.post(`${backendURL}/save-gcs-config`, newGcsConfig);
+      const response = await saveGcsConfigResponse(newGcsConfig);
 
       if (response.data.success) {
         setGcsConfig(newGcsConfig);
@@ -470,9 +493,7 @@ const MissionConfig = () => {
       return;
     }
 
-    const backendURL = getBackendURL(); // Uses REACT_APP_GCS_PORT
-    axios
-      .get(`${backendURL}/get-position-deviations`)
+    getPositionDeviationsResponse()
       .then((response) => {
         setDeviationData(response.data);
       })
@@ -562,6 +583,29 @@ const MissionConfig = () => {
   const sortedConfigData = [...configData].sort(
     (left, right) => compareMissionIds(left.pos_id, right.pos_id)
   );
+  const visibleClusters = useMemo(
+    () => filterClustersByScope(swarmViewModel?.clusters || [], clusterScope),
+    [clusterScope, swarmViewModel?.clusters]
+  );
+  const visibleClusterHwIds = useMemo(() => {
+    if (clusterScope === 'all') {
+      return null;
+    }
+
+    return new Set(
+      visibleClusters.flatMap((cluster) => cluster.drones.map((drone) => normalizeComparableId(drone.hw_id)))
+    );
+  }, [clusterScope, visibleClusters]);
+  const filteredConfigData = useMemo(() => (
+    sortedConfigData.filter((drone) => {
+      const hwId = normalizeComparableId(drone.hw_id);
+      if (visibleClusterHwIds && !visibleClusterHwIds.has(hwId)) {
+        return false;
+      }
+
+      return matchesDroneSearchQuery(drone, missionConfigSearch);
+    })
+  ), [missionConfigSearch, sortedConfigData, visibleClusterHwIds]);
 
   useEffect(() => {
     if (!requestedDroneId) {
@@ -599,35 +643,66 @@ const MissionConfig = () => {
   return (
     <div className="mission-config-container">
       <header className="mission-config-page-header">
-        <div>
+        <div className="mission-config-page-header__content">
           <h2 className="mission-config-title">Mission Configuration</h2>
           <p className="mission-config-subtitle">
-            Assign physical drones to show slots, verify live identity telemetry, and maintain clean per-drone mission metadata for drone-show or cooperative mission execution.
+            Assign airframes to slots and keep operator identity current.
           </p>
+          <div className="mission-config-header-chips" aria-label="Mission configuration focus areas">
+            <span className="mission-config-header-chip">Identity</span>
+            <span className="mission-config-header-chip">Launch slot</span>
+            <span className="mission-config-header-chip">Metadata</span>
+          </div>
         </div>
       </header>
 
       <section className="mission-identity-brief" aria-label="Hardware and position ID guidance">
-        <div className="identity-brief-card">
-          <span className="identity-brief-label">Hardware ID</span>
-          <strong>Physical drone identity</strong>
-          <p>Matches the labeled drone and the companion-computer identity used at runtime.</p>
+        <div className="mission-identity-brief__summary">
+          <div className="identity-brief-card">
+            <span className="identity-brief-label">Hardware ID</span>
+            <strong>Airframe identity</strong>
+            <p>Labeled airframe and runtime identity.</p>
+          </div>
+          <div className="identity-brief-card">
+            <span className="identity-brief-label">Position ID</span>
+            <strong>Mission slot</strong>
+            <p>Assigned show or route slot.</p>
+          </div>
+          <div className="identity-brief-card">
+            <span className="identity-brief-label">Role swaps</span>
+            <strong>Allowed, but explicit</strong>
+            <p>Use only for deliberate spare takeover.</p>
+          </div>
         </div>
-        <div className="identity-brief-card">
-          <span className="identity-brief-label">Position ID</span>
-          <strong>Show slot / trajectory slot</strong>
-          <p>Selects which <code>Drone {'{pos_id}'}.csv</code> trajectory that drone will fly.</p>
-        </div>
-        <div className="identity-brief-card identity-brief-card-wide">
-          <span className="identity-brief-label">Operational rule</span>
-          <strong>Role swaps are valid. Swarm follow-links still use Hardware ID.</strong>
-          <p>Use a role swap when a spare drone must take over another slot. In Smart Swarm and cooperative follow-chains, leaders and followers are still referenced by Hardware ID.</p>
-        </div>
-        <div className="identity-brief-card">
-          <span className="identity-brief-label">Additional fields</span>
-          <strong>Optional metadata stays secondary</strong>
-          <p>Add clean JSON-backed fields like <code>callsign</code>, <code>notes</code>, or maintenance tags without changing the core identity model.</p>
-        </div>
+
+        <details className="mission-identity-guide">
+          <summary>
+            <span>Identity guide</span>
+            <small>Slot ownership, role swaps, optional metadata</small>
+          </summary>
+          <div className="mission-identity-guide__grid">
+            <div className="identity-brief-card">
+              <span className="identity-brief-label">Hardware ID</span>
+              <strong>Physical drone identity</strong>
+              <p>Matches the labeled drone and the companion-computer identity used at runtime.</p>
+            </div>
+            <div className="identity-brief-card">
+              <span className="identity-brief-label">Position ID</span>
+              <strong>Show slot / trajectory slot</strong>
+              <p>Selects which <code>Drone {'{pos_id}'}.csv</code> path that airframe will fly.</p>
+            </div>
+            <div className="identity-brief-card identity-brief-card-wide">
+              <span className="identity-brief-label">Operational rule</span>
+              <strong>Follow-links still use Hardware ID.</strong>
+              <p>Role swaps change slot ownership only. Smart Swarm follow-chains still reference physical leader hardware IDs.</p>
+            </div>
+            <div className="identity-brief-card">
+              <span className="identity-brief-label">Additional fields</span>
+              <strong>Optional metadata stays secondary</strong>
+              <p>Add JSON-backed fields like <code>callsign</code>, <code>notes</code>, or maintenance tags without changing the core identity model.</p>
+            </div>
+          </div>
+        </details>
       </section>
 
       {/* Top Control Buttons */}
@@ -781,6 +856,32 @@ const MissionConfig = () => {
         openOriginModal={() => setShowOriginModal(true)}
       />
 
+      <section className="mission-config-ops-toolbar" aria-label="Mission configuration filters">
+        <label className="mission-config-search">
+          <span>Search assignments</span>
+          <input
+            type="search"
+            value={missionConfigSearch}
+            onChange={(event) => setMissionConfigSearch(event.target.value)}
+            placeholder={DRONE_SEARCH_PLACEHOLDER}
+            aria-label="Search assignments by position, hardware ID, or callsign"
+          />
+        </label>
+        <p className="mission-config-ops-note">
+          {filteredConfigData.length}/{sortedConfigData.length} assignment card{sortedConfigData.length === 1 ? '' : 's'} visible. {DRONE_SEARCH_HELP_TEXT}
+        </p>
+      </section>
+
+      {clusterScopeOptions.length > 1 && (
+        <ClusterScopeBar
+          label="Cluster scope"
+          options={clusterScopeOptions}
+          selectedId={clusterScope}
+          onSelect={setClusterScope}
+          summary="Detected from the current saved swarm topology."
+        />
+      )}
+
       {/* Drone Stats Summary */}
       {configData.length > 0 && (
         <div className="drone-stats-summary">
@@ -843,8 +944,8 @@ const MissionConfig = () => {
       {/* Main content: Drone Cards & Plots */}
       <div className="content-flex">
         <div className="drone-cards slide-in-left">
-          {sortedConfigData.length > 0 ? (
-            sortedConfigData.map((drone, index) => (
+          {filteredConfigData.length > 0 ? (
+            filteredConfigData.map((drone, index) => (
               <div
                 key={drone.hw_id}
                 id={`mission-config-drone-${drone.hw_id}`}
@@ -886,7 +987,7 @@ const MissionConfig = () => {
               </div>
             ))
           ) : (
-            <p>No drones connected. Please add a drone or connect one to proceed.</p>
+            <p>No assignment cards match the current search or cluster scope.</p>
           )}
         </div>
 

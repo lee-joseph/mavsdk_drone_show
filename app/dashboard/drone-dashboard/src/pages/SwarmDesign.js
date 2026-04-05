@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import axios from 'axios';
 import Papa from 'papaparse';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
@@ -19,18 +18,32 @@ import DroneCard from '../components/DroneCard';
 import DroneGraph from '../components/DroneGraph';
 import SwarmPlots from '../components/SwarmPlots';
 import SwarmRuntimeControls from '../components/SwarmRuntimeControls';
+import ClusterScopeBar from '../components/ClusterScopeBar';
 import useNormalizedTelemetry from '../hooks/useNormalizedTelemetry';
 import '../styles/SwarmDesign.css';
-import { getBackendURL } from '../utilities/utilities';
 import {
+  GCS_ROUTE_KEYS,
+  getFleetConfigResponse,
+  getSwarmConfigResponse,
+  saveSwarmConfigResponse,
+  unwrapSwarmConfigPayload,
+} from '../services/gcsApiService';
+import {
+  buildClusterScopeOptions,
   buildSwarmViewModel,
   buildWorkingSwarmAssignments,
+  filterClustersByScope,
   getDirtyAssignmentIds,
   normalizeConfigDrone,
   normalizeSwarmAssignment,
   toSwarmApiPayload,
 } from '../utilities/swarmDesignUtils';
 import { formatDroneLabel } from '../utilities/missionIdentityUtils';
+import {
+  DRONE_SEARCH_HELP_TEXT,
+  DRONE_SEARCH_PLACEHOLDER,
+  matchesDroneSearchQuery,
+} from '../utilities/dronePresentation';
 
 const CSV_HEADERS = ['hw_id', 'follow', 'offset_x', 'offset_y', 'offset_z', 'frame'];
 
@@ -42,25 +55,9 @@ function hasIncompleteNumericValue(value) {
   return ['', '-', '.', '-.'].includes(value.trim());
 }
 
-function getSelectedSearchFields(drone) {
-  return [
-    drone.hw_id,
-    drone.pos_id,
-    drone.roleLabel,
-    drone.ip,
-    drone.follow,
-    drone.title,
-    drone.subtitle,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-}
-
 function SwarmDesign() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const backendURL = getBackendURL();
   const cardRefs = useRef({});
   const handledRouteDroneRef = useRef('');
 
@@ -70,12 +67,13 @@ function SwarmDesign() {
   const [workingAssignments, setWorkingAssignments] = useState([]);
   const [selectedDroneId, setSelectedDroneId] = useState(null);
   const [selectedClusterId, setSelectedClusterId] = useState(null);
+  const [clusterScope, setClusterScope] = useState('all');
   const [expandedDroneId, setExpandedDroneId] = useState(null);
   const [pendingCardFocusId, setPendingCardFocusId] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [saving, setSaving] = useState(false);
   const requestedDroneId = String(searchParams.get('drone') || '').trim();
-  const { data: telemetryById = {} } = useNormalizedTelemetry('/telemetry', 2000);
+  const { data: telemetryById = {} } = useNormalizedTelemetry(GCS_ROUTE_KEYS.fleetTelemetry, 2000);
 
   const viewModel = useMemo(
     () => buildSwarmViewModel(workingAssignments, configData),
@@ -101,18 +99,33 @@ function SwarmDesign() {
     () => [...new Set([...syncChanges.addedIds, ...syncChanges.removedIds].map((value) => String(value)))],
     [syncChanges.addedIds, syncChanges.removedIds]
   );
+  const clusterScopeOptions = useMemo(
+    () => buildClusterScopeOptions(viewModel.clusters, viewModel.summary.totalDrones),
+    [viewModel.clusters, viewModel.summary.totalDrones]
+  );
+  const scopedClusters = useMemo(
+    () => filterClustersByScope(viewModel.clusters, clusterScope),
+    [clusterScope, viewModel.clusters]
+  );
 
   const searchValue = searchTerm.trim().toLowerCase();
   const filteredClusters = useMemo(
-    () => viewModel.clusters
+    () => scopedClusters
       .map((cluster) => ({
         ...cluster,
         drones: cluster.drones.filter((drone) => (
-          searchValue.length === 0 || getSelectedSearchFields(drone).includes(searchValue)
+          searchValue.length === 0
+          || matchesDroneSearchQuery(drone, searchValue, [
+            drone.roleLabel,
+            drone.ip,
+            drone.follow,
+            drone.title,
+            drone.subtitle,
+          ])
         )),
       }))
       .filter((cluster) => cluster.drones.length > 0),
-    [searchValue, viewModel.clusters]
+    [scopedClusters, searchValue]
   );
 
   const filteredDroneIds = useMemo(
@@ -130,8 +143,8 @@ function SwarmDesign() {
     async function loadSwarmDesignData() {
       try {
         const [swarmResponse, configResponse] = await Promise.all([
-          axios.get(`${backendURL}/get-swarm-data`),
-          axios.get(`${backendURL}/get-config-data`),
+          getSwarmConfigResponse(),
+          getFleetConfigResponse(),
         ]);
 
         if (!isActive) {
@@ -141,7 +154,7 @@ function SwarmDesign() {
         const normalizedConfig = configResponse.data
           .map((entry) => normalizeConfigDrone(entry))
           .filter(Boolean);
-        const normalizedSwarm = swarmResponse.data
+        const normalizedSwarm = unwrapSwarmConfigPayload(swarmResponse.data)
           .map((entry) => normalizeSwarmAssignment(entry))
           .filter(Boolean);
         const { assignments } = buildWorkingSwarmAssignments(normalizedConfig, normalizedSwarm);
@@ -164,7 +177,7 @@ function SwarmDesign() {
     return () => {
       isActive = false;
     };
-  }, [backendURL]);
+  }, []);
 
   useEffect(() => {
     if (viewModel.drones.length === 0) {
@@ -254,14 +267,14 @@ function SwarmDesign() {
 
   const refreshFromServer = async () => {
     const [swarmResponse, configResponse] = await Promise.all([
-      axios.get(`${backendURL}/get-swarm-data`),
-      axios.get(`${backendURL}/get-config-data`),
+      getSwarmConfigResponse(),
+      getFleetConfigResponse(),
     ]);
 
     const normalizedConfig = configResponse.data
       .map((entry) => normalizeConfigDrone(entry))
       .filter(Boolean);
-    const normalizedSwarm = swarmResponse.data
+    const normalizedSwarm = unwrapSwarmConfigPayload(swarmResponse.data)
       .map((entry) => normalizeSwarmAssignment(entry))
       .filter(Boolean);
     const { assignments } = buildWorkingSwarmAssignments(normalizedConfig, normalizedSwarm);
@@ -431,9 +444,9 @@ function SwarmDesign() {
     setSaving(true);
 
     try {
-      const response = await axios.post(
-        `${backendURL}/save-swarm-data?commit=${withCommit ? 'true' : 'false'}`,
-        toSwarmApiPayload(workingAssignments)
+      const response = await saveSwarmConfigResponse(
+        toSwarmApiPayload(workingAssignments),
+        { commit: withCommit }
       );
 
       toast.success(response.data.message || 'Smart Swarm configuration saved successfully.');
@@ -520,7 +533,7 @@ function SwarmDesign() {
           <h1>Operational Swarm Design</h1>
           <p>
             Hardware ID tracks the physical drone. Position ID tracks the assigned show slot.
-            Follow chains always target the drone hardware ID, even when a slot swap is active.
+            Follow chains always target the physical drone hardware ID, even when a slot swap is active.
           </p>
         </div>
 
@@ -576,7 +589,7 @@ function SwarmDesign() {
       <section className="swarm-status-strip">
         <div className="swarm-status-card identity">
           <strong>Identity model</strong>
-          <span>Slot swaps change show-slot assignment, not follow-chain targeting. Validate role swaps before flight.</span>
+          <span>Slot swaps change show-slot assignment, not follow-chain targeting.</span>
         </div>
 
         {hasPendingSync && (
@@ -631,7 +644,7 @@ function SwarmDesign() {
               <FaSearch />
               <input
                 type="search"
-                placeholder="Search drone, show slot, leader, or IP"
+                placeholder={DRONE_SEARCH_PLACEHOLDER}
                 value={searchTerm}
                 onChange={(event) => setSearchTerm(event.target.value)}
               />
@@ -643,11 +656,21 @@ function SwarmDesign() {
             <span>{dirtyIds.length} staged</span>
           </div>
 
+          {clusterScopeOptions.length > 1 && (
+            <ClusterScopeBar
+              label="Cluster scope"
+              options={clusterScopeOptions}
+              selectedId={clusterScope}
+              onSelect={setClusterScope}
+              summary="Top-leader scopes keep large swarm audits readable without changing saved topology."
+            />
+          )}
+
           <div className="swarm-cluster-stack">
             {filteredClusters.length === 0 && (
               <div className="swarm-empty-state">
                 <strong>No matching drones</strong>
-                <span>Try a different search term or clear the filter.</span>
+                <span>Try a different term or a scoped query like pos 1-5, hw 2,4, or a callsign. {DRONE_SEARCH_HELP_TEXT}</span>
               </div>
             )}
 
@@ -706,7 +729,7 @@ function SwarmDesign() {
           <div className="swarm-panel__header">
             <div>
               <h2>Follow Chain Graph</h2>
-              <p>Click any node to select the matching assignment card and inspect its upstream and downstream chain.</p>
+              <p>Arrows flow leader to follower. Click any node to inspect its upstream and downstream chain.</p>
             </div>
           </div>
 
@@ -723,6 +746,7 @@ function SwarmDesign() {
               <span className="legend-item leader">Top leader</span>
               <span className="legend-item relay">Relay leader</span>
               <span className="legend-item follower">Follower</span>
+              <span className="legend-item arrow-flow">Leader to follower</span>
               <span className="legend-item line-solid">Geographic offset</span>
               <span className="legend-item line-dashed">Body-relative offset</span>
             </div>

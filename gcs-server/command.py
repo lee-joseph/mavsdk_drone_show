@@ -16,7 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple, Iterable
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+from drone_api_routes import DRONE_LIVE_ARMABILITY_ROUTE
 from params import Params
+from live_armability_utils import calculate_live_armability_request_timeout
 from enums import CommandResultCategory, Mission
 from heartbeat import get_all_heartbeats
 
@@ -59,6 +61,20 @@ _CRITICAL_MISSIONS = {
     Mission.HOLD,
     Mission.RETURN_RTL,
     Mission.KILL_TERMINATE,
+}
+_MISSIONS_REQUIRING_ARMABILITY_GATE = {
+    Mission.TAKE_OFF,
+    Mission.DRONE_SHOW_FROM_CSV,
+    Mission.CUSTOM_CSV_DRONE_SHOW,
+    Mission.SWARM_TRAJECTORY,
+    Mission.QUICKSCOUT,
+    Mission.HOVER_TEST,
+}
+_STRICT_SYNC_MISSIONS = {
+    Mission.DRONE_SHOW_FROM_CSV,
+    Mission.CUSTOM_CSV_DRONE_SHOW,
+    Mission.SWARM_TRAJECTORY,
+    Mission.HOVER_TEST,
 }
 _COMMAND_HEARTBEAT_GRACE_SECONDS = max(Params.TELEMETRY_POLLING_TIMEOUT, Params.heartbeat_interval * 2)
 
@@ -143,6 +159,20 @@ def resolve_mission_type(mission_type: Any) -> Mission | None:
     if isinstance(mission_type, Mission):
         return mission_type
 
+    enum_value = getattr(mission_type, "value", None)
+    if enum_value is not None:
+        try:
+            mission = Mission._value2member_map_.get(int(enum_value))
+        except (TypeError, ValueError):
+            mission = None
+        if mission is not None:
+            return mission
+
+        enum_name = getattr(mission_type, "name", None)
+        if isinstance(enum_name, str):
+            normalized_name = enum_name.strip().upper().replace("-", "_").replace(" ", "_")
+            return _MISSION_NAME_ALIASES.get(normalized_name) or Mission.__members__.get(normalized_name)
+
     if isinstance(mission_type, int):
         return Mission._value2member_map_.get(mission_type)
 
@@ -176,6 +206,42 @@ def normalize_mission_type(mission_type: Any) -> Tuple[str, str, Mission | None]
 def is_critical_mission(mission: Mission | None) -> bool:
     """Identify commands worth always logging at INFO/WARNING on first attempt."""
     return mission in _CRITICAL_MISSIONS
+
+
+def mission_requires_launch_armability_probe(mission: Mission | None) -> bool:
+    """Launch-style missions should be gated on a live MAVSDK armability probe."""
+    return resolve_mission_type(mission) in _MISSIONS_REQUIRING_ARMABILITY_GATE
+
+
+def mission_requires_strict_sync_dispatch(mission: Mission | None) -> bool:
+    """Synchronized offboard missions should not be dispatched after their safe queue window."""
+    return resolve_mission_type(mission) in _STRICT_SYNC_MISSIONS
+
+
+def _extract_trigger_time_seconds(command_payload: Dict[str, Any]) -> float | None:
+    raw_trigger_time = command_payload.get('trigger_time', command_payload.get('triggerTime'))
+    if raw_trigger_time in (None, "", 0, "0"):
+        return None
+
+    try:
+        trigger_time = float(raw_trigger_time)
+    except (TypeError, ValueError):
+        return None
+
+    return trigger_time if trigger_time > 0 else None
+
+
+def _get_sync_dispatch_deadline(mission: Mission | None, command_payload: Dict[str, Any]) -> float | None:
+    if not mission_requires_strict_sync_dispatch(mission):
+        return None
+
+    trigger_time = _extract_trigger_time_seconds(command_payload)
+    if trigger_time is None:
+        return None
+
+    trigger_sooner = max(0.0, float(getattr(Params, "trigger_sooner_seconds", 0)))
+    dispatch_guard = max(0.0, float(getattr(Params, "COMMAND_SYNC_DISPATCH_GUARD_SEC", 1.0)))
+    return trigger_time - trigger_sooner - dispatch_guard
 
 
 def _log_command_event(message: str, level: str = "INFO", drone_id: Any | None = None) -> None:
@@ -257,7 +323,7 @@ def send_command_to_drone(drone: Dict[str, str], command_data: Dict[str, Any],
     """
     drone_id = normalize_drone_id(drone['hw_id'])
     drone_ip = drone['ip'] 
-    raw_command_type = command_data.get('missionType', 'UNKNOWN')
+    raw_command_type = command_data.get('mission_type', command_data.get('missionType', 'UNKNOWN'))
     normalized_mission_type, command_type, mission = normalize_mission_type(raw_command_type)
     
     attempt = 0
@@ -265,19 +331,40 @@ def send_command_to_drone(drone: Dict[str, str], command_data: Dict[str, Any],
     last_error = ""
     last_category = CommandResultCategory.ERROR.value  # Default category for failures
 
-    # Ensure missionType is string for drone API compatibility
     command_payload = command_data.copy()
-    if 'missionType' in command_payload:
-        command_payload['missionType'] = normalized_mission_type
-    if 'triggerTime' in command_payload:
-        command_payload['triggerTime'] = str(command_payload['triggerTime'])
+    if 'mission_type' in command_payload or 'missionType' in command_payload:
+        command_payload['mission_type'] = int(normalized_mission_type)
+        command_payload.pop('missionType', None)
+    if 'trigger_time' in command_payload or 'triggerTime' in command_payload:
+        command_payload['trigger_time'] = int(
+            command_payload.get('trigger_time', command_payload.get('triggerTime', 0))
+        )
+        command_payload.pop('triggerTime', None)
+    sync_dispatch_deadline = _get_sync_dispatch_deadline(mission, command_payload)
 
     while attempt < retries:
+        attempt_timeout = timeout
+        if sync_dispatch_deadline is not None:
+            remaining_window = sync_dispatch_deadline - time.time()
+            if remaining_window <= 0:
+                last_error = "Missed synchronized dispatch window before trigger time"
+                last_category = CommandResultCategory.ERROR.value
+                _log_command_event(
+                    (
+                        f"Aborting {command_type} dispatch because the safe synchronized queue window "
+                        "has already passed"
+                    ),
+                    "WARNING",
+                    drone_id=drone_id,
+                )
+                break
+            attempt_timeout = min(float(timeout), remaining_window)
+
         try:
             response = requests.post(
                 f"http://{drone_ip}:{Params.drone_api_port}/{Params.send_drone_command_URI}",
                 json=command_payload,
-                timeout=timeout
+                timeout=attempt_timeout
             )
             
             success, error_message, response_category = parse_command_ack_response(response)
@@ -306,6 +393,21 @@ def send_command_to_drone(drone: Dict[str, str], command_data: Dict[str, Any],
 
             if attempt < retries:
                 wait_time = backoff_factor * (2 ** (attempt - 1))
+                if sync_dispatch_deadline is not None:
+                    remaining_window = sync_dispatch_deadline - time.time()
+                    if remaining_window <= 0 or wait_time >= remaining_window:
+                        last_error = "Missed synchronized dispatch window before trigger time"
+                        last_category = CommandResultCategory.ERROR.value
+                        _log_command_event(
+                            (
+                                f"Stopping retries for {command_type} because the next retry would miss "
+                                "the synchronized queue window"
+                            ),
+                            "WARNING",
+                            drone_id=drone_id,
+                        )
+                        break
+                    wait_time = min(wait_time, remaining_window)
                 # Only log retry attempts for critical commands or on last attempt
                 if is_critical_mission(mission) or attempt == retries:
                     _log_command_event(
@@ -330,6 +432,102 @@ def send_command_to_drone(drone: Dict[str, str], command_data: Dict[str, Any],
 
     return False, last_error, last_category
 
+
+def probe_live_armability_for_drone(
+    drone: Dict[str, Any],
+    *,
+    require_global_position: bool = True,
+    timeout: float | None = None,
+) -> Dict[str, Any]:
+    """Query the drone-side live armability endpoint."""
+    drone_id = normalize_drone_id(drone['hw_id'])
+    drone_ip = drone['ip']
+    request_timeout = float(timeout or calculate_live_armability_request_timeout(params=Params))
+
+    try:
+        response = requests.get(
+            f"http://{drone_ip}:{Params.drone_api_port}{DRONE_LIVE_ARMABILITY_ROUTE}",
+            params={"require_global_position": str(bool(require_global_position)).lower()},
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        ready = bool(payload.get("ready"))
+        return {
+            "drone_id": drone_id,
+            "success": bool(payload.get("success", True)),
+            "ready": ready,
+            "summary": str(payload.get("summary") or ("Ready for launch" if ready else "Live armability probe reported not ready")),
+            "details": payload,
+            "category": "ready" if ready else "blocked",
+        }
+    except (Timeout, ConnectionError) as exc:
+        return {
+            "drone_id": drone_id,
+            "success": False,
+            "ready": False,
+            "summary": f"Live armability probe unreachable: {exc.__class__.__name__}",
+            "details": None,
+            "category": CommandResultCategory.OFFLINE.value,
+        }
+    except Exception as exc:
+        return {
+            "drone_id": drone_id,
+            "success": False,
+            "ready": False,
+            "summary": f"Live armability probe failed: {str(exc)[:120]}",
+            "details": None,
+            "category": CommandResultCategory.ERROR.value,
+        }
+
+
+def probe_live_armability_for_drones(
+    drones: List[Dict[str, Any]],
+    *,
+    require_global_position: bool = True,
+    timeout: float | None = None,
+) -> Dict[str, Any]:
+    """Run a bounded live armability probe across target drones."""
+    if not drones:
+        return {
+            "all_ready": True,
+            "blocked_ids": [],
+            "unavailable_ids": [],
+            "results": {},
+        }
+
+    results: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(drones), 10))) as executor:
+        future_to_drone = {
+            executor.submit(
+                probe_live_armability_for_drone,
+                drone,
+                require_global_position=require_global_position,
+                timeout=timeout,
+            ): drone
+            for drone in drones
+        }
+
+        for future in as_completed(future_to_drone):
+            result = future.result()
+            results[result["drone_id"]] = result
+
+    blocked_ids = sorted(
+        drone_id for drone_id, result in results.items()
+        if result.get("category") == "blocked"
+    )
+    unavailable_ids = sorted(
+        drone_id for drone_id, result in results.items()
+        if result.get("category") in {CommandResultCategory.OFFLINE.value, CommandResultCategory.ERROR.value}
+    )
+
+    return {
+        "all_ready": not blocked_ids and not unavailable_ids,
+        "blocked_ids": blocked_ids,
+        "unavailable_ids": unavailable_ids,
+        "results": results,
+    }
+
 def send_commands_to_all(drones: List[Dict[str, str]], command_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Send a command to all drones concurrently with comprehensive result tracking.
@@ -344,7 +542,9 @@ def send_commands_to_all(drones: List[Dict[str, str]], command_data: Dict[str, A
             'failed': 0, 'total': 0, 'result_summary': 'no drones', 'results': {}
         }
     
-    _, command_type, _ = normalize_mission_type(command_data.get('missionType', 'UNKNOWN'))
+    _, command_type, _ = normalize_mission_type(
+        command_data.get('mission_type', command_data.get('missionType', 'UNKNOWN'))
+    )
     
     # Log command initiation for swarm operations
     _log_command_event(
@@ -565,19 +765,24 @@ def validate_command_data(command_data: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "Command data must be a dictionary"
     
     # Check required fields
-    required_fields = ['missionType']
-    missing_fields = [field for field in required_fields if field not in command_data]
+    required_fields = ['mission_type']
+    legacy_to_canonical = {'missionType': 'mission_type'}
+    normalized_command = {
+        legacy_to_canonical.get(key, key): value
+        for key, value in command_data.items()
+    }
+    missing_fields = [field for field in required_fields if field not in normalized_command]
     
     if missing_fields:
         return False, f"Missing required fields: {', '.join(missing_fields)}"
     
     # Validate mission type
-    mission_type = command_data.get('missionType')
+    mission_type = normalized_command.get('mission_type')
     if not isinstance(mission_type, (int, str)):
-        return False, "missionType must be an integer or string"
+        return False, "mission_type must be an integer or string"
 
     if resolve_mission_type(mission_type) is None:
-        return False, "missionType must be a valid mission code or supported mission name"
+        return False, "mission_type must be a valid mission code or supported mission name"
     
     # Additional validation can be added here for specific command types
     
@@ -677,9 +882,9 @@ if __name__ == "__main__":
     
     # Prepare command data
     command_data = {
-        'missionType': args.command.upper(),
-        'triggerTime': '0',
-        'target_drones': args.drones or []
+        'mission_type': args.command.upper(),
+        'trigger_time': 0,
+        'target_drone_ids': args.drones or []
     }
     
     print(f"Sending {args.command.upper()} command to {'specific' if args.drones else 'all'} drones...")

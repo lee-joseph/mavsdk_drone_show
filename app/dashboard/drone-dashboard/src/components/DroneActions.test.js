@@ -25,6 +25,12 @@ describe('DroneActions', () => {
       takeoff_altitude: 10,
       uiMeta: expect.objectContaining({
         triggerSummary: 'Immediate on acceptance',
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Execution policy',
+            value: 'Launch begins on acceptance and retries PX4 armability briefly before failing.',
+          }),
+        ]),
       }),
     }));
   });
@@ -51,6 +57,12 @@ describe('DroneActions', () => {
       triggerTime: '1700000030',
       uiMeta: expect.objectContaining({
         triggerSummary: expect.stringMatching(/Executes in 30s/),
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Execution policy',
+            value: 'Launch waits for the trigger, then retries PX4 armability briefly before failing.',
+          }),
+        ]),
       }),
     }));
 
@@ -61,6 +73,43 @@ describe('DroneActions', () => {
       triggerTime: '0',
       uiMeta: expect.objectContaining({
         triggerSummary: 'Immediate on acceptance',
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Execution policy',
+            value: 'Immediate only. This action is not queued behind a future trigger.',
+          }),
+        ]),
+      }),
+    }));
+  });
+
+  test('treats hover test as a strict synchronized rehearsal in scheduled mode', () => {
+    const onSendCommand = jest.fn();
+
+    render(
+      <DroneActions
+        actionTypes={DRONE_ACTION_TYPES}
+        onSendCommand={onSendCommand}
+        targetCount={3}
+        referenceNowMs={1_700_000_000_000}
+      />
+    );
+
+    fireEvent.click(screen.getByText(/execution timing/i));
+    fireEvent.click(screen.getByRole('button', { name: 'Delay' }));
+    fireEvent.click(screen.getByRole('button', { name: '+30s' }));
+    fireEvent.click(screen.getByRole('button', { name: /hover test/i }));
+
+    expect(onSendCommand).toHaveBeenCalledWith(expect.objectContaining({
+      missionType: String(DRONE_ACTION_TYPES.HOVER_TEST),
+      triggerTime: '1700000030',
+      uiMeta: expect.objectContaining({
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            label: 'Execution policy',
+            value: expect.stringMatching(/queue for the shared trigger.*abort instead of joining late/i),
+          }),
+        ]),
       }),
     }));
   });

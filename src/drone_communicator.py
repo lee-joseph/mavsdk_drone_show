@@ -87,6 +87,52 @@ class DroneCommunicator:
         sock.setblocking(False)
         return sock
 
+    @staticmethod
+    def _normalize_update_time_ms(value: Any) -> int:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return 0
+
+        if numeric_value <= 0:
+            return 0
+
+        if numeric_value < 1_000_000_000_000:
+            numeric_value *= 1000.0
+
+        return int(numeric_value)
+
+    def _local_mavlink_stale_threshold_ms(self) -> int:
+        def _coerce_positive_int(value: Any, default: int) -> int:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                return default
+
+        configured_timeout = getattr(self.params, 'LOCAL_MAVLINK_STALE_TIMEOUT_SEC', None)
+        try:
+            configured_timeout_value = float(configured_timeout)
+        except (TypeError, ValueError):
+            configured_timeout_value = None
+
+        if configured_timeout_value is None or configured_timeout_value <= 0:
+            configured_timeout = (
+                _coerce_positive_int(getattr(self.params, 'LOCAL_MAVLINK_TIMEOUT_SEC', 5), 5)
+                * _coerce_positive_int(getattr(self.params, 'LOCAL_MAVLINK_RECONNECT_AFTER_TIMEOUTS', 3), 3)
+            )
+            configured_timeout_value = float(configured_timeout)
+
+        return max(1000, int(configured_timeout_value * 1000))
+
+    @staticmethod
+    def _build_stale_telemetry_blocker(message: str, timestamp_ms: int) -> Dict[str, Any]:
+        return {
+            "source": "telemetry",
+            "severity": "warning",
+            "message": message,
+            "timestamp": timestamp_ms,
+        }
+
     def send_telem(self, packet: bytes, ip: str, port: int) -> None:
         """
         Send telemetry packet to the specified IP and port.
@@ -134,7 +180,7 @@ class DroneCommunicator:
         else:
             logger.warning(f"Attempted to update non-existent drone: {hw_id}")
 
-    def process_command(self, command_data: Dict[str, Any]) -> None:
+    def process_command(self, command_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process incoming command data and update drone configuration.
 
@@ -142,8 +188,8 @@ class DroneCommunicator:
             command_data (Dict[str, Any]): A dictionary containing command information.
 
         Required fields:
-            - missionType (int): The mission code.
-            - triggerTime (str): The time to trigger the mission.
+            - mission_type (int): The mission code.
+            - trigger_time (int): The time to trigger the mission.
 
         Optional fields:
             - hw_id (str): Hardware ID.
@@ -155,12 +201,22 @@ class DroneCommunicator:
         logger.info(f"Received command data: {command_data}")
 
         try:
-            mission = int(command_data["missionType"])
-            trigger_time = command_data["triggerTime"]
+            mission_value = (
+                command_data["mission_type"]
+                if "mission_type" in command_data
+                else command_data["missionType"]
+            )
+            trigger_time_value = (
+                command_data["trigger_time"]
+                if "trigger_time" in command_data
+                else command_data["triggerTime"]
+            )
+            mission = int(mission_value)
+            trigger_time = int(trigger_time_value)
 
         except KeyError as e:
             logger.error(f"Missing required field in command data: {e}")
-            return
+            raise ValueError(f"Missing required field in command data: {e}") from e
 
         # Phase 2: Save origin from command if present
         if command_data.get('auto_global_origin') and 'origin' in command_data:
@@ -201,13 +257,18 @@ class DroneCommunicator:
             self._process_mission_command(mission, command_data)
         except Exception as e:
             logger.error(f"Mission processing failed: {e}. State unchanged.")
-            return  # State NOT changed - drone remains in previous state
+            raise ValueError(f"Mission processing failed: {e}") from e
 
         # Only update state AFTER successful mission processing
         self._update_drone_state(State.MISSION_READY.value, trigger_time)
 
         self._log_updated_configuration()
         self.drones[hw_id] = self.drone_config
+        return {
+            "mission": mission,
+            "trigger_time": trigger_time,
+            "state": self.drone_config.state,
+        }
 
     def _update_drone_state(self, state: int, trigger_time: int) -> None:
         """Update mutable drone state values.
@@ -360,6 +421,8 @@ class DroneCommunicator:
 
         live_swarm = self._get_live_swarm_assignment()
 
+        now_ms = int(time.time() * 1000)
+
         self.drone_state = {
             "hw_id": safe_int(self.drone_config.hw_id),  # Hardware ID of the drone
             "pos_id": safe_int(self.drone_config.pos_id),  # Position ID
@@ -383,7 +446,8 @@ class DroneCommunicator:
             "system_status": safe_int(self.drone_config.system_status),  # MAVLink system status (e.g., STANDBY, ACTIVE)
             "is_armed": bool(self.drone_config.is_armed),  # Armed status from base_mode flags
             "is_ready_to_arm": bool(self.drone_config.is_ready_to_arm),  # Pre-arm checks status
-            "home_position_set": bool(getattr(self.drone_config, 'home_position', None)),
+            "home_position_set": bool(getattr(self.drone_config, 'px4_home_position_set', False)),
+            "home_position_source": str(getattr(self.drone_config, 'home_position_source', 'unknown')),
             "readiness_status": str(getattr(self.drone_config, 'readiness_status', 'unknown')),
             "readiness_summary": str(getattr(self.drone_config, 'readiness_summary', 'Readiness unavailable')),
             "readiness_checks": list(getattr(self.drone_config, 'readiness_checks', []) or []),
@@ -397,6 +461,35 @@ class DroneCommunicator:
             "satellites_visible": safe_int(getattr(self.drone_config, 'satellites_visible', 0)),  # Number of satellites
             "ip": self.drone_config.config.get('ip', 'N/A')  # Drone IP address
         }
+
+        update_time_ms = self._normalize_update_time_ms(self.drone_state.get("update_time"))
+        telemetry_age_ms = (now_ms - update_time_ms) if update_time_ms > 0 else None
+        stale_threshold_ms = self._local_mavlink_stale_threshold_ms()
+
+        self.drone_state["telemetry_last_update_age_ms"] = telemetry_age_ms
+        self.drone_state["telemetry_stale_threshold_ms"] = stale_threshold_ms
+
+        if update_time_ms <= 0:
+            self.drone_state["telemetry_available"] = False
+            self.drone_state["telemetry_error"] = "Waiting for PX4 telemetry."
+        elif telemetry_age_ms is not None and telemetry_age_ms > stale_threshold_ms:
+            stale_message = (
+                f"Local MAVLink telemetry is stale ({telemetry_age_ms / 1000.0:.1f}s since last update). "
+                "Readiness is currently unavailable."
+            )
+            self.drone_state.update({
+                "telemetry_available": False,
+                "telemetry_error": stale_message,
+                "is_ready_to_arm": False,
+                "readiness_status": "unknown",
+                "readiness_summary": stale_message,
+                "preflight_blockers": [self._build_stale_telemetry_blocker(stale_message, now_ms)],
+                "preflight_warnings": [],
+                "preflight_last_update": now_ms,
+            })
+        else:
+            self.drone_state["telemetry_available"] = True
+            self.drone_state["telemetry_error"] = None
 
         return self.drone_state
 

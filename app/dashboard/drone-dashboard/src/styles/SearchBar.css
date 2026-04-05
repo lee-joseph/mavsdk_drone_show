@@ -1,10 +1,12 @@
+@import './DesignTokens.css';
+
 /* src/styles/SearchBar.css */
 /* FIXED: Search suggestions z-index issue - ensuring they appear above toolbar */
 
 .search-bar-container {
   position: relative;
   width: 100%;
-  max-width: 500px;
+  max-width: min(100%, 500px);
   /* CRITICAL FIX: Create new stacking context for search suggestions */
   z-index: 1070; /* Fallback for browsers without CSS variables */
   z-index: var(--z-tooltip);
@@ -23,7 +25,7 @@
 .search-icon {
   position: absolute;
   left: 1rem;
-  color: #6c757d;
+  color: var(--color-text-muted);
   z-index: 1;
   font-size: 1rem;
 }
@@ -31,27 +33,27 @@
 .search-input {
   width: 100%;
   padding: 0.75rem 3rem 0.75rem 3rem;
-  font-size: 0.875rem;
-  border: 2px solid #3a3f4b;
+  font-size: var(--font-size-sm);
+  border: 1px solid var(--color-border-secondary);
   border-radius: 25px;
-  background-color: #2a2d3a;
-  color: white;
-  transition: all 0.3s ease;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  transition: var(--transition-all);
 }
 
 .search-input:focus {
   outline: none;
-  border-color: #00d4ff;
-  background-color: #1a1c23;
-  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+  border-color: var(--color-primary);
+  background-color: var(--color-bg-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-light);
 }
 
 .search-input.error {
-  border-color: #dc3545;
+  border-color: var(--color-danger);
 }
 
 .search-input::placeholder {
-  color: #6c757d;
+  color: var(--color-text-muted);
 }
 
 .search-input:disabled {
@@ -64,7 +66,7 @@
   right: 3.5rem;
   background: none;
   border: none;
-  color: #6c757d;
+  color: var(--color-text-muted);
   cursor: pointer;
   padding: 0.5rem;
   display: flex;
@@ -74,27 +76,27 @@
 }
 
 .clear-button:hover {
-  color: #a2a5b9;
+  color: var(--color-text-primary);
 }
 
 .search-button {
   position: absolute;
   right: 0.5rem;
-  background-color: #00d4ff;
+  background-color: var(--color-primary);
   border: none;
-  color: #000;
+  color: var(--color-primary-text);
   padding: 0.5rem 1rem;
   border-radius: 20px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.3s ease;
-  font-weight: 600;
+  transition: var(--transition-all);
+  font-weight: var(--font-weight-semibold);
 }
 
 .search-button:hover:not(:disabled) {
-  background-color: #00a8cc;
+  background-color: var(--color-primary-hover);
   transform: translateY(-1px);
 }
 
@@ -116,39 +118,36 @@
   top: 100%;
   left: 0;
   right: 0;
-  background-color: #dc3545;
-  color: white;
+  background-color: var(--color-danger);
+  color: var(--color-text-inverse);
   padding: 0.5rem 1rem;
   border-radius: 6px;
   margin-top: 0.5rem;
-  font-size: 0.75rem;
-  box-shadow: 0 2px 8px rgba(220, 53, 69, 0.3);
+  font-size: var(--font-size-xs);
+  box-shadow: var(--shadow-sm);
   z-index: 1000;
 }
 
 /* FIXED: Enhanced search suggestions with proper z-index hierarchy */
 .search-suggestions {
-  position: fixed;
-  /* CRITICAL FIX: Use fixed positioning to break out of container */
-  background: var(--color-text-primary);
-  border: 2px solid var(--color-primary-border);
+  position: absolute;
+  top: calc(100% + var(--spacing-xs));
+  left: 0;
+  right: 0;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-primary-border);
   border-radius: var(--border-radius-md);
-  margin-top: var(--spacing-xs);
   max-height: 400px;
   overflow-y: auto;
   box-shadow: var(--shadow-lg);
-  /* CRITICAL FIX: Use highest z-index to ensure above toolbar */
   z-index: 1170; /* Fallback for browsers without CSS variables */
   z-index: calc(var(--z-tooltip) + 100);
   backdrop-filter: blur(8px);
-  /* ADDED: Force new stacking context */
   isolation: isolate;
-  /* ADDED: Ensure suggestions container is above everything */
   transform: translateZ(0);
-  /* CRITICAL FIX: Ensure suggestions are positioned correctly */
   width: 100%;
-  min-width: 400px;
-  max-width: 600px;
+  min-width: 0;
+  max-width: none;
 }
 
 .search-suggestions.loading {
@@ -193,8 +192,8 @@
 }
 
 .suggestion-main {
-  color: var(--color-text-muted);
-  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-base);
   margin-bottom: var(--spacing-xs);
   white-space: nowrap;
@@ -236,14 +235,10 @@
   }
 
   .search-suggestions {
-    max-height: 200px;
-    /* MOBILE FIX: Even higher z-index on mobile */
+    max-height: min(240px, 50vh);
     z-index: 1270; /* Fallback for browsers without CSS variables */
     z-index: calc(var(--z-tooltip) + 200);
-    /* MOBILE FIX: Full width on mobile */
-    min-width: 100%;
-    left: 0 !important;
-    right: 0 !important;
+    min-width: 0;
   }
 }
 
@@ -253,22 +248,14 @@
   }
 }
 
-/* LEGACY COMPATIBILITY: Fallback search suggestions styling */
+/* Legacy compatibility block kept aligned with the modern dropdown contract. */
 .search-suggestions {
-  position: fixed;
-  /* CRITICAL LEGACY FIX: Use fixed positioning */
-  background-color: #2a2d3a;
-  border: 1px solid #3a3f4b;
-  border-radius: 8px;
-  margin-top: 0.5rem;
-  max-height: 300px;
-  overflow-y: auto;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-  /* CRITICAL LEGACY FIX: Explicit high z-index */
-  z-index: 9999;
-  /* CRITICAL LEGACY FIX: Ensure suggestions are positioned correctly */
+  position: absolute;
+  top: calc(100% + var(--spacing-xs));
+  left: 0;
+  right: 0;
   width: 100%;
-  min-width: 400px;
+  min-width: 0;
 }
 
 .suggestion-item {
@@ -277,7 +264,7 @@
   padding: 0.75rem 1rem;
   cursor: pointer;
   transition: background-color 0.2s ease;
-  border-bottom: 1px solid #3a3f4b;
+  border-bottom: 1px solid var(--color-border-primary);
 }
 
 .suggestion-item:last-child {
@@ -285,11 +272,11 @@
 }
 
 .suggestion-item:hover {
-  background-color: #3a3f4b;
+  background-color: var(--color-primary-light);
 }
 
 .suggestion-icon {
-  color: #00d4ff;
+  color: var(--color-primary);
   margin-right: 0.75rem;
   margin-top: 0.25rem;
   flex-shrink: 0;
@@ -301,15 +288,15 @@
 }
 
 .suggestion-main {
-  color: #fff;
-  font-weight: 500;
-  font-size: 0.875rem;
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--font-size-sm);
   margin-bottom: 0.25rem;
 }
 
 .suggestion-sub {
-  color: #6c757d;
-  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

@@ -120,7 +120,10 @@ from mavsdk.action import ActionError
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from src.led_controller import LEDController
+from src.mission_startup import arm_with_preflight_gate
+from src.drone_api_routes import DRONE_LOCAL_POSITION_ROUTE
 from src.params import Params
+from src.synchronized_start import evaluate_synchronized_start, resolve_requested_start_time
 from src import origin_cache  # Phase 2: Origin caching system
 
 from drone_show_src.utils import (
@@ -398,7 +401,7 @@ async def get_current_ned_position(drone: System) -> PositionNedYaw:
         logger.debug("Attempting to get current NED position via local API")
         response = await asyncio.to_thread(
             requests.get,
-            f"http://localhost:{Params.drone_api_port}/get-local-position-ned",
+            f"http://localhost:{Params.drone_api_port}{DRONE_LOCAL_POSITION_ROUTE}",
             timeout=1,
         )
         if response.status_code == 200:
@@ -1191,7 +1194,7 @@ async def fetch_origin_with_fallback(drone: System):
     # Attempt 2: Fetch from GCS server
     try:
         logger.info("🌍 Fetching drone show origin from GCS...")
-        gcs_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/get-origin-for-drone"
+        gcs_url = f"http://{Params.GCS_IP}:{Params.gcs_api_port}/api/v1/origin"
         response = await asyncio.to_thread(
             requests.get,
             gcs_url,
@@ -1459,7 +1462,6 @@ async def pre_flight_checks(drone: System, require_global_position: bool):
         led_controller.set_color(255, 0, 0)
         raise
 
-@retry(stop=stop_after_attempt(Params.PREFLIGHT_MAX_RETRIES), wait=wait_fixed(2))
 async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
     """
     Arm the drone and start offboard mode, while computing the initial position offset in NED coordinates.
@@ -1493,9 +1495,12 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
         logger.info("Setting Hold flight mode.")
         await drone.action.hold()
 
-        # Step 3: Arm the drone
-        logger.info("Arming the drone.")
-        await drone.action.arm()
+        # Step 3: Wait for PX4 armability, then arm with bounded retries.
+        await arm_with_preflight_gate(
+            drone,
+            require_global_position=bool(Params.REQUIRE_GLOBAL_POSITION and home_position),
+            logger=logger,
+        )
 
         # Step 4: Set an initial offboard velocity setpoint
         logger.info("Setting initial velocity setpoint for offboard mode.")
@@ -1503,7 +1508,21 @@ async def arming_and_starting_offboard_mode(drone: System, home_position: dict):
 
         # Step 5: Start offboard mode
         logger.info("Starting offboard mode.")
-        await drone.offboard.start()
+        offboard_attempts = 0
+        max_offboard_attempts = max(1, int(getattr(Params, "OFFBOARD_START_MAX_ATTEMPTS", 3)))
+
+        while offboard_attempts < max_offboard_attempts:
+            try:
+                await drone.offboard.start()
+                logger.info("Offboard mode started successfully.")
+                break
+            except OffboardError as e:
+                offboard_attempts += 1
+                logger.warning(f"Offboard start attempt {offboard_attempts} failed: {e}")
+                if offboard_attempts >= max_offboard_attempts:
+                    raise
+                await asyncio.sleep(float(getattr(Params, "OFFBOARD_START_RETRY_DELAY_SEC", 1.0)))
+                await drone.offboard.set_velocity_body(VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0))
 
         # Indicate readiness with LED color
         led_controller.set_color(255, 255, 255)  # White: Ready to fly
@@ -1543,7 +1562,7 @@ async def compute_position_drift():
         # Request NED data from local API endpoint
         response = await asyncio.to_thread(
             requests.get,
-            f"http://localhost:{Params.drone_api_port}/get-local-position-ned",
+            f"http://localhost:{Params.drone_api_port}{DRONE_LOCAL_POSITION_ROUTE}",
             timeout=2,
         )
 
@@ -2022,18 +2041,21 @@ async def run_drone(synchronized_start_time, custom_csv=None, auto_launch_positi
         logger.info("=" * 70)
 
         # Step 4: Handle synchronized start time
-        if synchronized_start_time is None:
-            synchronized_start_time = time.time()
-            logger.info(f"No start_time provided; using now: {time.ctime(synchronized_start_time)}")
-        now = time.time()
-        if synchronized_start_time > now:
-            wait_secs = synchronized_start_time - now
-            logger.info(f"Waiting {wait_secs:.2f}s until synchronized start time.")
-            await asyncio.sleep(wait_secs)
-        elif synchronized_start_time < now:
-            logger.warning(f"Start time was {now - synchronized_start_time:.2f}s ago; starting immediately.")
+        start_decision = evaluate_synchronized_start(
+            synchronized_start_time,
+            late_tolerance_sec=getattr(Params, "SYNCHRONIZED_MISSION_LATE_START_TOLERANCE_SEC", 1.0),
+        )
+        synchronized_start_time = start_decision.effective_start_time
+        if start_decision.should_abort:
+            raise RuntimeError(
+                f"Synchronized mission start is too late to execute safely. {start_decision.reason}"
+            )
+        if start_decision.should_wait:
+            logger.info(start_decision.reason)
+            await asyncio.sleep(start_decision.wait_seconds)
         else:
-            logger.info("Synchronized start time is now.")
+            log_method = logger.warning if start_decision.late_by_seconds > 0 else logger.info
+            log_method(start_decision.reason)
 
         # Step 5: Arm and enter Offboard
         await arming_and_starting_offboard_mode(drone, home_position)
@@ -2202,15 +2224,7 @@ def main():
     init_drone_logging()
     logger = get_logger("drone_show")
 
-    # Get the synchronized start time
-    if args.start_time:
-        synchronized_start_time = args.start_time
-        formatted_time = time.ctime(synchronized_start_time)
-        logger.info(f"Synchronized start time provided: {formatted_time}.")
-    else:
-        synchronized_start_time = time.time()
-        formatted_time = time.ctime(synchronized_start_time)
-        logger.info(f"No synchronized start time provided. Using current time: {formatted_time}.")
+    synchronized_start_time = resolve_requested_start_time(args.start_time, logger=logger)
 
     global global_synchronized_start_time
     global_synchronized_start_time = synchronized_start_time
