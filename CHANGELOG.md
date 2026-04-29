@@ -7,6 +7,17 @@ and this project uses simple two-part versioning: `X.Y` (Major.Minor).
 
 ---
 
+## [5.4] - 2026-04-29
+
+### Added
+- Automated version bump (minor)
+
+### Changed
+- See commit history for detailed changes
+
+---
+
+
 ## [5.2] - 2026-04-19
 
 ### Added
