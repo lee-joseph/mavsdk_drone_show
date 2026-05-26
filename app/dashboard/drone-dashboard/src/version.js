@@ -10,10 +10,10 @@
  * 3. Rebuild the frontend: npm run build
  */
 
-const DEFAULT_VERSION = '5.5';
-const DEFAULT_GIT_COMMIT = '8bd16517';
+const DEFAULT_VERSION = '5.6';
+const DEFAULT_GIT_COMMIT = 'f05afe0b';
 const DEFAULT_GIT_BRANCH = 'main';
-const DEFAULT_GIT_REPO = 'alireza787b/mavsdk_drone_show';
+const DEFAULT_GIT_REPO = 'lee-joseph/mavsdk_drone_show';
 
 const VERSION = process.env.REACT_APP_VERSION || DEFAULT_VERSION;
 const GIT_COMMIT = process.env.REACT_APP_GIT_COMMIT || DEFAULT_GIT_COMMIT;
