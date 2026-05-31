@@ -92,10 +92,14 @@ export const GCS_ROUTE_KEYS = Object.freeze({
   simurghStatus: 'simurghStatus',
   simurghPolicy: 'simurghPolicy',
   simurghTools: 'simurghTools',
+  simurghToolCandidates: 'simurghToolCandidates',
   simurghContext: 'simurghContext',
   simurghSessions: 'simurghSessions',
   simurghAudit: 'simurghAudit',
   simurghAssistantTurns: 'simurghAssistantTurns',
+  simurghAssistantTurnsStream: 'simurghAssistantTurnsStream',
+  simurghRuntimeSettings: 'simurghRuntimeSettings',
+  simurghProviderCredentials: 'simurghProviderCredentials',
   logsBase: 'logsBase',
   sarBase: 'sarBase',
 });
@@ -187,10 +191,14 @@ export const GCS_ROUTES = Object.freeze({
   [GCS_ROUTE_KEYS.simurghStatus]: '/api/v1/simurgh/status',
   [GCS_ROUTE_KEYS.simurghPolicy]: '/api/v1/simurgh/policy',
   [GCS_ROUTE_KEYS.simurghTools]: '/api/v1/simurgh/tools',
+  [GCS_ROUTE_KEYS.simurghToolCandidates]: '/api/v1/simurgh/tool-candidates',
   [GCS_ROUTE_KEYS.simurghContext]: '/api/v1/simurgh/context',
   [GCS_ROUTE_KEYS.simurghSessions]: '/api/v1/simurgh/sessions',
   [GCS_ROUTE_KEYS.simurghAudit]: '/api/v1/simurgh/audit',
   [GCS_ROUTE_KEYS.simurghAssistantTurns]: '/api/v1/simurgh/assistant/turns',
+  [GCS_ROUTE_KEYS.simurghAssistantTurnsStream]: '/api/v1/simurgh/assistant/turns/stream',
+  [GCS_ROUTE_KEYS.simurghRuntimeSettings]: '/api/v1/simurgh/runtime-settings',
+  [GCS_ROUTE_KEYS.simurghProviderCredentials]: '/api/v1/simurgh/provider-credentials',
   [GCS_ROUTE_KEYS.logsBase]: '/api/logs',
   [GCS_ROUTE_KEYS.sarBase]: '/api/sar',
 });
@@ -285,10 +293,14 @@ const ROUTE_KEY_BY_PATH = Object.freeze({
   '/api/v1/simurgh/status': GCS_ROUTE_KEYS.simurghStatus,
   '/api/v1/simurgh/policy': GCS_ROUTE_KEYS.simurghPolicy,
   '/api/v1/simurgh/tools': GCS_ROUTE_KEYS.simurghTools,
+  '/api/v1/simurgh/tool-candidates': GCS_ROUTE_KEYS.simurghToolCandidates,
   '/api/v1/simurgh/context': GCS_ROUTE_KEYS.simurghContext,
   '/api/v1/simurgh/sessions': GCS_ROUTE_KEYS.simurghSessions,
   '/api/v1/simurgh/audit': GCS_ROUTE_KEYS.simurghAudit,
   '/api/v1/simurgh/assistant/turns': GCS_ROUTE_KEYS.simurghAssistantTurns,
+  '/api/v1/simurgh/assistant/turns/stream': GCS_ROUTE_KEYS.simurghAssistantTurnsStream,
+  '/api/v1/simurgh/runtime-settings': GCS_ROUTE_KEYS.simurghRuntimeSettings,
+  '/api/v1/simurgh/provider-credentials': GCS_ROUTE_KEYS.simurghProviderCredentials,
 });
 
 export function resolveGcsRoute(routeOrPath) {
@@ -472,6 +484,132 @@ export async function fetchBlobGcsResource(routeOrPath, config = {}) {
 
 export async function postGcsResource(routeOrPath, payload = {}, config = {}) {
   return axios.post(buildGcsUrl(routeOrPath), payload, withGcsAuthConfig(config, 'POST'));
+}
+
+function withGcsFetchConfig(config = {}, method = 'POST') {
+  const authConfig = withGcsAuthConfig(config, method);
+  return {
+    credentials: 'include',
+    signal: authConfig.signal,
+    headers: {
+      ...(authConfig.headers || {}),
+    },
+  };
+}
+
+function parseServerSentEventBlock(block) {
+  const lines = String(block || '').split(/\r?\n/);
+  let event = 'message';
+  const dataLines = [];
+  lines.forEach((line) => {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+  });
+  if (!dataLines.length) {
+    return null;
+  }
+  const dataText = dataLines.join('\n');
+  let data = dataText;
+  try {
+    data = JSON.parse(dataText);
+  } catch (error) {
+    data = dataText;
+  }
+  return { event, data };
+}
+
+async function readStreamError(response) {
+  try {
+    const payload = await response.json();
+    return payload?.detail || payload?.message || `Simurgh stream failed with status ${response.status}`;
+  } catch (jsonError) {
+    try {
+      const text = await response.text();
+      return text || `Simurgh stream failed with status ${response.status}`;
+    } catch (textError) {
+      return `Simurgh stream failed with status ${response.status}`;
+    }
+  }
+}
+
+export async function streamSimurghAssistantTurnResponse(payload = {}, config = {}) {
+  const fetchImpl = config.fetchImpl || (typeof fetch === 'function' ? fetch : null);
+  if (!fetchImpl) {
+    throw new Error('Streaming fetch is not available in this browser.');
+  }
+
+  const fetchConfig = withGcsFetchConfig(config, 'POST');
+  const response = await fetchImpl(buildGcsUrl(GCS_ROUTE_KEYS.simurghAssistantTurnsStream), {
+    method: 'POST',
+    credentials: fetchConfig.credentials,
+    signal: fetchConfig.signal,
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...(fetchConfig.headers || {}),
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readStreamError(response));
+  }
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    throw new Error('Simurgh stream response is not readable.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalPayload = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = parts.pop() || '';
+    for (const part of parts) {
+      const eventPayload = parseServerSentEventBlock(part);
+      if (!eventPayload) {
+        continue;
+      }
+      if (typeof config.onEvent === 'function') {
+        config.onEvent(eventPayload);
+      }
+      if (eventPayload.event === 'final') {
+        finalPayload = eventPayload.data;
+      } else if (eventPayload.event === 'error') {
+        const error = new Error(eventPayload.data?.detail || 'Simurgh stream failed.');
+        error.statusCode = eventPayload.data?.status_code;
+        throw error;
+      }
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    const eventPayload = parseServerSentEventBlock(buffer);
+    if (eventPayload) {
+      if (typeof config.onEvent === 'function') {
+        config.onEvent(eventPayload);
+      }
+      if (eventPayload.event === 'final') {
+        finalPayload = eventPayload.data;
+      } else if (eventPayload.event === 'error') {
+        const error = new Error(eventPayload.data?.detail || 'Simurgh stream failed.');
+        error.statusCode = eventPayload.data?.status_code;
+        throw error;
+      }
+    }
+  }
+
+  return { data: finalPayload };
 }
 
 export async function putGcsResource(routeOrPath, payload = {}, config = {}) {
@@ -802,6 +940,20 @@ export async function getSimurghToolsResponse({ includeExcluded = true } = {}, c
   });
 }
 
+export async function getSimurghToolCandidatesResponse({ eligibleReadOnly = null, riskClass = '', search = '', limit = 50, offset = 0 } = {}, config = {}) {
+  return fetchGcsResource(GCS_ROUTE_KEYS.simurghToolCandidates, {
+    ...config,
+    params: {
+      ...(eligibleReadOnly === null || eligibleReadOnly === undefined ? {} : { eligible_read_only: eligibleReadOnly ? 'true' : 'false' }),
+      ...(riskClass ? { risk_class: riskClass } : {}),
+      ...(search ? { search } : {}),
+      limit,
+      offset,
+      ...(config.params || {}),
+    },
+  });
+}
+
 export async function getSimurghContextResponse(config = {}) {
   return fetchGcsResource(GCS_ROUTE_KEYS.simurghContext, config);
 }
@@ -840,6 +992,22 @@ export async function getSimurghAssistantTurnsResponse({ sessionId = null, actor
 
 export async function createSimurghAssistantTurnResponse(payload = {}, config = {}) {
   return postGcsResource(GCS_ROUTE_KEYS.simurghAssistantTurns, payload, config);
+}
+
+export async function getSimurghRuntimeSettingsResponse(config = {}) {
+  return fetchGcsResource(GCS_ROUTE_KEYS.simurghRuntimeSettings, config);
+}
+
+export async function updateSimurghRuntimeSettingsResponse(payload = {}, config = {}) {
+  return putGcsResource(GCS_ROUTE_KEYS.simurghRuntimeSettings, payload, config);
+}
+
+export async function getSimurghProviderCredentialsResponse(config = {}) {
+  return fetchGcsResource(GCS_ROUTE_KEYS.simurghProviderCredentials, config);
+}
+
+export async function updateSimurghProviderCredentialsResponse(payload = {}, config = {}) {
+  return putGcsResource(GCS_ROUTE_KEYS.simurghProviderCredentials, payload, config);
 }
 
 export async function computeOriginResponse(payload, config = {}) {

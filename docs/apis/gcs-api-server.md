@@ -875,6 +875,35 @@ Retrieve comprehensive trajectory analysis metrics.
 }
 ```
 
+#### `GET /api/v1/shows/skybrush/metrics/snapshot`
+Read the current cached comprehensive trajectory metrics snapshot without recalculating or writing metrics files. Use this route for MCP/read-only inspections.
+
+**Response with current cache:**
+```json
+{
+  "available": true,
+  "snapshot_only": true,
+  "cache_current": true,
+  "metrics": {
+    "safety_metrics": {...},
+    "performance_metrics": {...},
+    "formation_metrics": {...}
+  }
+}
+```
+
+**Response when no current cache exists:**
+```json
+{
+  "available": false,
+  "snapshot_only": true,
+  "cache_current": false,
+  "detail": "No current cached SkyBrush metrics snapshot is available..."
+}
+```
+
+The legacy `GET /api/v1/shows/skybrush/metrics` route may refresh cached metrics and is therefore not exposed as a read-only MCP tool.
+
 #### `GET /api/v1/shows/skybrush/safety-report`
 Get detailed safety analysis report.
 
@@ -2146,6 +2175,62 @@ Policy:
 - node proxy calls require the drone API to be reachable from the GCS on the
   configured `MDS_DRONE_API_PORT`
 
+### Simurgh Operator MCP Review
+
+Simurgh exposes two separate surfaces on purpose:
+
+- reviewed callable tools: `GET /api/v1/simurgh/tools` and
+  `POST /api/v1/simurgh/mcp`
+- first-party dashboard assistant turns:
+  `POST /api/v1/simurgh/assistant/turns` and
+  `POST /api/v1/simurgh/assistant/turns/stream`
+- generated review-only candidates: `GET /api/v1/simurgh/tool-candidates`
+
+`GET /api/v1/simurgh/tool-candidates` reads
+`docs/agent-context/generated/simurgh-openapi-tool-candidates.yaml`, summarizes
+the current OpenAPI-derived candidate set, and reports which candidates already
+match curated registry routes. It does not make routes callable.
+
+Useful query parameters:
+
+- `eligible_read_only=true|false`: filter by generator-inferred read-only MCP
+  eligibility
+- `risk_class=observe|sensitive_observe|operate|admin|...`: filter by inferred
+  risk class
+- `search=<text>`: filter by candidate id, route, operation id, summary, or tag
+- `limit` and `offset`: bounded pagination, with `limit` capped at 200
+
+Promotion remains manual and reviewed:
+
+```text
+OpenAPI route
+  -> generated non-callable candidate
+  -> config/agent_tools.yaml
+  -> config/agent_policy.yaml
+  -> tests/docs/evals
+  -> reviewer approval
+  -> MCP tools/list and tools/call
+```
+
+This lets FastAPI-MCP, FastMCP, MCPify, or future adapters help with discovery
+without replacing the MDS safety boundary.
+
+`POST /api/v1/simurgh/assistant/turns/stream` returns `text/event-stream` for
+the dashboard chat UI. It emits `progress`, `delta`, `final`, `done`, and
+sanitized `error` events. The `final` payload matches the normal assistant-turn
+response shape. This SSE route is not an MCP transport and is not callable from
+the generated OpenAPI candidate menu unless a future reviewed registry/policy
+promotion explicitly approves it.
+
+For authenticated dashboard/operator sessions with `MDS_AGENT_PROVIDER=openai`,
+assistant turns may first execute a policy-approved read-only Simurgh advisory
+tool and then ask OpenAI to compose the final text from a bounded
+`session.read_only_mds_evidence` context document. The route still reports the
+selected local `trace.tool.intent`, does not expose raw prompts in the trace, and
+does not allow provider-side tool execution. Unauthenticated local-tool turns
+remain deterministic `mds-tools` answers so field-visible GCS deployments do not
+turn into an external provider surface.
+
 ---
 
 ## Error Handling
@@ -2224,6 +2309,6 @@ The FastAPI implementation replaced the earlier Flask server, but the public con
 
 ---
 
-**Last Updated:** 2026-04-03
-**Version:** 5.0 (FastAPI)
+**Last Updated:** 2026-05-27
+**Version:** 5.5 (FastAPI)
 **Maintainer:** MAVSDK Drone Show Team

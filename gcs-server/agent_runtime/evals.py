@@ -76,7 +76,7 @@ OFFLINE_OPENAI_FORBIDDEN_REQUEST_KEYS = (
     "vector_store_ids",
 )
 FIELD_PRIVACY_PATTERNS = (
-    ("field vehicle label", re.compile(r"\bAIRFRAME-\d+\b", re.IGNORECASE)),
+    ("field vehicle label", re.compile(r"\bCM4-\d+\b", re.IGNORECASE)),
     (
         "exact coordinate pair",
         re.compile(r"\b-?\d{1,2}\.\d{4,}\s*,\s*-?\d{1,3}\.\d{4,}\b"),
@@ -471,6 +471,7 @@ def run_assistant_eval_scenario(
     try:
         with tempfile.TemporaryDirectory(prefix="simurgh-eval-") as temp_dir:
             env_updates: dict[str, str | None] = {
+                "MDS_MODE": "sitl",
                 "MDS_AGENT_ENABLED": "true",
                 "MDS_AGENT_PROVIDER": scenario.provider,
             }

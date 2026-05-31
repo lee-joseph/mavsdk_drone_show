@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
 from agent_runtime import AgentRuntimeError, OpenAIResponsesAssistantAdapter
+from agent_runtime.assistant import _provider_tool_composition_message
 from api_routes.simurgh import create_simurgh_router
 
 
@@ -31,6 +34,23 @@ def _write_restricted_key(path, value="test-openai-key\n"):
     path.write_text(value, encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def _parse_sse_events(body: str):
+    events = []
+    for block in body.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = "message"
+        data_lines = []
+        for line in block.splitlines():
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip() or "message"
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].lstrip())
+        if data_lines:
+            events.append((event_name, json.loads("\n".join(data_lines))))
+    return events
 
 
 def test_simurgh_assistant_turn_requires_enabled_agent(monkeypatch):
@@ -80,6 +100,38 @@ def test_simurgh_assistant_turn_creates_mock_session_and_audit(monkeypatch):
     assert history[0]["message_hash"]
     assert history[0]["model"] == "mock-local"
     assert history[0]["adapter_version"] == "mock-v1"
+
+
+def test_simurgh_assistant_turn_streams_progress_delta_final_and_history(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    client = _client()
+
+    with client.stream(
+        "POST",
+        "/api/v1/simurgh/assistant/turns/stream",
+        json={"actor": "operator", "message": "How many drones do we have configured?"},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = "".join(response.iter_text())
+
+    events = _parse_sse_events(body)
+    event_names = [event for event, _payload in events]
+    assert event_names[:3] == ["progress", "progress", "progress"]
+    assert "delta" in event_names
+    assert "final" in event_names
+    assert event_names[-1] == "done"
+    progress_labels = [payload["label"] for event, payload in events if event == "progress"]
+    assert "Understanding request" in progress_labels
+    assert "Streaming answer" in progress_labels
+    streamed_content = "".join(payload["text"] for event, payload in events if event == "delta")
+    final_payload = next(payload for event, payload in events if event == "final")
+    assert final_payload["provider"] == "mds-tools"
+    assert "configured drone" in streamed_content.lower()
+    assert streamed_content == final_payload["content"]
+
+    history = client.get("/api/v1/simurgh/assistant/turns", params={"actor": "operator"}).json()["turns"]
+    assert [turn["id"] for turn in history] == [final_payload["id"]]
 
 
 def test_simurgh_assistant_turn_can_use_existing_session(monkeypatch):
@@ -149,7 +201,7 @@ def test_simurgh_assistant_turn_does_not_reflect_raw_metadata_to_sessions(monkey
             "message": "Summarize safety policy.",
             "metadata": {
                 "source": "simurgh-dashboard",
-                "raw_prompt": "AIRFRAME-01 stopped streaming on 192.168.1.10",
+                "raw_prompt": "CM4-99 stopped streaming on 192.168.1.10",
             },
         },
     )
@@ -169,7 +221,7 @@ def test_simurgh_assistant_turn_rejects_sensitive_metadata_source(monkeypatch):
             "actor": "operator",
             "message": "Summarize safety policy.",
             "metadata": {
-                "source": "AIRFRAME-01",
+                "source": "CM4-99",
             },
         },
     )
@@ -178,7 +230,7 @@ def test_simurgh_assistant_turn_rejects_sensitive_metadata_source(monkeypatch):
     session = response.json()["session"]
     assert session["metadata"] == {"channel": "assistant"}
     serialized = str(client.get("/api/v1/simurgh/sessions").json())
-    assert "AIRFRAME-01" not in serialized
+    assert "CM4-99" not in serialized
 
 
 def test_simurgh_assistant_history_filters_by_actor(monkeypatch):
@@ -235,6 +287,300 @@ def test_simurgh_assistant_turn_rejects_external_provider_without_auth(monkeypat
 
     assert response.status_code == 403
     assert "require MDS auth" in response.json()["detail"]
+
+
+def test_simurgh_assistant_turn_allows_local_mds_tool_answer_without_external_provider_auth(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    response = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "How many drones do we have configured?"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "mds-tools"
+    assert payload["model"] == "local-read-only"
+    assert "configured drone" in payload["content"].lower()
+    assert "No direct drone API" in payload["safety_notes"][1]
+    assert payload["trace"]["query"]["domain"] == "fleet"
+    assert payload["trace"]["tool"]["intent"] == "fleet_summary"
+    assert payload["trace"]["language"]["language"] == "en"
+    assert "How many drones" not in str(payload["trace"])
+
+
+def test_simurgh_assistant_turn_composes_local_tool_evidence_with_openai_when_authenticated(monkeypatch, tmp_path):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    api_key_file = _write_restricted_key(tmp_path / "openai_api_key")
+    monkeypatch.setenv("MDS_AGENT_OPENAI_API_KEY_FILE", str(api_key_file))
+    captured: dict[str, object] = {}
+
+    def fake_post(self, payload, *, api_key):  # noqa: ANN001
+        captured.update(payload)
+        captured["api_key"] = api_key
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "You have 2 configured drones in the GCS fleet. I used the read-only fleet evidence only; no drone command was sent.",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(OpenAIResponsesAssistantAdapter, "_post_response", fake_post)
+    client = _client(auth_context={"kind": "session", "role": "operator", "username": "operator"})
+
+    response = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "How many drones do we have configured?"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "openai"
+    assert payload["trace"]["tool"]["intent"] == "fleet_summary"
+    assert payload["trace"]["context"]["retrieved_context_count"] == 1
+    assert "2 configured drones" in payload["content"]
+    assert "read-only" in payload["safety_notes"][0].lower()
+    assert captured["api_key"] == "test-openai-key"
+    assert captured["tools"] == []
+    assert captured["tool_choice"] == "none"
+    assert "session.read_only_mds_evidence" in str(captured["input"])
+    assert "Fleet status from GCS configuration" in str(captured["input"])
+
+
+def test_provider_tool_composition_message_has_safe_fallback_labels():
+    message = _provider_tool_composition_message(
+        operator_message="status?",
+        tool_intent="",
+        response_mode="",
+    )
+
+    assert "Read-only tool intent: unknown." in message
+    assert "Response mode: status." in message
+
+
+def test_simurgh_assistant_turn_uses_adapted_routing_for_local_auth_gate(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    first = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "wat droens are connected?"},
+    )
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["provider"] == "mds-tools"
+    assert first_payload["trace"]["tool"]["intent"] == "fleet_connectivity"
+
+    followup = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={
+            "actor": "operator",
+            "session_id": first_payload["session"]["id"],
+            "message": "can you report any warnign if exist last 30 minutes in gcs?",
+        },
+    )
+
+    assert followup.status_code == 200
+    payload = followup.json()
+    assert payload["provider"] == "mds-tools"
+    assert payload["trace"]["query"]["domain"] == "logs"
+    assert payload["trace"]["tool"]["intent"] == "backend_log_summary"
+    assert "Simurgh capabilities" not in payload["content"]
+
+
+def test_simurgh_assistant_turn_explicit_fleet_prompt_overrides_log_session_topic(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    first = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "check last 1 hour logs is there anything I need to know?"},
+    )
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["trace"]["tool"]["intent"] == "backend_log_summary"
+
+    followup = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={
+            "actor": "operator",
+            "session_id": first_payload["session"]["id"],
+            "message": "what is the current flee status and info?",
+        },
+    )
+
+    assert followup.status_code == 200
+    payload = followup.json()
+    assert payload["provider"] == "mds-tools"
+    assert payload["trace"]["query"]["domain"] == "fleet"
+    assert payload["trace"]["tool"]["intent"] == "fleet_summary"
+    assert "Fleet status from GCS configuration" in payload["content"]
+    assert "Backend warning/error summary" not in payload["content"]
+
+
+def test_simurgh_assistant_turn_answers_general_questions_without_inheriting_fleet_topic(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    first = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "wat droens are connected?"},
+    )
+    assert first.status_code == 200
+    session_id = first.json()["session"]["id"]
+
+    for message, expected, blocked in (
+        ("what is a drone?", "unmanned aircraft", "Fleet status from GCS configuration"),
+        ("what is mavlink?", "MAVLink", "Connectivity from GCS state"),
+        ("how is the weather today?", "do not have a live weather feed", "Fleet status from GCS configuration"),
+    ):
+        response = client.post(
+            "/api/v1/simurgh/assistant/turns",
+            json={"actor": "operator", "session_id": session_id, "message": message},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["provider"] == "mds-tools"
+        assert payload["trace"]["tool"]["intent"] == "general_knowledge"
+        assert expected in payload["content"]
+        assert blocked not in payload["content"]
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("is there any drone connected?", "Connectivity from GCS state"),
+        ("what formation swarm is defined for drones and what are the clusters?", "Configured/planned swarm geometry"),
+        ("from where I can edit the swarm offsets?", "/swarm-design"),
+        ("what drone show is loaded? what is the length of drone show?", "Loaded show state"),
+    ],
+)
+def test_simurgh_assistant_turn_answers_pm_read_only_prompts(monkeypatch, message, expected):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    client = _client()
+
+    response = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": message},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "mds-tools"
+    assert expected in payload["content"]
+    assert "No direct drone API" in payload["safety_notes"][1]
+
+
+def test_simurgh_assistant_turn_routes_multilingual_local_prompt_with_adaptation_trace(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    response = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "Combien de drones sont configurés maintenant ?"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "mds-tools"
+    assert payload["trace"]["language"]["language"] == "fr"
+    assert payload["trace"]["adaptation"]["routing_language"] == "en"
+    assert payload["trace"]["adaptation"]["strategy"] == "config-governed-cross-language-routing"
+    assert payload["trace"]["query"]["domain"] == "fleet"
+    assert payload["trace"]["tool"]["intent"] == "fleet_summary"
+    assert "Combien" not in str(payload["trace"])
+
+
+def test_simurgh_assistant_turn_uses_session_topic_for_local_followup_without_provider_auth(monkeypatch):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    client = _client()
+
+    first = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "what drone show is planned now?"},
+    )
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["provider"] == "mds-tools"
+    assert first_payload["session"]["metadata"]["last_domain"] == "drone_show"
+
+    followup = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={
+            "actor": "operator",
+            "session_id": first_payload["session"]["id"],
+            "message": "is there any uploaded?",
+        },
+    )
+
+    assert followup.status_code == 200
+    payload = followup.json()
+    assert payload["provider"] == "mds-tools"
+    assert "Loaded show state" in payload["content"]
+    assert "I can’t see uploads from here" not in payload["content"]
+
+
+def test_simurgh_assistant_turn_interprets_log_followup_without_provider_auth(monkeypatch):
+    from agent_runtime.mds_read_tools import MdsReadOnlyTools
+
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+
+    def fake_recent_warning_events(self, **_kwargs):  # noqa: ANN001
+        return (
+            [
+                {
+                    "ts": "2026-05-26T08:51:00Z",
+                    "level": "WARNING",
+                    "source": "/var/log/mds-gcs.log",
+                    "message": "08:51:00 WARNING [api] API GET /api/v1/commands/active -> 401 (0.001s)",
+                }
+            ],
+            ["/var/log/mds-gcs.log"],
+        )
+
+    monkeypatch.setattr(MdsReadOnlyTools, "_recent_warning_events", fake_recent_warning_events)
+    client = _client()
+
+    first = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "check backend logs and report anything worth mentioning"},
+    )
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["provider"] == "mds-tools"
+    assert first_payload["session"]["metadata"]["last_domain"] == "logs"
+
+    followup = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={
+            "actor": "operator",
+            "session_id": first_payload["session"]["id"],
+            "message": "what does it mean?",
+        },
+    )
+
+    assert followup.status_code == 200
+    payload = followup.json()
+    assert payload["provider"] == "mds-tools"
+    assert "Operational interpretation of backend warnings" in payload["content"]
+    assert "HTTP authorization warnings" in payload["content"]
+    assert "Most recent entries:" not in payload["content"]
 
 
 @pytest.mark.parametrize(
@@ -350,6 +696,33 @@ def test_simurgh_assistant_turn_uses_openai_provider_with_safe_metadata(monkeypa
     assert history[0]["adapter_version"] == "openai-responses-v1"
 
 
+def test_simurgh_assistant_turn_trace_profiles_non_english_provider_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
+    monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
+    api_key_file = _write_restricted_key(tmp_path / "openai_api_key")
+    monkeypatch.setenv("MDS_AGENT_OPENAI_API_KEY_FILE", str(api_key_file))
+
+    def fake_post(self, payload, *, api_key):  # noqa: ANN001
+        assert "Detected language: fr" in str(payload["input"])
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": "Réponse."}]}]}
+
+    monkeypatch.setattr(OpenAIResponsesAssistantAdapter, "_post_response", fake_post)
+    client = _client(auth_context={"kind": "session", "role": "operator", "username": "operator"})
+
+    response = client.post(
+        "/api/v1/simurgh/assistant/turns",
+        json={"actor": "operator", "message": "Combien de pages Simurgh sont utiles maintenant ?"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "openai"
+    assert payload["trace"]["language"]["language"] == "fr"
+    assert payload["trace"]["language"]["localization_strategy"] == "same-language-provider-response"
+    assert payload["trace"]["safety"]["action_execution"] == "none"
+    assert "Combien de drones" not in str(payload["trace"])
+
+
 def test_simurgh_assistant_turn_returns_safe_openai_failure(monkeypatch, tmp_path):
     monkeypatch.setenv("MDS_AGENT_ENABLED", "true")
     monkeypatch.setenv("MDS_AGENT_PROVIDER", "openai")
@@ -367,8 +740,11 @@ def test_simurgh_assistant_turn_returns_safe_openai_failure(monkeypatch, tmp_pat
         json={"actor": "operator", "message": "Use a provider."},
     )
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "OpenAI assistant request failed with HTTP 500"
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider"] == "openai"
+    assert "could not reach the external assistant provider" in payload["content"].lower()
+    assert "HTTP 500" not in payload["content"]
     assert "test-secret" not in str(response.json())
 
 

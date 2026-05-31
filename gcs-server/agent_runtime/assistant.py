@@ -9,7 +9,7 @@ import re
 import stat
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -20,8 +20,23 @@ import yaml
 
 from .audit import InMemoryAuditSink
 from .context import AgentContextIndex, load_default_context_index
+from .language import LanguageProfile, detect_language_profile, provider_language_guidance
+from .mds_read_tools import (
+    READ_TOOL_ADAPTER_VERSION,
+    READ_TOOL_MODEL,
+    READ_TOOL_PROVIDER,
+    MdsReadToolAnswer,
+    answer_mds_read_only_question,
+    classify_mds_read_intent,
+    infer_mds_read_topic,
+    is_safe_blocked_term_read_only_intent,
+)
 from .models import AgentRuntimeError, AgentSession, AuditEvent, ContextResource, stable_payload_hash, utc_now
 from .policy import load_default_policy
+from .query_adaptation import adapt_operator_query
+from .query_understanding import AssistantQueryPlan, build_assistant_query_plan
+from .tool_executor import ADVISORY_ANSWER_TOOL_ID, execute_policy_allowed_advisory_tool
+from .retrieval import load_default_retriever, search_retriever_queries
 from .sessions import AgentSessionStore, sanitize_session_metadata
 
 
@@ -43,6 +58,11 @@ OPENAI_TIMEOUT_SECONDS_ENV = "MDS_AGENT_OPENAI_TIMEOUT_SEC"
 OPENAI_MAX_OUTPUT_TOKENS_ENV = "MDS_AGENT_OPENAI_MAX_OUTPUT_TOKENS"
 OPENAI_REASONING_EFFORT_ENV = "MDS_AGENT_OPENAI_REASONING_EFFORT"
 OPENAI_TEXT_VERBOSITY_ENV = "MDS_AGENT_OPENAI_TEXT_VERBOSITY"
+OPENAI_WEB_SEARCH_ENABLED_ENV = "MDS_AGENT_WEB_SEARCH_ENABLED"
+OPENAI_WEB_SEARCH_CONTEXT_SIZE_ENV = "MDS_AGENT_WEB_SEARCH_CONTEXT_SIZE"
+OPENAI_WEB_SEARCH_EXTERNAL_ACCESS_ENV = "MDS_AGENT_WEB_SEARCH_EXTERNAL_ACCESS"
+OPENAI_WEB_SEARCH_ALLOWED_DOMAINS_ENV = "MDS_AGENT_WEB_SEARCH_ALLOWED_DOMAINS"
+OPENAI_WEB_SEARCH_BLOCKED_DOMAINS_ENV = "MDS_AGENT_WEB_SEARCH_BLOCKED_DOMAINS"
 DEFAULT_ASSISTANT_HISTORY_MAX_AGE_DAYS = 30
 DEFAULT_ASSISTANT_HISTORY_MAX_RECORDS = 200
 ASSISTANT_HISTORY_SCHEMA_VERSION = 1
@@ -56,8 +76,13 @@ DEFAULT_OPENAI_TIMEOUT_SECONDS = 30.0
 DEFAULT_OPENAI_MAX_OUTPUT_TOKENS = 900
 DEFAULT_OPENAI_REASONING_EFFORT = "medium"
 DEFAULT_OPENAI_TEXT_VERBOSITY = "low"
+DEFAULT_OPENAI_WEB_SEARCH_CONTEXT_SIZE = "medium"
+DEFAULT_RETRIEVED_CONTEXT_LIMIT = 4
+DEFAULT_RETRIEVED_CONTEXT_MAX_CHARS = 2200
+DEFAULT_RETRIEVED_CONTEXT_BUDGET_BYTES = 14000
 SUPPORTED_OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 SUPPORTED_OPENAI_TEXT_VERBOSITY = {"low", "medium", "high"}
+SUPPORTED_OPENAI_WEB_SEARCH_CONTEXT_SIZE = {"low", "medium", "high"}
 
 
 def _string_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
@@ -131,6 +156,43 @@ def _env_float(name: str, default: float) -> float:
         raise AgentRuntimeError(f"{name} must be a number") from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return _coerce_bool(raw, field_name=name)
+
+
+def _coerce_bool(value: object, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise AgentRuntimeError(f"{field_name} must be a boolean")
+
+
+def _env_csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _string_or_csv_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+    if isinstance(value, list):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    raise AgentRuntimeError(f"{field_name} must be a list or comma-separated string")
+
+
 def validate_openai_api_key_file(
     path: str | Path,
     *,
@@ -191,6 +253,97 @@ class AssistantResponseTemplate:
 
 
 @dataclass(frozen=True)
+class OpenAIWebSearchConfig:
+    """Responses API web-search settings for public/general assistant prompts."""
+
+    enabled: bool = False
+    search_context_size: str = DEFAULT_OPENAI_WEB_SEARCH_CONTEXT_SIZE
+    external_web_access: bool = True
+    allowed_domains: tuple[str, ...] = ()
+    blocked_domains: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object] | None) -> "OpenAIWebSearchConfig":
+        values = dict(payload or {})
+        config = cls(
+            enabled=_coerce_bool(
+                values.get("enabled", False),
+                field_name="providers.openai.web_search.enabled",
+            ),
+            search_context_size=str(values.get("search_context_size") or DEFAULT_OPENAI_WEB_SEARCH_CONTEXT_SIZE)
+            .strip()
+            .lower(),
+            external_web_access=_coerce_bool(
+                values.get("external_web_access", True),
+                field_name="providers.openai.web_search.external_web_access",
+            ),
+            allowed_domains=_string_or_csv_tuple(
+                values.get("allowed_domains"),
+                field_name="providers.openai.web_search.allowed_domains",
+            ),
+            blocked_domains=_string_or_csv_tuple(
+                values.get("blocked_domains"),
+                field_name="providers.openai.web_search.blocked_domains",
+            ),
+        )
+        return config.with_env_overrides()
+
+    def with_env_overrides(self) -> "OpenAIWebSearchConfig":
+        updated = OpenAIWebSearchConfig(
+            enabled=_env_bool(OPENAI_WEB_SEARCH_ENABLED_ENV, self.enabled),
+            search_context_size=os.environ.get(
+                OPENAI_WEB_SEARCH_CONTEXT_SIZE_ENV,
+                self.search_context_size,
+            ).strip().lower()
+            or self.search_context_size,
+            external_web_access=_env_bool(
+                OPENAI_WEB_SEARCH_EXTERNAL_ACCESS_ENV,
+                self.external_web_access,
+            ),
+            allowed_domains=_env_csv_tuple(OPENAI_WEB_SEARCH_ALLOWED_DOMAINS_ENV, self.allowed_domains),
+            blocked_domains=_env_csv_tuple(OPENAI_WEB_SEARCH_BLOCKED_DOMAINS_ENV, self.blocked_domains),
+        )
+        updated.validate()
+        return updated
+
+    def validate(self) -> None:
+        if self.search_context_size not in SUPPORTED_OPENAI_WEB_SEARCH_CONTEXT_SIZE:
+            raise AgentRuntimeError("OpenAI web search context size is not supported")
+        if self.allowed_domains and self.blocked_domains:
+            raise AgentRuntimeError("OpenAI web search cannot set both allowed_domains and blocked_domains")
+        for label, domains in (
+            ("allowed_domains", self.allowed_domains),
+            ("blocked_domains", self.blocked_domains),
+        ):
+            if len(domains) > 100:
+                raise AgentRuntimeError(f"OpenAI web search {label} supports at most 100 domains")
+            for domain in domains:
+                _validate_web_search_domain(domain, field_name=label)
+
+    def tool_payload(self) -> dict[str, Any]:
+        tool: dict[str, Any] = {
+            "type": "web_search",
+            "search_context_size": self.search_context_size,
+            "external_web_access": self.external_web_access,
+        }
+        if self.allowed_domains:
+            tool["filters"] = {"allowed_domains": list(self.allowed_domains)}
+        elif self.blocked_domains:
+            tool["filters"] = {"blocked_domains": list(self.blocked_domains)}
+        return tool
+
+
+def _validate_web_search_domain(domain: str, *, field_name: str) -> None:
+    value = str(domain or "").strip().lower()
+    if not value:
+        raise AgentRuntimeError(f"OpenAI web search {field_name} includes an empty domain")
+    if "://" in value or "/" in value or "?" in value or "#" in value:
+        raise AgentRuntimeError(f"OpenAI web search {field_name} must contain bare domains only")
+    if len(value) > 253 or not re.fullmatch(r"[a-z0-9*.-]+", value):
+        raise AgentRuntimeError(f"OpenAI web search {field_name} includes an invalid domain")
+
+
+@dataclass(frozen=True)
 class OpenAIProviderConfig:
     """OpenAI Responses API settings for advisory assistant turns."""
 
@@ -202,6 +355,7 @@ class OpenAIProviderConfig:
     reasoning_effort: str = DEFAULT_OPENAI_REASONING_EFFORT
     text_verbosity: str = DEFAULT_OPENAI_TEXT_VERBOSITY
     store: bool = False
+    web_search: OpenAIWebSearchConfig = field(default_factory=OpenAIWebSearchConfig)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, object] | None) -> "OpenAIProviderConfig":
@@ -216,6 +370,9 @@ class OpenAIProviderConfig:
             max_output_tokens=int(values.get("max_output_tokens") or DEFAULT_OPENAI_MAX_OUTPUT_TOKENS),
             reasoning_effort=str(values.get("reasoning_effort") or DEFAULT_OPENAI_REASONING_EFFORT).strip().lower(),
             text_verbosity=str(values.get("text_verbosity") or DEFAULT_OPENAI_TEXT_VERBOSITY).strip().lower(),
+            web_search=OpenAIWebSearchConfig.from_mapping(
+                values.get("web_search") if isinstance(values.get("web_search"), Mapping) else None
+            ),
         )
         return config.with_env_overrides()
 
@@ -230,6 +387,7 @@ class OpenAIProviderConfig:
             or self.reasoning_effort,
             text_verbosity=os.environ.get(OPENAI_TEXT_VERBOSITY_ENV, self.text_verbosity).strip().lower()
             or self.text_verbosity,
+            web_search=self.web_search.with_env_overrides(),
         )
         updated.validate()
         return updated
@@ -255,6 +413,7 @@ class OpenAIProviderConfig:
             raise AgentRuntimeError("OpenAI assistant text_verbosity is not supported")
         if self.store is not False:
             raise AgentRuntimeError("OpenAI assistant store is fixed false in this slice")
+        self.web_search.validate()
 
     def read_api_key(self) -> str:
         if not self.api_key_file:
@@ -854,7 +1013,14 @@ class OpenAIResponsesAssistantAdapter:
     def __init__(self, *, config: AssistantConfig):
         self.config = config
 
-    def generate(self, *, message: str, context_documents: tuple[AssistantContextDocument, ...]) -> AssistantTurnResult:
+    def generate(
+        self,
+        *,
+        message: str,
+        context_documents: tuple[AssistantContextDocument, ...],
+        language_profile: LanguageProfile | None = None,
+        enable_web_search: bool = False,
+    ) -> AssistantTurnResult:
         mock_adapter = MockAssistantAdapter(config=self.config)
         sensitive_input_terms = mock_adapter._sensitive_input_terms(message)
         blocked_intents = tuple(sorted(set(mock_adapter._blocked_intents(message) + sensitive_input_terms)))
@@ -866,9 +1032,15 @@ class OpenAIResponsesAssistantAdapter:
                 sensitive_input_terms=sensitive_input_terms,
             )
 
-        request_payload = self._request_payload(message=message, context_documents=context_documents)
+        request_payload = self._request_payload(
+            message=message,
+            context_documents=context_documents,
+            language_profile=language_profile,
+            enable_web_search=enable_web_search,
+        )
         response_payload = self._post_response(request_payload, api_key=self.config.openai.read_api_key())
         content = self._extract_response_text(response_payload)
+        web_search_used = _response_used_web_search(response_payload)
 
         return AssistantTurnResult(
             id=f"turn-{uuid.uuid4().hex}",
@@ -881,7 +1053,11 @@ class OpenAIResponsesAssistantAdapter:
             blocked_intents=(),
             safety_notes=(
                 "No tool execution was attempted.",
-                "OpenAI Responses API was called with tools disabled and store=false.",
+                (
+                    "OpenAI Responses API was called with web_search enabled, citations preserved, and store=false."
+                    if web_search_used
+                    else "OpenAI Responses API was called with tools disabled and store=false."
+                ),
                 "No direct drone API or raw GCS command was exposed.",
             ),
         )
@@ -929,15 +1105,26 @@ class OpenAIResponsesAssistantAdapter:
         *,
         message: str,
         context_documents: tuple[AssistantContextDocument, ...],
+        language_profile: LanguageProfile | None = None,
+        enable_web_search: bool = False,
     ) -> dict[str, Any]:
         context_blocks = self._context_blocks(context_documents)
+        provider_message = _provider_message_with_language_guidance(message, language_profile)
         try:
             input_text = self.config.provider_input_template.format(
-                message=message,
+                message=provider_message,
                 context_blocks=context_blocks,
             )
         except KeyError as exc:
             raise AgentRuntimeError("assistant provider_input_template has an unknown placeholder") from exc
+
+        tools: list[dict[str, Any]] = []
+        tool_choice: str = "none"
+        include: list[str] = []
+        if enable_web_search:
+            tools = [self.config.openai.web_search.tool_payload()]
+            tool_choice = "required"
+            include = ["web_search_call.action.sources"]
 
         return {
             "model": self.config.openai.model,
@@ -950,12 +1137,14 @@ class OpenAIResponsesAssistantAdapter:
                 "verbosity": self.config.openai.text_verbosity,
             },
             "store": False,
-            "tools": [],
-            "tool_choice": "none",
+            "include": include,
+            "tools": tools,
+            "tool_choice": tool_choice,
             "parallel_tool_calls": False,
             "metadata": {
                 "mds_component": "simurgh_operator",
                 "mds_execution": "none",
+                "mds_web_search": "enabled" if enable_web_search else "disabled",
             },
         }
 
@@ -1005,9 +1194,10 @@ class OpenAIResponsesAssistantAdapter:
         if error:
             raise AgentRuntimeError("OpenAI assistant response returned an error")
         self._reject_non_text_outputs(payload)
+        citations = _url_citations_from_response(payload)
         output_text = payload.get("output_text")
         if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
+            return _append_citation_sources(output_text.strip(), citations)
 
         parts: list[str] = []
         for item in payload.get("output") or ():
@@ -1023,13 +1213,15 @@ class OpenAIResponsesAssistantAdapter:
         text = "\n".join(parts).strip()
         if not text:
             raise AgentRuntimeError("OpenAI assistant response did not include output text")
-        return text
+        return _append_citation_sources(text, citations)
 
     def _reject_non_text_outputs(self, payload: Mapping[str, Any]) -> None:
         for item in payload.get("output") or ():
             if not isinstance(item, dict):
                 raise AgentRuntimeError("OpenAI assistant response included an invalid output item")
             item_type = item.get("type")
+            if item_type in {"reasoning", "web_search_call"}:
+                continue
             if item_type != "message":
                 raise AgentRuntimeError("OpenAI assistant response included non-text output")
             for content in item.get("content") or ():
@@ -1053,19 +1245,603 @@ def _safe_assistant_session_metadata(metadata: Mapping[str, object] | None) -> d
     return safe
 
 
+def _context_bytes(documents: tuple[AssistantContextDocument, ...]) -> int:
+    return sum(len(document.text.encode("utf-8")) for document in documents)
+
+
+def _retrieved_context_documents(
+    *,
+    query_plan: AssistantQueryPlan,
+    existing_documents: tuple[AssistantContextDocument, ...],
+) -> tuple[AssistantContextDocument, ...]:
+    """Return bounded public docs chunks for provider context assembly."""
+
+    try:
+        retriever = load_default_retriever()
+    except AgentRuntimeError:
+        return ()
+
+    search_queries = query_plan.search_queries or (query_plan.normalized_message,)
+    try:
+        ranked = search_retriever_queries(
+            retriever,
+            search_queries,
+            limit=DEFAULT_RETRIEVED_CONTEXT_LIMIT,
+            tags=query_plan.tags,
+        )
+    except AgentRuntimeError:
+        return ()
+
+    existing_ids = {document.id for document in existing_documents}
+    documents: list[AssistantContextDocument] = []
+    budget = DEFAULT_RETRIEVED_CONTEXT_BUDGET_BYTES
+    used = 0
+    for hit in ranked[: DEFAULT_RETRIEVED_CONTEXT_LIMIT * 2]:
+        chunk = hit.chunk
+        document_id = "retrieved." + re.sub(r"[^A-Za-z0-9_.:-]+", ".", chunk.id).strip(".")
+        if not document_id or document_id in existing_ids:
+            continue
+        text = _retrieved_chunk_text(
+            chunk_text=chunk.text,
+            canonical_url=chunk.canonical_url,
+            route_hint=chunk.route_hint,
+            search_query=hit.query,
+            max_chars=DEFAULT_RETRIEVED_CONTEXT_MAX_CHARS,
+        )
+        next_bytes = len(text.encode("utf-8"))
+        if used + next_bytes > budget and documents:
+            break
+        used += next_bytes
+        documents.append(
+            AssistantContextDocument(
+                id=document_id,
+                title=f"Retrieved docs: {chunk.title}" + (f" - {chunk.heading}" if chunk.heading else ""),
+                uri=chunk.canonical_url or f"mds://simurgh/docs/{chunk.id}",
+                mime_type=chunk.mime_type,
+                summary=(
+                    f"Retrieved public docs context for domain={query_plan.domain}, "
+                    f"mode={query_plan.response_mode}, score={hit.score:.1f}. {chunk.summary}"
+                ),
+                tags=tuple(dict.fromkeys(("retrieved", "rag", query_plan.domain, *chunk.tags))),
+                content_hash=chunk.content_hash,
+                text=text,
+            )
+        )
+        if len(documents) >= DEFAULT_RETRIEVED_CONTEXT_LIMIT:
+            break
+    return tuple(documents)
+
+def _retrieved_chunk_text(
+    *,
+    chunk_text: str,
+    canonical_url: str,
+    route_hint: str | None,
+    search_query: str,
+    max_chars: int,
+) -> str:
+    text = str(chunk_text or "").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n...[truncated by Simurgh retrieval context budget]"
+    lines = [f"Retrieved query: {search_query}"]
+    if canonical_url:
+        lines.append(f"Source: {canonical_url}")
+    if route_hint:
+        lines.append(f"Dashboard route: {route_hint}")
+    lines.extend(["", text])
+    return "\n".join(lines)
+
+
+def _response_used_web_search(payload: Mapping[str, Any]) -> bool:
+    return any(
+        isinstance(item, Mapping) and item.get("type") == "web_search_call"
+        for item in payload.get("output") or ()
+    )
+
+
+def _url_citations_from_response(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    citations: list[dict[str, str]] = []
+    for item in payload.get("output") or ():
+        if not isinstance(item, Mapping):
+            continue
+        for content in item.get("content") or ():
+            if isinstance(content, Mapping):
+                citations.extend(_url_citations_from_content(content))
+        citations.extend(_url_citations_from_web_search_item(item))
+    return citations
+
+
+def _url_citations_from_web_search_item(item: Mapping[str, Any]) -> list[dict[str, str]]:
+    if item.get("type") != "web_search_call":
+        return []
+    action = item.get("action")
+    if not isinstance(action, Mapping):
+        return []
+    sources = action.get("sources")
+    if not isinstance(sources, list):
+        return []
+    citations: list[dict[str, str]] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        url = str(source.get("url") or source.get("uri") or "").strip()
+        if not _safe_https_url(url):
+            continue
+        title = _citation_title_from_url(url, source.get("title") or source.get("name"))
+        citations.append({"title": title[:160], "url": url})
+    return citations
+
+
+def _url_citations_from_content(content: Mapping[str, Any]) -> list[dict[str, str]]:
+    citations: list[dict[str, str]] = []
+    for annotation in content.get("annotations") or ():
+        if not isinstance(annotation, Mapping) or annotation.get("type") != "url_citation":
+            continue
+        url = str(annotation.get("url") or "").strip()
+        if not _safe_https_url(url):
+            continue
+        title = _citation_title_from_url(url, annotation.get("title"))
+        citations.append({"title": title[:160], "url": url})
+    return citations
+
+
+def _citation_title_from_url(url: str, raw_title: object | None) -> str:
+    title = str(raw_title or "").strip()
+    if title and title.casefold() != "source":
+        return title[:160]
+    try:
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+    except ValueError:
+        host = ""
+    return host[:160] or "Source"
+
+
+def _append_citation_sources(text: str, citations: list[dict[str, str]]) -> str:
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for citation in citations:
+        url = citation.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        unique.append(citation)
+    if not unique:
+        return text
+    lines = [text.rstrip(), "", "Sources:"]
+    for citation in unique[:8]:
+        label = _markdown_link_label(citation.get("title") or "Source")
+        url = citation["url"]
+        lines.append(f"- [{label}]({url})")
+    return "\n".join(lines).strip()
+
+
+def _markdown_link_label(value: str) -> str:
+    return re.sub(r"[\[\]\n\r]+", " ", str(value or "Source")).strip()[:160] or "Source"
+
+
+def _safe_https_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def _should_enable_web_search_for_turn(
+    *,
+    config: AssistantConfig,
+    query_plan: AssistantQueryPlan,
+    normalized_message: str,
+    routing_message: str,
+    local_intent: str | None,
+) -> bool:
+    if config.provider != OPENAI_ASSISTANT_PROVIDER or not config.openai.web_search.enabled:
+        return False
+    if local_intent not in {None, "general_knowledge"}:
+        return False
+    normalized = re.sub(r"\s+", " ", (routing_message or normalized_message).casefold()).strip()
+    if not normalized:
+        return False
+    if _has_mds_private_or_state_signal(normalized):
+        return False
+    if _has_public_current_or_lookup_signal(normalized):
+        return True
+    return local_intent is None and query_plan.domain == "general" and query_plan.confidence < 0.4
+
+
+def _has_mds_private_or_state_signal(normalized: str) -> bool:
+    return _has_any_text(
+        normalized,
+        (
+            "mds",
+            "simurgh",
+            "fleet",
+            "swarm",
+            "drone show",
+            "skybrush",
+            "qgc",
+            "px4",
+            "mavlink",
+            "sys_id",
+            "telemetry",
+            "heartbeat",
+            "netbird",
+            "gcs",
+            "dashboard",
+            "sitl",
+            "logs",
+            "runtime",
+            "mcp",
+            "scout drone",
+            "drone 1",
+            "drone 2",
+            "drone 3",
+            "ip",
+            "connected",
+            "configured",
+        ),
+    )
+
+
+def _has_public_current_or_lookup_signal(normalized: str) -> bool:
+    return _has_any_text(
+        normalized,
+        (
+            "weather",
+            "forecast",
+            "today",
+            "latest",
+            "current",
+            "right now",
+            "news",
+            "internet",
+            "web search",
+            "search the web",
+            "search internet",
+            "who is",
+            "when is",
+            "where is",
+            "capital of",
+            "population of",
+            "latitude",
+            "longitude",
+            "lat long",
+            "lat lon",
+            "lat/lon",
+            "lat and long",
+            "coordinates",
+            "coordinate of",
+            "wgs84",
+            "altitude",
+            "elevation",
+            "height",
+            "how far",
+            "distance from",
+            "distance between",
+            "regulation",
+            "regulations",
+            "law",
+            "rules",
+        ),
+    )
+
+
+def _has_any_text(value: str, needles: tuple[str, ...]) -> bool:
+    for needle in needles:
+        marker = str(needle or "").strip()
+        if not marker:
+            continue
+        if re.fullmatch(r"[a-z0-9_]+", marker):
+            if re.search(rf"\b{re.escape(marker)}\b", value):
+                return True
+        elif marker in value:
+            return True
+    return False
+
+
+def _provider_message_with_language_guidance(
+    message: str,
+    language_profile: LanguageProfile | None,
+) -> str:
+    """Append safe language/tone guidance for provider turns without mutating stored prompts."""
+
+    if language_profile is None:
+        return message
+    return message + "\n\n" + provider_language_guidance(language_profile)
+
+
+def _conversation_transform_kind(message: str) -> str | None:
+    """Return the requested previous-answer transform, if the turn is referential.
+
+    This is a generic conversation-state primitive, not an MDS domain intent. It
+    prevents polite follow-ups like "can you say it in Persian" from being
+    stolen by capability or fleet routing before the provider can transform the
+    actual previous answer.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(message or "").strip().casefold())
+    if not normalized:
+        return None
+    language_markers = (
+        "persian",
+        "farsi",
+        "فارسی",
+        "français",
+        "french",
+        "spanish",
+        "español",
+        "arabic",
+        "عربی",
+        "english",
+    )
+    transform_markers = (
+        "say it in",
+        "say this in",
+        "translate",
+        "translation",
+        "same in",
+        "answer in",
+        "write it in",
+        "rewrite it in",
+        "به فارسی",
+        "فارسی بگو",
+        "فارسی بنویس",
+        "همینو فارسی",
+        "همین رو فارسی",
+        "همین را فارسی",
+        "in persian",
+        "in farsi",
+    )
+    persian_same_answer = "فارسی" in normalized and any(
+        marker in normalized for marker in ("همینو", "همین رو", "همین را", "این رو", "این را")
+    )
+    marker_transform = any(marker in normalized for marker in transform_markers) and any(
+        marker in normalized for marker in language_markers
+    )
+    if persian_same_answer or marker_transform:
+        return "translate_previous_answer"
+    if any(marker in normalized for marker in ("shorter", "more concise", "simpler", "summarize that", "summarise that")):
+        return "rewrite_previous_answer"
+    return None
+
+
+def _previous_answer_context_document(previous_answer: str) -> AssistantContextDocument:
+    content = str(previous_answer or "").strip()
+    return AssistantContextDocument(
+        id="session.previous_assistant_answer",
+        title="Previous Simurgh answer in this chat",
+        uri="mds://simurgh/session/previous-assistant-answer",
+        mime_type="text/markdown",
+        summary="Bounded private session context used only to transform the previous answer for the current operator.",
+        tags=("session", "conversation", "previous-answer"),
+        content_hash=stable_payload_hash({"previous_assistant_answer": content}),
+        text=content[:DEFAULT_RETRIEVED_CONTEXT_MAX_CHARS],
+    )
+
+
+def _previous_answer_transform_message(*, operator_message: str, transform_kind: str) -> str:
+    return "\n".join(
+        [
+            f"Operator follow-up: {operator_message}",
+            f"Conversation task: {transform_kind}.",
+            "Use the context document `session.previous_assistant_answer` as the source answer.",
+            "Do not retrieve new facts, do not change numbers/IPs/routes/safety caveats, and do not claim any action was executed.",
+            "Return only the transformed answer in the operator-requested language or style.",
+        ]
+    )
+
+
+def _read_only_tool_evidence_context_document(
+    *,
+    tool_intent: str,
+    tool_ids: list[str],
+    response_mode: str,
+    content: str,
+) -> AssistantContextDocument:
+    evidence = str(content or "").strip()
+    intent = str(tool_intent or "read_only_mds_tool").strip() or "read_only_mds_tool"
+    mode = str(response_mode or "status").strip() or "status"
+    tool_ids_text = ", ".join(tool_ids) or "none"
+    return AssistantContextDocument(
+        id="session.read_only_mds_evidence",
+        title="Read-only MDS evidence for this assistant turn",
+        uri="mds://simurgh/session/read-only-mds-evidence",
+        mime_type="text/markdown",
+        summary=(
+            "Authoritative read-only GCS/MDS tool result selected by the Simurgh policy layer. "
+            f"intent={intent}; response_mode={mode}; tool_ids={tool_ids_text}."
+        ),
+        tags=("session", "tool-evidence", "read-only", intent),
+        content_hash=stable_payload_hash(
+            {
+                "tool_intent": intent,
+                "tool_ids": tool_ids,
+                "response_mode": response_mode,
+                "content": evidence,
+            }
+        ),
+        text=evidence[:DEFAULT_RETRIEVED_CONTEXT_BUDGET_BYTES],
+    )
+
+
+def _provider_tool_composition_message(
+    *,
+    operator_message: str,
+    tool_intent: str,
+    response_mode: str,
+) -> str:
+    intent_label = tool_intent or "unknown"
+    response_mode_label = response_mode or "status"
+    return "\n".join(
+        [
+            f"Operator message: {operator_message}",
+            "Conversation task: answer naturally using the read-only MDS evidence context.",
+            f"Read-only tool intent: {intent_label}.",
+            f"Response mode: {response_mode_label}.",
+            "Use `session.read_only_mds_evidence` as authoritative. Preserve exact counts, IPs, routes, URLs, modes, times, coordinates, safety caveats, and no-action statements from that evidence.",
+            "Do not invent live state, do not call or imply any action, and do not add unsupported claims. If the user is asking a short follow-up, answer the follow-up directly instead of repeating the whole evidence dump.",
+            "Prefer a concise ChatGPT-style answer: short direct verdict first, then only the useful details. Keep Markdown tables/lists only when they improve scanability.",
+        ]
+    )
+
+
+def _safe_provider_composition_error(exc: Exception) -> str:
+    message = str(exc or "").strip()
+    if not message:
+        return "provider-composition-failed"
+    return re.sub(r"[^A-Za-z0-9 .:_/-]+", "", message)[:160]
+
+
+def _looks_like_public_geography_frame_reply(message: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(message or "").strip().casefold())
+    if not normalized or len(normalized) > 140:
+        return False
+    return _has_any_text(
+        normalized,
+        (
+            "yes",
+            "yeah",
+            "ok",
+            "correct",
+            "meter",
+            "meters",
+            "metre",
+            "metres",
+            "wgs84",
+            "decimal degree",
+            "decimal degrees",
+            "altitude",
+            "elevation",
+            "msl",
+            "asl",
+            "above sea level",
+        ),
+    )
+
+
+def _frame_bound_routing_message(
+    *,
+    routing_message: str,
+    original_message: str,
+    conversation_topic: str,
+    previous_context: Mapping[str, str],
+) -> str:
+    """Bind very short slot-filling replies to the active task frame.
+
+    This is the missing state layer that prevents a reply like "yes, WGS84 and
+    meters" from being interpreted against an older swarm/fleet topic. It only
+    rewrites the internal routing text; the provider still sees the original
+    user message and the final answer is based on retrieved evidence.
+    """
+
+    if conversation_topic != "public_geography":
+        return routing_message
+    if _conversation_transform_kind(original_message):
+        return routing_message
+    if not _looks_like_public_geography_frame_reply(original_message):
+        return routing_message
+    previous_question = (
+        previous_context.get("last_routing_message")
+        or previous_context.get("last_user_message")
+        or ""
+    ).strip()
+    if not previous_question:
+        return routing_message
+    return f"{previous_question}\nFollow-up answer from operator: {routing_message}"
+
+
+def _provider_failure_turn(
+    *,
+    exc: Exception,
+    config: AssistantConfig,
+    context_documents: tuple[AssistantContextDocument, ...],
+    local_fallback: MdsReadToolAnswer | None = None,
+) -> AssistantTurnResult:
+    safe_error = _safe_provider_composition_error(exc)
+    if local_fallback is not None:
+        content = "\n\n".join(
+            (
+                local_fallback.content,
+                "Provider note: external model/search composition was unavailable for this turn, so Simurgh returned the deterministic read-only evidence instead of a raw transport failure.",
+            )
+        )
+        return AssistantTurnResult(
+            id=f"turn-{uuid.uuid4().hex}",
+            created_at=utc_now().isoformat(),
+            provider=READ_TOOL_PROVIDER,
+            model=READ_TOOL_MODEL,
+            adapter_version=READ_TOOL_ADAPTER_VERSION,
+            content=content,
+            context_documents=context_documents,
+            blocked_intents=(),
+            safety_notes=(
+                "External assistant provider failed after routing; deterministic local read-only evidence was returned.",
+                f"Provider failure class: {safe_error or provider-unavailable}.",
+                "No direct drone API, raw command, GCS mutation, or mission action was exposed.",
+            ),
+        )
+    content = (
+        "I could not reach the external assistant provider/search service for that turn. "
+        "The chat state was kept, and no GCS mutation or drone command was attempted. "
+        "Please retry, or ask for an MDS read-only status/tool answer that can be resolved locally."
+    )
+    return AssistantTurnResult(
+        id=f"turn-{uuid.uuid4().hex}",
+        created_at=utc_now().isoformat(),
+        provider=config.provider,
+        model=config.openai.model if config.provider == OPENAI_ASSISTANT_PROVIDER else MOCK_ASSISTANT_MODEL,
+        adapter_version="provider-fallback-v1",
+        content=content,
+        context_documents=context_documents,
+        blocked_intents=(),
+        safety_notes=(
+            "External assistant provider failed; Simurgh returned a bounded fallback instead of exposing raw transport errors.",
+            f"Provider failure class: {safe_error or provider-unavailable}.",
+            "No direct drone API, raw command, GCS mutation, or mission action was exposed.",
+        ),
+    )
+
+
+def _is_provider_runtime_recoverable(exc: Exception) -> bool:
+    """Return whether a provider error should become a chat fallback.
+
+    Configuration errors, schema violations, unsafe tool outputs, and unsupported
+    provider behavior should still fail tests loudly. Transport/service failures
+    should not surface to operators as raw network errors.
+    """
+
+    message = str(exc or "").casefold()
+    return any(
+        marker in message
+        for marker in (
+            "network",
+            "timeout",
+            "timed out",
+            "connection",
+            "request failed",
+            "rate limit",
+            "service unavailable",
+            "temporarily unavailable",
+            "bad gateway",
+            "gateway timeout",
+        )
+    )
+
+
 def create_assistant_turn(
     *,
     sessions: AgentSessionStore,
     audit: InMemoryAuditSink,
     actor: str,
     message: str,
+    deps: Any | None = None,
     session_id: str | None = None,
     mode: str | None = None,
     context_resource_ids: tuple[str, ...] | None = None,
     metadata: Mapping[str, object] | None = None,
     force_provider: str | None = None,
+    allow_provider_for_local_tools: bool = False,
 ) -> AssistantTurnRecord:
-    """Create one assistant turn without executing tools."""
+    """Create one assistant turn without command or mutation execution."""
 
     policy = load_default_policy()
     if not policy.agent_enabled:
@@ -1084,6 +1860,8 @@ def create_assistant_turn(
     if len(normalized_message) > config.max_message_chars:
         raise AgentRuntimeError("assistant message exceeds max_message_chars")
 
+    language_profile = detect_language_profile(normalized_message)
+
     if session_id:
         session = sessions.require(session_id)
         if session.closed:
@@ -1101,10 +1879,242 @@ def create_assistant_turn(
         )
 
     context_documents = AssistantContextAssembler(config=config).assemble(context_resource_ids)
-    turn = _adapter_for_config(config).generate(
-        message=normalized_message,
-        context_documents=context_documents,
+    previous_context = sessions.get_private_context(session.id)
+    conversation_topic = str(session.metadata.get("last_domain") or previous_context.get("last_domain") or "")
+    query_adaptation = adapt_operator_query(
+        normalized_message,
+        language_profile=language_profile,
+        conversation_topic=conversation_topic,
     )
+    routing_message = query_adaptation.routing_text or normalized_message
+    routing_message = _frame_bound_routing_message(
+        routing_message=routing_message,
+        original_message=normalized_message,
+        conversation_topic=conversation_topic,
+        previous_context=previous_context,
+    )
+    query_plan = build_assistant_query_plan(routing_message, conversation_topic=conversation_topic)
+    retrieved_context_count = 0
+    blocked_matches = tuple(
+        sorted(
+            set(
+                blocked_intent_matches(config, normalized_message)
+                + blocked_intent_matches(config, routing_message)
+            )
+        )
+    )
+    sensitive_matches = tuple(
+        sorted(
+            set(
+                sensitive_input_matches(config, normalized_message)
+                + sensitive_input_matches(config, routing_message)
+            )
+        )
+    )
+    local_intent = None
+    tool_result = None
+    tool_intent = None
+    tool_response_mode = None
+    tool_ids: list[str] = []
+    web_search_enabled_for_turn = False
+    provider_composed_from_tool = False
+    provider_composition_error = ""
+    transform_kind = _conversation_transform_kind(routing_message)
+    transform_answer = previous_context.get("last_assistant_content") if transform_kind else ""
+    if force_provider is None and transform_kind and transform_answer and not blocked_matches and not sensitive_matches:
+        adapter = _adapter_for_config(config)
+        if isinstance(adapter, OpenAIResponsesAssistantAdapter):
+            previous_document = _previous_answer_context_document(transform_answer)
+            context_documents = (*context_documents, previous_document)
+            retrieved_context_count = 1
+            try:
+                turn = adapter.generate(
+                    message=_previous_answer_transform_message(
+                        operator_message=normalized_message,
+                        transform_kind=transform_kind,
+                    ),
+                    context_documents=context_documents,
+                    language_profile=language_profile,
+                )
+            except AgentRuntimeError as exc:
+                if not _is_provider_runtime_recoverable(exc):
+                    raise
+                turn = _provider_failure_turn(
+                    exc=exc,
+                    config=config,
+                    context_documents=context_documents,
+                )
+            tool_intent = "conversation_transform"
+            tool_response_mode = "transform"
+        else:
+            tool_result = None
+
+    if force_provider is None and tool_intent is None:
+        local_intent = classify_mds_read_intent(routing_message, conversation_topic=conversation_topic)
+        if not blocked_matches and not sensitive_matches:
+            web_search_enabled_for_turn = _should_enable_web_search_for_turn(
+                config=config,
+                query_plan=query_plan,
+                normalized_message=normalized_message,
+                routing_message=routing_message,
+                local_intent=local_intent,
+            )
+        safe_read_only_blocked_term = is_safe_blocked_term_read_only_intent(routing_message, local_intent)
+        if not web_search_enabled_for_turn and local_intent is not None and (
+            local_intent == "action_capability"
+            or (not sensitive_matches and (not blocked_matches or safe_read_only_blocked_term))
+        ):
+            tool_arguments = {"question": routing_message}
+            if conversation_topic:
+                tool_arguments["conversation_topic"] = conversation_topic
+            tool_result = execute_policy_allowed_advisory_tool(
+                name=ADVISORY_ANSWER_TOOL_ID,
+                arguments=tool_arguments,
+                channel="agent",
+                deps=deps,
+                policy=policy,
+            )
+            if tool_result.is_error:
+                tool_result = None
+
+    if tool_intent == "conversation_transform":
+        pass
+    elif tool_result is not None:
+        structured = tool_result.structured_content if isinstance(tool_result.structured_content, Mapping) else {}
+        raw_safety_notes = structured.get("safety_notes") if isinstance(structured, Mapping) else None
+        safety_notes = tuple(str(note) for note in raw_safety_notes) if isinstance(raw_safety_notes, list) else (
+            "Read-only Simurgh advisory registry tool was executed.",
+            "No direct drone API or raw GCS command was exposed.",
+        )
+        tool_intent = structured.get("intent") if isinstance(structured, Mapping) else None
+        raw_tool_ids = structured.get("tool_ids") if isinstance(structured, Mapping) else None
+        tool_ids = [str(tool_id) for tool_id in raw_tool_ids] if isinstance(raw_tool_ids, list) else []
+        tool_response_mode = structured.get("response_mode") if isinstance(structured, Mapping) else None
+        local_tool_turn = AssistantTurnResult(
+            id=f"turn-{uuid.uuid4().hex}",
+            created_at=utc_now().isoformat(),
+            provider=READ_TOOL_PROVIDER,
+            model=READ_TOOL_MODEL,
+            adapter_version=READ_TOOL_ADAPTER_VERSION,
+            content=tool_result.text,
+            context_documents=context_documents,
+            blocked_intents=(),
+            safety_notes=safety_notes,
+        )
+        turn = local_tool_turn
+        if (
+            allow_provider_for_local_tools
+            and config.provider == OPENAI_ASSISTANT_PROVIDER
+            and not blocked_matches
+            and not sensitive_matches
+        ):
+            adapter = _adapter_for_config(config)
+            if isinstance(adapter, OpenAIResponsesAssistantAdapter):
+                evidence_document = _read_only_tool_evidence_context_document(
+                    tool_intent=str(tool_intent or ""),
+                    tool_ids=tool_ids,
+                    response_mode=str(tool_response_mode or query_plan.response_mode),
+                    content=local_tool_turn.content,
+                )
+                provider_context_documents = (*context_documents, evidence_document)
+                try:
+                    provider_turn = adapter.generate(
+                        message=_provider_tool_composition_message(
+                            operator_message=normalized_message,
+                            tool_intent=str(tool_intent or ""),
+                            response_mode=str(tool_response_mode or query_plan.response_mode),
+                        ),
+                        context_documents=provider_context_documents,
+                        language_profile=language_profile,
+                    )
+                    turn = replace(
+                        provider_turn,
+                        context_documents=provider_context_documents,
+                        safety_notes=(
+                            "Read-only Simurgh advisory registry tool was executed before provider composition.",
+                            "OpenAI Responses API composed the final text from bounded read-only MDS evidence with store=false.",
+                            "No direct drone API, MAVSDK command, raw GCS command, or mission mutation was exposed.",
+                        ),
+                    )
+                    context_documents = provider_context_documents
+                    retrieved_context_count += 1
+                    provider_composed_from_tool = True
+                except AgentRuntimeError as exc:
+                    provider_composition_error = _safe_provider_composition_error(exc)
+    else:
+        if (
+            config.provider != "mock"
+            and not web_search_enabled_for_turn
+            and query_plan.domain != "general"
+            and not blocked_matches
+            and not sensitive_matches
+        ):
+            retrieved_documents = _retrieved_context_documents(
+                query_plan=query_plan,
+                existing_documents=context_documents,
+            )
+            if retrieved_documents:
+                context_documents = (*context_documents, *retrieved_documents)
+                retrieved_context_count = len(retrieved_documents)
+        adapter = _adapter_for_config(config)
+        if isinstance(adapter, OpenAIResponsesAssistantAdapter):
+            try:
+                turn = adapter.generate(
+                    message=normalized_message,
+                    context_documents=context_documents,
+                    language_profile=language_profile,
+                    enable_web_search=web_search_enabled_for_turn,
+                )
+            except AgentRuntimeError as exc:
+                if not _is_provider_runtime_recoverable(exc):
+                    raise
+                local_fallback = None
+                if not blocked_matches and not sensitive_matches:
+                    local_fallback = answer_mds_read_only_question(
+                        routing_message,
+                        deps=deps,
+                        conversation_topic=conversation_topic,
+                    )
+                turn = _provider_failure_turn(
+                    exc=exc,
+                    config=config,
+                    context_documents=context_documents,
+                    local_fallback=local_fallback,
+                )
+        else:
+            turn = adapter.generate(
+                message=normalized_message,
+                context_documents=context_documents,
+            )
+
+    final_response_mode = str(tool_response_mode or query_plan.response_mode)
+    next_topic = infer_mds_read_topic(routing_message, intent=str(tool_intent or local_intent or ""))
+    if not next_topic and query_plan.domain == "general":
+        next_topic = query_plan.domain
+    if next_topic:
+        session = sessions.update_metadata(
+            session.id,
+            {
+                "last_domain": next_topic,
+                "last_intent": str(tool_intent or local_intent or ""),
+                "last_response_mode": final_response_mode,
+            },
+        )
+    sessions.update_private_context(
+        session.id,
+        {
+            "last_assistant_content": turn.content,
+            "last_assistant_provider": turn.provider,
+            "last_assistant_model": turn.model,
+            "last_domain": str(next_topic or session.metadata.get("last_domain") or ""),
+            "last_intent": str(tool_intent or local_intent or session.metadata.get("last_intent") or ""),
+            "last_response_mode": final_response_mode,
+            "last_user_message": normalized_message,
+            "last_routing_message": routing_message,
+            "last_tool_intent": str(tool_intent or local_intent or ""),
+        },
+    )
+
     event = audit.record(
         "assistant_turn_created",
         session_id=session.id,
@@ -1122,6 +2132,27 @@ def create_assistant_turn(
             "mode": session.mode,
             "context_count": len(context_documents),
             "blocked_intent_count": len(turn.blocked_intents),
+            "tool_intent": tool_intent,
+            "tool_id": ADVISORY_ANSWER_TOOL_ID if tool_result is not None else None,
+            "tool_ids": tool_ids,
+            "response_mode": final_response_mode,
+            "query_domain": query_plan.domain,
+            "query_confidence": round(float(query_plan.confidence), 3),
+            "query_unclear": query_plan.unclear,
+            "query_reason": query_plan.reason,
+            "retrieved_context_count": retrieved_context_count,
+            "web_search_enabled": web_search_enabled_for_turn,
+            "provider_composed_from_tool": provider_composed_from_tool,
+            "provider_composition_error": provider_composition_error,
+            "query_adaptation": query_adaptation.public_metadata(),
+            "routing_strategy": query_adaptation.strategy,
+            "routing_language": query_adaptation.routing_language,
+            "routing_rule_count": len(query_adaptation.applied_rules),
+            "language_profile": language_profile.public_metadata(),
+            "input_language": language_profile.language,
+            "input_script": language_profile.script,
+            "input_tone": language_profile.tone,
+            "localization_strategy": language_profile.localization_strategy,
         },
     )
     return AssistantTurnRecord(session=session, turn=turn, audit_event=event)
@@ -1133,6 +2164,7 @@ def create_mock_assistant_turn(
     audit: InMemoryAuditSink,
     actor: str,
     message: str,
+    deps: Any | None = None,
     session_id: str | None = None,
     mode: str | None = None,
     context_resource_ids: tuple[str, ...] | None = None,
@@ -1145,6 +2177,7 @@ def create_mock_assistant_turn(
         audit=audit,
         actor=actor,
         message=message,
+        deps=deps,
         session_id=session_id,
         mode=mode,
         context_resource_ids=context_resource_ids,

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from src.settings.runtime import resolve_runtime_mode
+from agent_runtime.tool_executor import execute_policy_allowed_read_only_tool, list_policy_allowed_read_only_tools
 
 from agent_runtime import (
     AgentRuntimeError,
@@ -20,9 +22,11 @@ from agent_runtime import (
     InMemoryAuditSink,
     MCP_ENDPOINT_PATH,
     MCP_PROTOCOL_VERSION,
+    MCP_RESOURCE_PREFIX,
     PolicyDecisionStatus,
     SimurghMcpResourceProvider,
     ToolExposure,
+    blocked_intent_matches,
     create_assistant_turn,
     is_mcp_auth_required,
     is_mcp_origin_allowed,
@@ -36,8 +40,19 @@ from agent_runtime import (
     mcp_server_info,
     mcp_server_instructions,
     require_mcp_runtime_enabled,
+    sensitive_input_matches,
+)
+from agent_runtime.mds_read_tools import (
+    apply_runtime_settings,
+    build_provider_credentials_payload,
+    build_runtime_settings_payload,
+    classify_mds_read_intent,
+    delete_provider_credentials,
+    update_provider_credentials,
 )
 from agent_runtime.models import AgentSession, AuditEvent, ContextResource, ToolDefinition
+from agent_runtime.query_adaptation import normalize_operator_query_text
+from agent_runtime.tool_candidates import candidate_review_payload, load_default_tool_candidate_artifact
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +64,7 @@ JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
 JSONRPC_SERVER_ERROR = -32000
+MCP_PROMPT_COMPARE_MISSION_MODES = "mds.compare_mission_modes"
 MAX_ASSISTANT_METADATA_BYTES = 4096
 MAX_ASSISTANT_CONTEXT_RESOURCE_IDS = 12
 MAX_ASSISTANT_HISTORY_LIMIT = 100
@@ -86,6 +102,34 @@ class SimurghToolListResponse(BaseModel):
     tools: list[SimurghToolResponse]
 
 
+class SimurghToolCandidateResponse(BaseModel):
+    id: str
+    review_status: str
+    callable: bool
+    source: dict[str, Any]
+    classification: dict[str, Any]
+    has_request_body: bool
+    parameter_count: int
+    promoted: bool
+    promoted_tools: list[dict[str, Any]]
+
+
+class SimurghToolCandidateReviewResponse(BaseModel):
+    schema_version: int
+    artifact: str
+    artifact_path: str
+    source: dict[str, Any]
+    policy: dict[str, Any]
+    summary: dict[str, Any]
+    candidate_count: int
+    filtered_count: int
+    returned_count: int
+    offset: int
+    limit: int
+    filters: dict[str, Any]
+    candidates: list[SimurghToolCandidateResponse]
+
+
 class SimurghRuntimeModePolicyResponse(BaseModel):
     allowed_risks: list[str]
     denied_risks: list[str]
@@ -99,7 +143,8 @@ class SimurghPolicyResponse(BaseModel):
     mode: str
     action_circuit_breaker_enabled: bool
     always_confirm_before_action: bool
-    real_commands_enabled: bool
+    actions_blocked: bool
+    action_policy_source: str
     allow_drone_api_exposure: bool
     unknown_tool_policy: str
     approval_ttl_seconds: int
@@ -115,7 +160,8 @@ class SimurghStatusResponse(BaseModel):
     mode: str
     action_circuit_breaker_enabled: bool
     always_confirm_before_action: bool
-    real_commands_enabled: bool
+    actions_blocked: bool
+    action_policy_source: str
     tool_registry_version: int
     tool_count: int
     allowed_tool_count: int
@@ -202,6 +248,28 @@ class SimurghAssistantTurnRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class SimurghRuntimeSettingsRequest(BaseModel):
+    agent_enabled: bool | None = None
+    mcp_enabled: bool | None = None
+    action_circuit_breaker_enabled: bool | None = None
+    always_confirm_before_action: bool | None = None
+    provider: str | None = None
+    model: str | None = None
+    openai_model: str | None = None
+    web_search_enabled: bool | None = None
+    dry_run: bool = False
+
+
+class SimurghProviderCredentialsRequest(BaseModel):
+    openai_api_key: str = Field(min_length=20, max_length=4096)
+    set_provider_openai: bool = False
+    openai_model: str | None = None
+
+
+class SimurghProviderCredentialsDeleteRequest(BaseModel):
+    openai_api_key_file: str | None = None
+
+
 class SimurghAssistantContextResponse(BaseModel):
     id: str
     title: str
@@ -210,6 +278,20 @@ class SimurghAssistantContextResponse(BaseModel):
     summary: str
     tags: list[str]
     content_hash: str
+
+
+class SimurghAssistantTurnTraceResponse(BaseModel):
+    schema_version: int = 1
+    provider: str | None = None
+    model: str | None = None
+    adapter_version: str | None = None
+    session: dict[str, Any] = Field(default_factory=dict)
+    language: dict[str, Any] = Field(default_factory=dict)
+    adaptation: dict[str, Any] = Field(default_factory=dict)
+    query: dict[str, Any] = Field(default_factory=dict)
+    tool: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+    safety: dict[str, Any] = Field(default_factory=dict)
 
 
 class SimurghAssistantTurnResponse(BaseModel):
@@ -228,6 +310,7 @@ class SimurghAssistantTurnResponse(BaseModel):
     blocked_intents: list[str]
     safety_notes: list[str]
     audit_event_id: str
+    trace: SimurghAssistantTurnTraceResponse = Field(default_factory=SimurghAssistantTurnTraceResponse)
 
 
 class SimurghAssistantTurnHistoryResponse(BaseModel):
@@ -322,6 +405,47 @@ def _assistant_context_history_response(payload: dict[str, Any]) -> SimurghAssis
     return SimurghAssistantContextResponse(**payload)
 
 
+def _assistant_trace_response(record) -> SimurghAssistantTurnTraceResponse:
+    """Return sanitized orchestration trace metadata for PM/test inspection."""
+
+    metadata = dict(record.audit_event.metadata or {})
+    language = metadata.get("language_profile") if isinstance(metadata.get("language_profile"), dict) else {}
+    adaptation = metadata.get("query_adaptation") if isinstance(metadata.get("query_adaptation"), dict) else {}
+    return SimurghAssistantTurnTraceResponse(
+        provider=record.turn.provider,
+        model=record.turn.model,
+        adapter_version=record.turn.adapter_version,
+        session={
+            "id": record.session.id,
+            "mode": record.session.mode,
+            "topic": str(record.session.metadata.get("last_domain") or ""),
+        },
+        language=dict(language),
+        adaptation=dict(adaptation),
+        query={
+            "domain": metadata.get("query_domain"),
+            "confidence": metadata.get("query_confidence"),
+            "unclear": metadata.get("query_unclear"),
+            "reason": metadata.get("query_reason"),
+            "response_mode": metadata.get("response_mode"),
+        },
+        tool={
+            "id": metadata.get("tool_id"),
+            "intent": metadata.get("tool_intent"),
+            "ids": metadata.get("tool_ids") or [],
+        },
+        context={
+            "resource_count": metadata.get("context_count"),
+            "retrieved_context_count": metadata.get("retrieved_context_count"),
+        },
+        safety={
+            "blocked_intent_count": metadata.get("blocked_intent_count"),
+            "action_execution": "none",
+            "circuit_breaker_layer": "final-action layer; no action tool was invoked for this turn",
+        },
+    )
+
+
 def _assistant_history_response(record: AssistantTurnHistoryRecord) -> SimurghAssistantTurnHistoryResponse:
     return SimurghAssistantTurnHistoryResponse(
         id=record.id,
@@ -341,6 +465,51 @@ def _assistant_history_response(record: AssistantTurnHistoryRecord) -> SimurghAs
         message_hash=record.message_hash,
         message_chars=record.message_chars,
     )
+
+
+def _assistant_turn_response_model(record, history_record: AssistantTurnHistoryRecord) -> SimurghAssistantTurnResponse:
+    return SimurghAssistantTurnResponse(
+        id=record.turn.id,
+        created_at=record.turn.created_at,
+        provider=record.turn.provider,
+        model=history_record.model,
+        adapter_version=history_record.adapter_version,
+        session=_session_response(record.session),
+        actor=history_record.actor,
+        mode=history_record.mode,
+        message_hash=history_record.message_hash,
+        message_chars=history_record.message_chars,
+        content=record.turn.content,
+        context_resources=[
+            _assistant_context_response(document) for document in record.turn.context_documents
+        ],
+        blocked_intents=list(record.turn.blocked_intents),
+        safety_notes=list(record.turn.safety_notes),
+        audit_event_id=record.audit_event.id,
+        trace=_assistant_trace_response(record),
+    )
+
+
+def _assistant_turn_response_payload(record, history_record: AssistantTurnHistoryRecord) -> dict[str, Any]:
+    response = _assistant_turn_response_model(record, history_record)
+    if hasattr(response, "model_dump"):
+        return response.model_dump(mode="json")
+    return response.dict()
+
+
+def _assistant_sse_event(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _assistant_content_chunks(content: str, chunk_size: int = 96):
+    text = str(content or "")
+    if not text:
+        return
+    for line in text.splitlines(keepends=True):
+        while line:
+            yield line[:chunk_size]
+            line = line[chunk_size:]
 
 
 def _auth_context(request: Request) -> dict[str, Any]:
@@ -380,16 +549,8 @@ def _require_actor_access(request: Request, actor: str) -> None:
 def _require_external_assistant_provider_auth(request: Request, provider: str) -> None:
     if provider == "mock":
         return
-    context = _auth_context(request)
-    if _auth_enabled(context):
-        context_kind = str(context.get("kind") or "").lower()
-        role = str(context.get("role") or "").lower()
-        if context_kind == "session" and role in EXTERNAL_ASSISTANT_PROVIDER_SESSION_ROLES:
-            return
-        if context_kind == "bearer":
-            scopes = {str(scope).strip().lower() for scope in context.get("scopes", []) if str(scope).strip()}
-            if not scopes.isdisjoint(EXTERNAL_ASSISTANT_PROVIDER_BEARER_SCOPES):
-                return
+    if _has_external_assistant_provider_auth(request):
+        return
     raise HTTPException(
         status_code=403,
         detail=(
@@ -398,6 +559,20 @@ def _require_external_assistant_provider_auth(request: Request, provider: str) -
             "Keep MDS_AGENT_PROVIDER=mock when MDS auth is disabled."
         ),
     )
+
+
+def _has_external_assistant_provider_auth(request: Request) -> bool:
+    context = _auth_context(request)
+    if _auth_enabled(context):
+        context_kind = str(context.get("kind") or "").lower()
+        role = str(context.get("role") or "").lower()
+        if context_kind == "session" and role in EXTERNAL_ASSISTANT_PROVIDER_SESSION_ROLES:
+            return True
+        if context_kind == "bearer":
+            scopes = {str(scope).strip().lower() for scope in context.get("scopes", []) if str(scope).strip()}
+            if not scopes.isdisjoint(EXTERNAL_ASSISTANT_PROVIDER_BEARER_SCOPES):
+                return True
+    return False
 
 
 def _bounded_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -528,9 +703,140 @@ def _require_mcp_bearer_scope(request: Request, request_id: str | int | None) ->
     return None
 
 
-def _handle_mcp_jsonrpc(
+def _mcp_prompt_definitions() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": MCP_PROMPT_COMPARE_MISSION_MODES,
+            "title": "Compare MDS Mission Modes",
+            "description": (
+                "Compare QuickScout, Swarm Trajectory, and related MDS mission workflows "
+                "using static operator docs before live state."
+            ),
+            "arguments": [
+                {
+                    "name": "question",
+                    "description": "Operator wording to answer, if different from the default comparison.",
+                    "required": False,
+                }
+            ],
+            "_meta": {
+                "ai.mds/resources": [
+                    f"{MCP_RESOURCE_PREFIX}/context/mds.mission_planning_workspace",
+                    f"{MCP_RESOURCE_PREFIX}/context/mds.quickscout",
+                    f"{MCP_RESOURCE_PREFIX}/context/mds.swarm_trajectory",
+                ],
+                "ai.mds/execution": "none",
+            },
+        }
+    ]
+
+
+def _mcp_prompt_definition_names() -> set[str]:
+    return {prompt["name"] for prompt in _mcp_prompt_definitions()}
+
+
+def _mcp_embedded_context_message(
+    resources: SimurghMcpResourceProvider,
+    resource_id: str,
+) -> dict[str, Any]:
+    content = resources.read_resource(f"{MCP_RESOURCE_PREFIX}/context/{resource_id}")
+    return {
+        "role": "user",
+        "content": {
+            "type": "resource",
+            "resource": content.as_mcp_content(),
+        },
+    }
+
+
+def _mcp_get_prompt(
+    name: str,
+    *,
+    arguments: dict[str, Any],
+    resources: SimurghMcpResourceProvider,
+) -> dict[str, Any]:
+    if name not in _mcp_prompt_definition_names():
+        raise KeyError(f"unknown Simurgh MCP prompt: {name}")
+    question = str(arguments.get("question") or "Compare QuickScout and Swarm Trajectory mode.").strip()
+    if not question:
+        question = "Compare QuickScout and Swarm Trajectory mode."
+    return {
+        "description": "Compare MDS mission-planning modes from static operator documentation.",
+        "messages": [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": (
+                        f"Operator question: {question}\n\n"
+                        "Answer from the embedded MDS operator docs. Treat this as a conceptual workflow comparison. "
+                        "Do not inspect live swarm topology, telemetry, or show state unless the operator explicitly asks for current status."
+                    ),
+                },
+            },
+            _mcp_embedded_context_message(resources, "mds.mission_planning_workspace"),
+            _mcp_embedded_context_message(resources, "mds.quickscout"),
+            _mcp_embedded_context_message(resources, "mds.swarm_trajectory"),
+        ],
+    }
+
+
+def _mcp_tool_input_schema(tool: ToolDefinition) -> dict[str, Any]:
+    if tool.input_schema:
+        return dict(tool.input_schema)
+    return {"type": "object", "additionalProperties": False}
+
+
+def _mcp_tool_definition(tool: ToolDefinition) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": tool.id,
+        "title": tool.title,
+        "description": tool.description,
+        "inputSchema": _mcp_tool_input_schema(tool),
+        "annotations": {
+            "readOnlyHint": tool.read_only,
+            "destructiveHint": tool.destructive,
+            "idempotentHint": tool.read_only,
+            "openWorldHint": False,
+        },
+        "_meta": {
+            "ai.mds/risk_class": tool.risk_class.value,
+            "ai.mds/boundary": tool.boundary,
+            "ai.mds/required_role": tool.required_role,
+            "ai.mds/route": {
+                "method": tool.route_method,
+                "path": tool.route_path,
+            },
+        },
+    }
+    if tool.output_schema:
+        payload["outputSchema"] = dict(tool.output_schema)
+    return payload
+
+
+def _mcp_callable_tools() -> list[ToolDefinition]:
+    return list(list_policy_allowed_read_only_tools(channel="mcp"))
+
+
+async def _mcp_call_registry_tool(
+    request: Request,
+    *,
+    name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    result = await execute_policy_allowed_read_only_tool(
+        request,
+        name=name,
+        arguments=arguments,
+        channel="mcp",
+    )
+    return result.as_mcp_result()
+
+
+async def _handle_mcp_jsonrpc(
     message: Any,
     *,
+    request: Request,
     resources: SimurghMcpResourceProvider,
 ) -> dict[str, Any] | None:
     if isinstance(message, list):
@@ -571,13 +877,30 @@ def _handle_mcp_jsonrpc(
             request_id,
             {
                 "protocolVersion": protocol_version,
-                "capabilities": {"resources": {}},
+                "capabilities": {"prompts": {"listChanged": False}, "resources": {}, "tools": {"listChanged": False}},
                 "serverInfo": mcp_server_info(),
                 "instructions": mcp_server_instructions(),
             },
         )
     if method == "ping":
         return _mcp_result(request_id, {})
+    if method == "prompts/list":
+        return _mcp_result(request_id, {"prompts": _mcp_prompt_definitions()})
+    if method == "prompts/get":
+        name = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(name, str) or not name:
+            return _mcp_error(request_id, code=JSONRPC_INVALID_PARAMS, message="prompts/get requires params.name")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _mcp_error(request_id, code=JSONRPC_INVALID_PARAMS, message="prompts/get params.arguments must be an object")
+        try:
+            return _mcp_result(request_id, _mcp_get_prompt(name, arguments=arguments, resources=resources))
+        except KeyError as exc:
+            return _mcp_error(request_id, code=JSONRPC_INVALID_PARAMS, message=str(exc))
+        except AgentRuntimeError as exc:
+            return _mcp_error(request_id, code=JSONRPC_INTERNAL_ERROR, message=str(exc))
     if method == "resources/list":
         try:
             return _mcp_result(request_id, {"resources": resources.list_resources()})
@@ -599,10 +922,23 @@ def _handle_mcp_jsonrpc(
             return _mcp_error(request_id, code=JSONRPC_INTERNAL_ERROR, message=str(exc))
         return _mcp_result(request_id, {"contents": [content.as_mcp_content()]})
 
+    if method == "tools/list":
+        return _mcp_result(request_id, {"tools": [_mcp_tool_definition(tool) for tool in _mcp_callable_tools()]})
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(name, str) or not name:
+            return _mcp_error(request_id, code=JSONRPC_INVALID_PARAMS, message="tools/call requires params.name")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _mcp_error(request_id, code=JSONRPC_INVALID_PARAMS, message="tools/call params.arguments must be an object")
+        return _mcp_result(request_id, await _mcp_call_registry_tool(request, name=name, arguments=arguments))
+
     return _mcp_error(request_id, code=JSONRPC_METHOD_NOT_FOUND, message=f"unsupported MCP method: {method}")
 
 
-def create_simurgh_router() -> APIRouter:
+def create_simurgh_router(deps: Any | None = None) -> APIRouter:
     """Create the non-executing Simurgh GCS metadata router."""
 
     router = APIRouter(tags=["Simurgh Operator"])
@@ -632,13 +968,13 @@ def create_simurgh_router() -> APIRouter:
 
         external_provider = assistant_config.provider != "mock"
         warnings: list[str] = []
-        if policy.mode != "read_only":
+        if policy.mode != gcs_runtime.mode:
             warnings.append(
-                "Simurgh policy profile is not read_only; verify the action circuit breaker and approval policy before testing."
+                "Simurgh policy mode did not resolve to canonical MDS_MODE; verify runtime configuration before testing."
             )
-        if gcs_runtime.mode == "real" and policy.mode == "sitl":
+        if gcs_runtime.mode == "real" and not policy.action_circuit_breaker_enabled:
             warnings.append(
-                "GCS is in real mode while Simurgh policy profile is sitl; this does not change MDS_MODE, but it is confusing for field operations."
+                "GCS is in real mode and the Simurgh action circuit breaker is off."
             )
         return SimurghStatusResponse(
             agent_enabled=policy.agent_enabled,
@@ -648,7 +984,8 @@ def create_simurgh_router() -> APIRouter:
             mode=policy.mode,
             action_circuit_breaker_enabled=policy.action_circuit_breaker_enabled,
             always_confirm_before_action=policy.always_confirm_before_action,
-            real_commands_enabled=policy.real_commands_enabled,
+            actions_blocked=policy.action_circuit_breaker_enabled,
+            action_policy_source="circuit_breaker_and_mds_mode",
             tool_registry_version=registry.version,
             tool_count=len(registry.tools),
             allowed_tool_count=len(registry.list_tools(exposure=ToolExposure.ALLOW)),
@@ -684,7 +1021,8 @@ def create_simurgh_router() -> APIRouter:
             mode=policy.mode,
             action_circuit_breaker_enabled=policy.action_circuit_breaker_enabled,
             always_confirm_before_action=policy.always_confirm_before_action,
-            real_commands_enabled=policy.real_commands_enabled,
+            actions_blocked=policy.action_circuit_breaker_enabled,
+            action_policy_source="circuit_breaker_and_mds_mode",
             allow_drone_api_exposure=policy.allow_drone_api_exposure,
             unknown_tool_policy=policy.unknown_tool_policy,
             approval_ttl_seconds=policy.approval_ttl_seconds,
@@ -698,6 +1036,65 @@ def create_simurgh_router() -> APIRouter:
                 for mode, mode_policy in sorted(policy.runtime_modes.items())
             },
         )
+
+    @router.get("/api/v1/simurgh/runtime-settings")
+    async def get_simurgh_runtime_settings():
+        """Read compact hot-reloadable Simurgh settings for the dashboard."""
+
+        try:
+            return build_runtime_settings_payload()
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.put("/api/v1/simurgh/runtime-settings")
+    async def put_simurgh_runtime_settings(request: SimurghRuntimeSettingsRequest):
+        """Persist and hot-apply Simurgh settings without restarting the whole GCS."""
+
+        try:
+            return apply_runtime_settings(request.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.get("/api/v1/simurgh/provider-credentials")
+    async def get_simurgh_provider_credentials():
+        """Read redacted provider credential status for the dashboard."""
+
+        try:
+            return build_provider_credentials_payload()
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.put("/api/v1/simurgh/provider-credentials")
+    async def put_simurgh_provider_credentials(request: SimurghProviderCredentialsRequest):
+        """Persist provider credentials in server-side secret files only."""
+
+        try:
+            return update_provider_credentials(request.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.delete("/api/v1/simurgh/provider-credentials")
+    async def delete_simurgh_provider_credentials(request: SimurghProviderCredentialsDeleteRequest | None = None):
+        """Delete managed provider credentials without exposing secret values."""
+
+        try:
+            return delete_provider_credentials(request.model_dump(exclude_none=True) if request else {})
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.get("/api/v1/simurgh/tools", response_model=SimurghToolListResponse)
     async def list_simurgh_tools(include_excluded: bool = Query(default=True)):
@@ -721,14 +1118,63 @@ def create_simurgh_router() -> APIRouter:
             raise HTTPException(status_code=404, detail=f"unknown Simurgh tool: {tool_id}")
         return _tool_response(tool)
 
+    @router.get("/api/v1/simurgh/tool-candidates", response_model=SimurghToolCandidateReviewResponse)
+    async def list_simurgh_tool_candidates(
+        eligible_read_only: bool | None = Query(default=None),
+        risk_class: str | None = Query(default=None, max_length=64),
+        search: str | None = Query(default=None, max_length=120),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ):
+        """Review generated OpenAPI candidates before MCP registry promotion.
+
+        This endpoint is intentionally read-only. It reports what the generator
+        discovered and whether a route already maps to a curated registry tool;
+        it does not make any candidate callable.
+        """
+
+        try:
+            artifact, artifact_path = load_default_tool_candidate_artifact()
+            registry = load_default_tool_registry()
+            return candidate_review_payload(
+                artifact,
+                artifact_path=artifact_path,
+                registry=registry,
+                eligible_read_only=eligible_read_only,
+                risk_class=risk_class,
+                search=search,
+                limit=limit,
+                offset=offset,
+            )
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @router.get("/api/v1/simurgh/context", response_model=SimurghContextListResponse)
     async def list_simurgh_context_resources():
         try:
             index = load_default_context_index()
         except AgentRuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        resources = [_context_resource_response(index, resource) for resource in index.resources.values()]
+        resources = [
+            _context_resource_response(index, resource)
+            for resource in index.resources.values()
+            if resource.sensitivity == "public"
+        ]
         return SimurghContextListResponse(version=index.version, resources=sorted(resources, key=lambda item: item.id))
+
+    @router.get("/api/v1/simurgh/context/{resource_id}/markdown", response_class=Response)
+    async def get_simurgh_context_resource_markdown(resource_id: str):
+        try:
+            index = load_default_context_index()
+            resource = index.require(resource_id)
+            if resource.sensitivity != "public":
+                raise HTTPException(status_code=403, detail="context resource is not public")
+            media_type = resource.mime_type if resource.mime_type.startswith("text/") else "text/plain"
+            return Response(content=index.read_text(resource_id), media_type=media_type)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"unknown context resource: {resource_id}") from exc
+        except AgentRuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.get("/api/v1/simurgh/context/{resource_id}", response_model=SimurghContextContentResponse)
     async def get_simurgh_context_resource(resource_id: str):
@@ -823,23 +1269,41 @@ def create_simurgh_router() -> APIRouter:
             events=[_audit_event_response(event) for event in event_values]
         )
 
-    @router.post("/api/v1/simurgh/assistant/turns", response_model=SimurghAssistantTurnResponse)
-    async def create_simurgh_assistant_turn(http_request: Request, request: SimurghAssistantTurnRequest):
+    def _create_assistant_turn_record_for_request(http_request: Request, turn_request: SimurghAssistantTurnRequest):
         try:
             assistant_config = load_default_assistant_config()
-            _require_external_assistant_provider_auth(http_request, assistant_config.provider)
-            actor = _resolve_actor(http_request, request.actor)
+            conversation_topic = None
+            if turn_request.session_id:
+                try:
+                    conversation_topic = str(sessions.require(turn_request.session_id).metadata.get("last_domain") or "")
+                except KeyError:
+                    conversation_topic = None
+            routing_message = normalize_operator_query_text(turn_request.message)
+            local_only_turn = bool(
+                classify_mds_read_intent(routing_message, conversation_topic=conversation_topic)
+                or blocked_intent_matches(assistant_config, turn_request.message)
+                or blocked_intent_matches(assistant_config, routing_message)
+                or sensitive_input_matches(assistant_config, turn_request.message)
+                or sensitive_input_matches(assistant_config, routing_message)
+            )
+            provider_auth_allowed = assistant_config.provider != "mock" and _has_external_assistant_provider_auth(http_request)
+            if not local_only_turn:
+                _require_external_assistant_provider_auth(http_request, assistant_config.provider)
+                provider_auth_allowed = assistant_config.provider != "mock"
+            actor = _resolve_actor(http_request, turn_request.actor)
             record = create_assistant_turn(
                 sessions=sessions,
                 audit=audit,
                 actor=actor,
-                message=request.message,
-                session_id=request.session_id,
-                mode=request.mode,
-                context_resource_ids=_bounded_context_resource_ids(request.context_resource_ids),
-                metadata=_bounded_metadata(request.metadata),
+                message=turn_request.message,
+                deps=deps,
+                session_id=turn_request.session_id,
+                mode=turn_request.mode,
+                context_resource_ids=_bounded_context_resource_ids(turn_request.context_resource_ids),
+                metadata=_bounded_metadata(turn_request.metadata),
+                allow_provider_for_local_tools=local_only_turn and provider_auth_allowed,
             )
-            history_record = history.append_turn(record=record, message=request.message)
+            history_record = history.append_turn(record=record, message=turn_request.message)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except KeyError as exc:
@@ -853,25 +1317,58 @@ def create_simurgh_router() -> APIRouter:
             else:
                 status_code = 400
             raise HTTPException(status_code=status_code, detail=message) from exc
+        return record, history_record
 
-        return SimurghAssistantTurnResponse(
-            id=record.turn.id,
-            created_at=record.turn.created_at,
-            provider=record.turn.provider,
-            model=history_record.model,
-            adapter_version=history_record.adapter_version,
-            session=_session_response(record.session),
-            actor=history_record.actor,
-            mode=history_record.mode,
-            message_hash=history_record.message_hash,
-            message_chars=history_record.message_chars,
-            content=record.turn.content,
-            context_resources=[
-                _assistant_context_response(document) for document in record.turn.context_documents
-            ],
-            blocked_intents=list(record.turn.blocked_intents),
-            safety_notes=list(record.turn.safety_notes),
-            audit_event_id=record.audit_event.id,
+    @router.post("/api/v1/simurgh/assistant/turns", response_model=SimurghAssistantTurnResponse)
+    async def create_simurgh_assistant_turn(http_request: Request, request: SimurghAssistantTurnRequest):
+        record, history_record = _create_assistant_turn_record_for_request(http_request, request)
+        return _assistant_turn_response_model(record, history_record)
+
+    @router.post("/api/v1/simurgh/assistant/turns/stream")
+    async def stream_simurgh_assistant_turn(http_request: Request, request: SimurghAssistantTurnRequest):
+        async def event_stream():
+            try:
+                yield _assistant_sse_event("progress", {"stage": "understanding", "label": "Understanding request"})
+                await asyncio.sleep(0)
+                yield _assistant_sse_event("progress", {"stage": "policy", "label": "Checking safety and access policy"})
+                await asyncio.sleep(0)
+                yield _assistant_sse_event("progress", {"stage": "context", "label": "Selecting MDS context and tools"})
+                await asyncio.sleep(0)
+                record, history_record = _create_assistant_turn_record_for_request(http_request, request)
+                payload = _assistant_turn_response_payload(record, history_record)
+                trace = payload.get("trace") if isinstance(payload.get("trace"), dict) else {}
+                tool = trace.get("tool") if isinstance(trace.get("tool"), dict) else {}
+                tool_intent = str(tool.get("intent") or "").strip()
+                provider = str(payload.get("provider") or "").strip()
+                if tool_intent:
+                    yield _assistant_sse_event("progress", {"stage": "tool", "label": f"Using {tool_intent.replace('_', ' ')}"})
+                elif provider == "openai":
+                    yield _assistant_sse_event("progress", {"stage": "provider", "label": "Composing with OpenAI provider"})
+                else:
+                    yield _assistant_sse_event("progress", {"stage": "provider", "label": "Composing local response"})
+                await asyncio.sleep(0)
+                content = str(payload.get("content") or "")
+                if content:
+                    yield _assistant_sse_event("progress", {"stage": "answer", "label": "Streaming answer"})
+                    await asyncio.sleep(0)
+                    for chunk in _assistant_content_chunks(content):
+                        yield _assistant_sse_event("delta", {"text": chunk})
+                        await asyncio.sleep(0)
+                yield _assistant_sse_event("final", payload)
+                session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+                yield _assistant_sse_event("done", {"id": payload.get("id"), "session_id": session.get("id")})
+            except HTTPException as exc:
+                yield _assistant_sse_event("error", {"status_code": exc.status_code, "detail": exc.detail})
+            except Exception:  # pragma: no cover - final guard for streaming clients
+                yield _assistant_sse_event("error", {"status_code": 500, "detail": "Simurgh stream failed."})
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @router.get("/api/v1/simurgh/assistant/turns", response_model=SimurghAssistantTurnListResponse)
@@ -939,7 +1436,7 @@ def create_simurgh_router() -> APIRouter:
                 status_code=400,
             )
 
-        response = _handle_mcp_jsonrpc(message, resources=mcp_resources)
+        response = await _handle_mcp_jsonrpc(message, request=request, resources=mcp_resources)
         if response is None:
             return Response(status_code=202)
         return JSONResponse(content=response)

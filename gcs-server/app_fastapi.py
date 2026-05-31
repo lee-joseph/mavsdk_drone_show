@@ -950,7 +950,7 @@ app.include_router(create_management_router(sys.modules[__name__]), responses=DE
 app.include_router(create_origin_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
 app.include_router(create_px4_params_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
 app.include_router(create_show_management_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
-app.include_router(create_simurgh_router(), responses=DEFAULT_ERROR_RESPONSES)
+app.include_router(create_simurgh_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
 app.include_router(create_sitl_control_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
 app.include_router(create_static_assets_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
 app.include_router(create_swarm_router(sys.modules[__name__]), responses=DEFAULT_ERROR_RESPONSES)
@@ -977,7 +977,7 @@ async def log_requests(request: Request, call_next):
     duration = time.time() - start_time
 
     path = str(request.url.path)
-    level = get_request_log_level(path, response.status_code)
+    level = get_request_log_level(path, response.status_code, method=request.method)
     log_system_event(
         f"API {request.method} {path} → {response.status_code} ({duration:.3f}s)",
         level, "api"
