@@ -10,8 +10,8 @@
  * 3. Rebuild the frontend: npm run build
  */
 
-const DEFAULT_VERSION = '5.6';
-const DEFAULT_GIT_COMMIT = 'f05afe0b';
+const DEFAULT_VERSION = '5.7';
+const DEFAULT_GIT_COMMIT = '985fcbd1';
 const DEFAULT_GIT_BRANCH = 'main';
 const DEFAULT_GIT_REPO = 'lee-joseph/mavsdk_drone_show';
 
